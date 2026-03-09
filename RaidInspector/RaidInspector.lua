@@ -14,6 +14,12 @@ local INSPECT_THROTTLE_SECONDS = 2
 local INSPECT_TIMEOUT_SECONDS = 8
 local ACHIEVEMENT_COMPARE_THROTTLE_SECONDS = 2
 local ACHIEVEMENT_COMPARE_TIMEOUT_SECONDS = 8
+local OVERVIEW_ROW_HEIGHT = 18
+local DETAIL_ROW_HEIGHT = 18
+local WINDOW_WIDTH = 1000
+local WINDOW_HEIGHT = 500
+local PANEL_SIDE_MARGIN = 24
+local RIGHT_PANEL_X = 474
 
 local RAID_ACHIEVEMENT_KEYS = { "icc10", "icc25", "toc10", "toc25", "rs10", "rs25" }
 local RAID_CATEGORY_MATCHERS = {
@@ -27,6 +33,7 @@ local RAID_CATEGORY_MATCHERS = {
 
 local SORT_MODES = { "recent", "gs", "issues", "name" }
 local FILTER_MODES = { "all", "snapshot", "ready", "queued", "issues" }
+local ITEM_LIST_FILTER_MODES = { "all", "issues", "missing-enchant", "missing-gems" }
 
 local SORT_LABELS = {
     recent = "Recent",
@@ -41,6 +48,13 @@ local FILTER_LABELS = {
     ready = "Ready",
     queued = "Queued",
     issues = "Issues",
+}
+
+local ITEM_LIST_FILTER_LABELS = {
+    all = "All Slots",
+    issues = "Issues Only",
+    ["missing-enchant"] = "Missing Enchant",
+    ["missing-gems"] = "Missing Gems",
 }
 
 local SLOT_ORDER = {
@@ -255,6 +269,88 @@ end
 
 local function ColorText(text, color)
     return "|cff" .. color .. tostring(text) .. "|r"
+end
+
+local GS_LITE_QUALITY = {
+    [1000] = {
+        Red = { A = 0.55, B = 0, C = 0.00045, D = 1 },
+        Green = { A = 0.55, B = 0, C = 0.00045, D = 1 },
+        Blue = { A = 0.55, B = 0, C = 0.00045, D = 1 },
+    },
+    [2000] = {
+        Red = { A = 1.00, B = 1000, C = 0.00088, D = -1 },
+        Green = { A = 1.00, B = 0, C = 0.0, D = 0 },
+        Blue = { A = 1.00, B = 1000, C = 0.001, D = -1 },
+    },
+    [3000] = {
+        Red = { A = 0.12, B = 2000, C = 0.00012, D = -1 },
+        Green = { A = 1.00, B = 2000, C = 0.00050, D = -1 },
+        Blue = { A = 0.00, B = 2000, C = 0.001, D = 1 },
+    },
+    [4000] = {
+        Red = { A = 0.00, B = 3000, C = 0.00069, D = 1 },
+        Green = { A = 0.50, B = 3000, C = 0.00022, D = -1 },
+        Blue = { A = 1.00, B = 3000, C = 0.00003, D = -1 },
+    },
+    [5000] = {
+        Red = { A = 0.69, B = 4000, C = 0.00025, D = 1 },
+        Green = { A = 0.28, B = 4000, C = 0.00019, D = 1 },
+        Blue = { A = 0.97, B = 4000, C = 0.00096, D = -1 },
+    },
+    [6000] = {
+        Red = { A = 0.94, B = 5000, C = 0.00006, D = 1 },
+        Green = { A = 0.47, B = 5000, C = 0.00047, D = -1 },
+        Blue = { A = 0.00, B = 0, C = 0.0, D = 0 },
+    },
+}
+
+local function Clamp01(value)
+    if value < 0 then
+        return 0
+    end
+    if value > 1 then
+        return 1
+    end
+    return value
+end
+
+local function GetGearScoreLiteColorRGB(score)
+    local itemScore = tonumber(score)
+    if not itemScore then
+        return 0.1, 0.1, 0.1
+    end
+
+    if itemScore > 5999 then
+        itemScore = 5999
+    end
+
+    local i
+    for i = 0, 6 do
+        local minScore = i * 1000
+        local maxScore = (i + 1) * 1000
+        if itemScore > minScore and itemScore <= maxScore then
+            local q = GS_LITE_QUALITY[maxScore]
+            if not q then
+                break
+            end
+
+            -- Preserve GearScoreLite channel math/order for visual parity.
+            local red = q.Red.A + (((itemScore - q.Red.B) * q.Red.C) * q.Red.D)
+            local blue = q.Green.A + (((itemScore - q.Green.B) * q.Green.C) * q.Green.D)
+            local green = q.Blue.A + (((itemScore - q.Blue.B) * q.Blue.C) * q.Blue.D)
+            return Clamp01(red), Clamp01(green), Clamp01(blue)
+        end
+    end
+
+    return 0.1, 0.1, 0.1
+end
+
+local function GetGearScoreColorCode(score)
+    local red, green, blue = GetGearScoreLiteColorRGB(score)
+    local r = math.floor((red * 255) + 0.5)
+    local g = math.floor((green * 255) + 0.5)
+    local b = math.floor((blue * 255) + 0.5)
+    return string.format("%02x%02x%02x", r, g, b)
 end
 
 local function Print(msg)
@@ -1591,6 +1687,7 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state.lastSnapshot, "members", {})
     EnsureTable(RaidInspectorDB.state, "ui", {})
     EnsureTable(RaidInspectorDB.state.ui, "selectedKey", "")
+    EnsureTable(RaidInspectorDB.state.ui, "itemListFilterMode", "all")
 
     EnsureTable(RaidInspectorDB, "requests", {})
     EnsureTable(RaidInspectorDB, "results", {})
@@ -1616,6 +1713,24 @@ function addon:GetFilterMode()
     end
     RaidInspectorDB.settings.overview.filterMode = "all"
     return "all"
+end
+
+function addon:GetItemListFilterMode()
+    local mode = RaidInspectorDB.state.ui.itemListFilterMode
+    if ITEM_LIST_FILTER_LABELS[mode] then
+        return mode
+    end
+    RaidInspectorDB.state.ui.itemListFilterMode = "all"
+    return "all"
+end
+
+function addon:SetItemListFilterMode(mode)
+    if not ITEM_LIST_FILTER_LABELS[mode] then
+        return false
+    end
+    RaidInspectorDB.state.ui.itemListFilterMode = mode
+    addon:RefreshMainWindow()
+    return true
 end
 
 function addon:GetLatestRequestForKey(key)
@@ -2356,21 +2471,22 @@ end
 function addon:BuildOverviewRows(container, rowCount)
     container.rows = container.rows or {}
     local i
+    local rowWidth = tonumber(container:GetWidth()) or 432
 
     for i = 1, rowCount do
         local row = CreateFrame("Button", nil, container)
-        row:SetWidth(430)
-        row:SetHeight(16)
-        row:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -(i - 1) * 16)
+        row:SetWidth(rowWidth)
+        row:SetHeight(OVERVIEW_ROW_HEIGHT)
+        row:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -(i - 1) * OVERVIEW_ROW_HEIGHT)
         row:SetFrameStrata("DIALOG")
         row:SetFrameLevel(40)
         row:RegisterForClicks("LeftButtonUp")
         row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
 
-        local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        local text = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         text:SetPoint("LEFT", row, "LEFT", 2, 0)
-        text:SetWidth(426)
-        text:SetHeight(16)
+        text:SetWidth(rowWidth - 4)
+        text:SetHeight(OVERVIEW_ROW_HEIGHT)
         text:SetJustifyH("LEFT")
         text:SetJustifyV("MIDDLE")
         text:SetText("")
@@ -2392,18 +2508,19 @@ end
 function addon:BuildDetailRows(container, rowCount)
     container.rows = container.rows or {}
     local i
+    local rowWidth = tonumber(container:GetWidth()) or 442
 
     for i = 1, rowCount do
         local row = CreateFrame("Button", nil, container)
-        row:SetWidth(442)
-        row:SetHeight(14)
-        row:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -(i - 1) * 14)
+        row:SetWidth(rowWidth)
+        row:SetHeight(DETAIL_ROW_HEIGHT)
+        row:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -(i - 1) * DETAIL_ROW_HEIGHT)
         row:EnableMouse(true)
 
-        local text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        local text = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         text:SetPoint("LEFT", row, "LEFT", 0, 0)
-        text:SetWidth(442)
-        text:SetHeight(14)
+        text:SetWidth(rowWidth)
+        text:SetHeight(DETAIL_ROW_HEIGHT)
         text:SetJustifyH("LEFT")
         text:SetJustifyV("MIDDLE")
         text:SetText("")
@@ -2518,8 +2635,8 @@ function addon:CreateMainWindow()
     addon.ui = addon.ui or {}
 
     local f = CreateFrame("Frame", "RaidInspectorMainFrame", UIParent)
-    f:SetWidth(940)
-    f:SetHeight(470)
+    f:SetWidth(WINDOW_WIDTH)
+    f:SetHeight(WINDOW_HEIGHT)
     f:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
         edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
@@ -2564,18 +2681,12 @@ function addon:CreateMainWindow()
     local statusText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     statusText:SetPoint("TOPLEFT", subtitle, "BOTTOMLEFT", 0, -10)
     statusText:SetJustifyH("LEFT")
-    statusText:SetWidth(900)
+    statusText:SetWidth(WINDOW_WIDTH - (PANEL_SIDE_MARGIN * 2))
     statusText:SetText("")
 
-    local helpText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    helpText:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
-    helpText:SetWidth(900)
-    helpText:SetJustifyH("LEFT")
-    helpText:SetText("/ri inspect <name> <realm>  |  /ri inspecttarget  |  /ri inspectraid  |  /ri sync  |  /ri export")
-
     local snapshotText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    snapshotText:SetPoint("TOPLEFT", helpText, "BOTTOMLEFT", 0, -6)
-    snapshotText:SetWidth(900)
+    snapshotText:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
+    snapshotText:SetWidth(WINDOW_WIDTH - (PANEL_SIDE_MARGIN * 2))
     snapshotText:SetJustifyH("LEFT")
     snapshotText:SetText("Snapshot: none")
 
@@ -2725,13 +2836,16 @@ function addon:CreateMainWindow()
     rowsContainer:SetPoint("TOPLEFT", actionPanel, "BOTTOMLEFT", 0, -10)
     rowsContainer:SetWidth(432)
     rowsContainer:SetHeight(300)
+    if rowsContainer.SetClipsChildren then
+        rowsContainer:SetClipsChildren(true)
+    end
     addon:BuildOverviewRows(rowsContainer, 18)
 
     local overviewScroll = CreateFrame("ScrollFrame", "RaidInspectorOverviewScroll", rowsContainer, "FauxScrollFrameTemplate")
     overviewScroll:SetPoint("TOPLEFT", rowsContainer, "TOPRIGHT", 0, -1)
     overviewScroll:SetPoint("BOTTOMLEFT", rowsContainer, "BOTTOMRIGHT", 0, 1)
     overviewScroll:SetScript("OnVerticalScroll", function(self, offset)
-        FauxScrollFrame_OnVerticalScroll(self, offset, 16, function()
+        FauxScrollFrame_OnVerticalScroll(self, offset, OVERVIEW_ROW_HEIGHT, function()
             addon:RefreshMainWindow()
         end)
     end)
@@ -2742,46 +2856,92 @@ function addon:CreateMainWindow()
         local current = GetFauxScrollOffset(overviewScroll)
         local nextOffset = math.max(0, math.min(maxOffset, current - delta))
         if nextOffset ~= current then
-            SetFauxScrollOffset(overviewScroll, nextOffset, 16)
+            SetFauxScrollOffset(overviewScroll, nextOffset, OVERVIEW_ROW_HEIGHT)
             addon:RefreshMainWindow()
         end
     end)
 
+    local rightPanelWidth = WINDOW_WIDTH - RIGHT_PANEL_X - PANEL_SIDE_MARGIN
+
     local detailHeader = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    detailHeader:SetPoint("TOPLEFT", f, "TOPLEFT", 474, -136)
-    detailHeader:SetWidth(442)
+    detailHeader:SetPoint("TOPLEFT", f, "TOPLEFT", RIGHT_PANEL_X, -136)
+    detailHeader:SetWidth(rightPanelWidth)
     detailHeader:SetJustifyH("LEFT")
     detailHeader:SetText("Selected: none")
 
-    local detailScore = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    local detailScore = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     detailScore:SetPoint("TOPLEFT", detailHeader, "BOTTOMLEFT", 0, -6)
-    detailScore:SetWidth(442)
+    detailScore:SetWidth(rightPanelWidth)
     detailScore:SetJustifyH("LEFT")
     detailScore:SetText("")
 
-    local detailAudit = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    detailAudit:SetPoint("TOPLEFT", detailScore, "BOTTOMLEFT", 0, -4)
-    detailAudit:SetWidth(442)
+    local detailMeta = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    detailMeta:SetPoint("TOPLEFT", detailScore, "BOTTOMLEFT", 0, -4)
+    detailMeta:SetWidth(rightPanelWidth)
+    detailMeta:SetJustifyH("LEFT")
+    detailMeta:SetText("")
+    if detailMeta.GetFont and detailMeta.SetFont then
+        local fontName, fontHeight = detailMeta:GetFont()
+        if fontName and fontHeight then
+            detailMeta:SetFont(fontName, fontHeight, "OUTLINE")
+        end
+    end
+
+    local detailAudit = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    detailAudit:SetPoint("TOPLEFT", detailMeta, "BOTTOMLEFT", 0, -4)
+    detailAudit:SetWidth(rightPanelWidth)
     detailAudit:SetJustifyH("LEFT")
     detailAudit:SetText("")
 
-    local detailRaid = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    detailRaid:SetPoint("TOPLEFT", detailAudit, "BOTTOMLEFT", 0, -4)
-    detailRaid:SetWidth(442)
-    detailRaid:SetJustifyH("LEFT")
-    detailRaid:SetText("")
+    local itemFilterLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    itemFilterLabel:SetPoint("TOPLEFT", detailAudit, "BOTTOMLEFT", 0, -10)
+    itemFilterLabel:SetWidth(70)
+    itemFilterLabel:SetJustifyH("LEFT")
+    itemFilterLabel:SetText("Item List:")
+
+    local itemFilterDropDown = CreateFrame("Frame", "RaidInspectorItemListDropDown", f, "UIDropDownMenuTemplate")
+    itemFilterDropDown:SetPoint("TOPLEFT", itemFilterLabel, "TOPLEFT", 62, 10)
+    UIDropDownMenu_SetWidth(itemFilterDropDown, 170)
+    UIDropDownMenu_JustifyText(itemFilterDropDown, "LEFT")
+    UIDropDownMenu_Initialize(itemFilterDropDown, function(_, level)
+        if level ~= 1 then
+            return
+        end
+
+        local i
+        for i = 1, #ITEM_LIST_FILTER_MODES do
+            local mode = ITEM_LIST_FILTER_MODES[i]
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = ITEM_LIST_FILTER_LABELS[mode] or mode
+            info.value = mode
+            info.checked = (addon:GetItemListFilterMode() == mode)
+            info.func = function(btn)
+                local selectedMode = btn.value
+                addon:SetItemListFilterMode(selectedMode)
+                UIDropDownMenu_SetSelectedValue(itemFilterDropDown, selectedMode)
+                UIDropDownMenu_SetText(itemFilterDropDown, ITEM_LIST_FILTER_LABELS[selectedMode] or selectedMode)
+            end
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end)
+    local selectedItemFilter = addon:GetItemListFilterMode()
+    UIDropDownMenu_SetSelectedValue(itemFilterDropDown, selectedItemFilter)
+    UIDropDownMenu_SetText(itemFilterDropDown, ITEM_LIST_FILTER_LABELS[selectedItemFilter] or selectedItemFilter)
 
     local detailContainer = CreateFrame("Frame", nil, f)
-    detailContainer:SetPoint("TOPLEFT", detailRaid, "BOTTOMLEFT", 0, -8)
-    detailContainer:SetWidth(442)
+    detailContainer:SetPoint("TOPLEFT", itemFilterLabel, "BOTTOMLEFT", 0, -10)
+    detailContainer:SetWidth(rightPanelWidth)
     detailContainer:SetHeight(250)
-    addon:BuildDetailRows(detailContainer, 18)
+    if detailContainer.SetClipsChildren then
+        detailContainer:SetClipsChildren(true)
+    end
+    addon:BuildDetailRows(detailContainer, 13)
 
     local detailScroll = CreateFrame("ScrollFrame", "RaidInspectorDetailScroll", detailContainer, "FauxScrollFrameTemplate")
     detailScroll:SetPoint("TOPLEFT", detailContainer, "TOPRIGHT", 0, -1)
     detailScroll:SetPoint("BOTTOMLEFT", detailContainer, "BOTTOMRIGHT", 0, 1)
     detailScroll:SetScript("OnVerticalScroll", function(self, offset)
-        FauxScrollFrame_OnVerticalScroll(self, offset, 14, function()
+        FauxScrollFrame_OnVerticalScroll(self, offset, DETAIL_ROW_HEIGHT, function()
             if addon.ui.lastDetailEntry then
                 addon:RefreshDetailPanel(addon.ui.lastDetailEntry)
             end
@@ -2794,7 +2954,7 @@ function addon:CreateMainWindow()
         local current = GetFauxScrollOffset(detailScroll)
         local nextOffset = math.max(0, math.min(maxOffset, current - delta))
         if nextOffset ~= current then
-            SetFauxScrollOffset(detailScroll, nextOffset, 14)
+            SetFauxScrollOffset(detailScroll, nextOffset, DETAIL_ROW_HEIGHT)
             if addon.ui.lastDetailEntry then
                 addon:RefreshDetailPanel(addon.ui.lastDetailEntry)
             end
@@ -2811,8 +2971,9 @@ function addon:CreateMainWindow()
     addon.ui.overviewEntryCount = 0
     addon.ui.detailHeader = detailHeader
     addon.ui.detailScore = detailScore
+    addon.ui.detailMeta = detailMeta
     addon.ui.detailAudit = detailAudit
-    addon.ui.detailRaid = detailRaid
+    addon.ui.itemFilterDropDown = itemFilterDropDown
     addon.ui.detailRows = detailContainer.rows
     addon.ui.detailScroll = detailScroll
     addon.ui.detailLineCount = 0
@@ -2832,12 +2993,12 @@ function addon:BuildOverviewRowText(entry)
 
     local gsText = "-"
     if result and result.gearScore then
-        gsText = tostring(result.gearScore)
+        gsText = ColorText(tostring(result.gearScore), GetGearScoreColorCode(result.gearScore))
     end
 
     local ageText = ""
     if entry.ageMinutes >= 0 then
-        ageText = " age=" .. tostring(entry.ageMinutes) .. "m"
+        ageText = " Scanned=" .. tostring(entry.ageMinutes) .. "m"
     end
 
     local issueSummary = result and result.issueSummary or {}
@@ -2942,6 +3103,42 @@ function addon:BuildSlotLine(slotKey, item)
     return ColorText(line, "dddddd")
 end
 
+local function ItemMatchesListFilter(mode, slotKey, item)
+    if mode == "all" then
+        return true
+    end
+
+    if type(item) ~= "table" then
+        return false
+    end
+
+    local missingEnchant = false
+    if ENCHANTABLE_SLOTS[slotKey] then
+        local enchantId = tonumber(item.enchantId)
+        if not enchantId and not OPTIONAL_ENCHANT_SLOTS[slotKey] then
+            missingEnchant = true
+        end
+    end
+
+    local socketCount = tonumber(item.socketCount) or 0
+    local gemCount = (type(item.gems) == "table") and #item.gems or 0
+    local missingGems = socketCount > 0 and gemCount < socketCount
+
+    if mode == "issues" then
+        return missingEnchant or missingGems
+    end
+
+    if mode == "missing-enchant" then
+        return missingEnchant
+    end
+
+    if mode == "missing-gems" then
+        return missingGems
+    end
+
+    return true
+end
+
 function addon:RefreshDetailPanel(selectedEntry)
     if not addon.ui or not addon.ui.detailHeader then
         return
@@ -2952,14 +3149,14 @@ function addon:RefreshDetailPanel(selectedEntry)
     if not selectedEntry then
         addon.ui.detailHeader:SetText("Selected: none")
         addon.ui.detailScore:SetText("Select a player from the left overview.")
-        addon.ui.detailAudit:SetText("")
-        if addon.ui.detailRaid then
-            addon.ui.detailRaid:SetText("")
+        if addon.ui.detailMeta then
+            addon.ui.detailMeta:SetText("")
         end
+        addon.ui.detailAudit:SetText("")
         addon.ui.detailLineCount = 0
         if addon.ui.detailScroll then
-            SetFauxScrollOffset(addon.ui.detailScroll, 0, 14)
-            FauxScrollFrame_Update(addon.ui.detailScroll, 0, #addon.ui.detailRows, 14)
+            SetFauxScrollOffset(addon.ui.detailScroll, 0, DETAIL_ROW_HEIGHT)
+            FauxScrollFrame_Update(addon.ui.detailScroll, 0, #addon.ui.detailRows, DETAIL_ROW_HEIGHT)
         end
         local i
         for i = 1, #addon.ui.detailRows do
@@ -2982,14 +3179,14 @@ function addon:RefreshDetailPanel(selectedEntry)
         else
             addon.ui.detailScore:SetText("No result yet. Use Target/Raid for live inspect, or Sync/Force for bridge data.")
         end
-        addon.ui.detailAudit:SetText("")
-        if addon.ui.detailRaid then
-            addon.ui.detailRaid:SetText("")
+        if addon.ui.detailMeta then
+            addon.ui.detailMeta:SetText("")
         end
+        addon.ui.detailAudit:SetText("")
         addon.ui.detailLineCount = 0
         if addon.ui.detailScroll then
-            SetFauxScrollOffset(addon.ui.detailScroll, 0, 14)
-            FauxScrollFrame_Update(addon.ui.detailScroll, 0, #addon.ui.detailRows, 14)
+            SetFauxScrollOffset(addon.ui.detailScroll, 0, DETAIL_ROW_HEIGHT)
+            FauxScrollFrame_Update(addon.ui.detailScroll, 0, #addon.ui.detailRows, DETAIL_ROW_HEIGHT)
         end
         local i
         for i = 1, #addon.ui.detailRows do
@@ -3004,25 +3201,16 @@ function addon:RefreshDetailPanel(selectedEntry)
     local guildText = result.guild and tostring(result.guild) or "-"
     local levelText = result.level and tostring(result.level) or "?"
     local scoreValue = result.gearScore and tostring(result.gearScore) or "N/A"
-    local scoreSource = result.gearScoreSource and tostring(result.gearScoreSource) or "none"
-    local apText = result.achievementPoints and tostring(result.achievementPoints) or "?"
-    local apSource = ResolveAchievementPointsSource(result)
-    local raidSource = ResolveRaidAchievementsSource(result)
-
-    addon.ui.detailHeader:SetText(
-        "Selected: " .. SafeText(req.name) .. "-" .. SafeText(req.realm)
-            .. " [" .. selectedEntry.state .. "]"
-            .. " | APsrc:" .. apSource
-            .. " | RAIDsrc:" .. raidSource
-    )
+    local scoreColored = result.gearScore and ColorText(scoreValue, GetGearScoreColorCode(result.gearScore)) or scoreValue
+    local specColored = ColorText(specText, "ff9933")
 
     addon.ui.detailScore:SetText(
-        "Lvl " .. levelText .. " | " .. classText .. " / " .. specText
-            .. " | Guild: " .. guildText
-            .. " | GS: " .. scoreValue
-            .. " (" .. scoreSource .. ")"
-                .. " | AP: " .. apText
+        "GS: " .. scoreColored .. " | Character: Lvl " .. levelText .. " | " .. classText .. " | Guild: " .. guildText
     )
+
+    if addon.ui.detailMeta then
+        addon.ui.detailMeta:SetText("Talent: " .. specColored)
+    end
 
     local summary = result.issueSummary or {}
     local missingEnchant = tonumber(summary.missingEnchant or 0) or 0
@@ -3031,28 +3219,33 @@ function addon:RefreshDetailPanel(selectedEntry)
     local socketsFilled = tonumber(summary.filledSockets or 0) or 0
     local socketsTotal = tonumber(summary.totalSockets or 0) or 0
 
+    local missingEnchantText = "missingEnchant=" .. tostring(missingEnchant)
+    local missingGemsText = "missingGems=" .. tostring(missingGems)
+    local socketsText = "sockets=" .. tostring(socketsFilled) .. "/" .. tostring(socketsTotal)
+
+    if missingEnchant > 0 then
+        missingEnchantText = ColorText(missingEnchantText, "ff6666")
+    end
+
+    if missingGems > 0 then
+        missingGemsText = ColorText(missingGemsText, "ff6666")
+    end
+
+    if socketsTotal > 0 and socketsFilled < socketsTotal then
+        socketsText = ColorText(socketsText, "ff6666")
+    end
+
     addon.ui.detailAudit:SetText(
-        "Audit: missingEnchant=" .. tostring(missingEnchant)
-            .. " | missingGems=" .. tostring(missingGems)
-            .. " | sockets=" .. tostring(socketsFilled) .. "/" .. tostring(socketsTotal)
+        "Audit: " .. missingEnchantText
+            .. " | " .. missingGemsText
+            .. " | " .. socketsText
             .. " | items=" .. tostring(itemsAnalyzed)
     )
-
-    if addon.ui.detailRaid then
-        if result.source == "local-inspect" and not HasAnyKnownRaidAchievementFlags(result.raidAchievements) then
-            if apSource == "inspect-achievement-compare" then
-                addon.ui.detailRaid:SetText("Raid Achievements: unresolved by in-game compare (AP ok, ICC/TOC/RS flags not exposed)")
-            else
-                addon.ui.detailRaid:SetText("Raid Achievements: bridge-only (live inspect cannot resolve ICC/TOC/RS flags)")
-            end
-        else
-            addon.ui.detailRaid:SetText("Raid Achievements: " .. FormatRaidAchievements(result.raidAchievements))
-        end
-    end
 
     local itemsBySlot = {}
     local detailLines = {}
     local unslotted = 0
+    local filterMode = addon:GetItemListFilterMode()
     local i
 
     for i = 1, #(result.items or {}) do
@@ -3067,23 +3260,32 @@ function addon:RefreshDetailPanel(selectedEntry)
 
     for i = 1, #SLOT_ORDER do
         local slotKey = SLOT_ORDER[i]
+        local slotItem = itemsBySlot[slotKey]
+        if ItemMatchesListFilter(filterMode, slotKey, slotItem) then
+            table.insert(detailLines, {
+                text = addon:BuildSlotLine(slotKey, slotItem),
+                item = slotItem,
+                slotKey = slotKey,
+            })
+        end
+    end
+
+    if unslotted > 0 and filterMode == "all" then
         table.insert(detailLines, {
-            text = addon:BuildSlotLine(slotKey, itemsBySlot[slotKey]),
-            item = itemsBySlot[slotKey],
-            slotKey = slotKey,
+            text = ColorText("Other: " .. tostring(unslotted) .. " unslotted item(s)", "ffcc66"),
         })
     end
 
-    if unslotted > 0 then
+    if #detailLines == 0 then
         table.insert(detailLines, {
-            text = ColorText("Other: " .. tostring(unslotted) .. " unslotted item(s)", "ffcc66"),
+            text = ColorText("No items match selected filter.", "ffcc66"),
         })
     end
 
     if addon.ui.lastDetailKey ~= selectedEntry.key then
         addon.ui.lastDetailKey = selectedEntry.key
         if addon.ui.detailScroll then
-            SetFauxScrollOffset(addon.ui.detailScroll, 0, 14)
+            SetFauxScrollOffset(addon.ui.detailScroll, 0, DETAIL_ROW_HEIGHT)
         end
     end
 
@@ -3094,10 +3296,10 @@ function addon:RefreshDetailPanel(selectedEntry)
         local maxOffset = math.max(0, #detailLines - #addon.ui.detailRows)
         local currentOffset = GetFauxScrollOffset(addon.ui.detailScroll)
         if currentOffset > maxOffset then
-            SetFauxScrollOffset(addon.ui.detailScroll, maxOffset, 14)
+            SetFauxScrollOffset(addon.ui.detailScroll, maxOffset, DETAIL_ROW_HEIGHT)
             currentOffset = maxOffset
         end
-        FauxScrollFrame_Update(addon.ui.detailScroll, #detailLines, #addon.ui.detailRows, 14)
+        FauxScrollFrame_Update(addon.ui.detailScroll, #detailLines, #addon.ui.detailRows, DETAIL_ROW_HEIGHT)
         offset = currentOffset
     end
 
@@ -3152,6 +3354,12 @@ function addon:RefreshMainWindow()
         addon.ui.filterButton:SetText("|cff66ff66F:" .. addon:GetFilterMode() .. "|r")
     end
 
+    if addon.ui.itemFilterDropDown then
+        local selectedMode = addon:GetItemListFilterMode()
+        UIDropDownMenu_SetSelectedValue(addon.ui.itemFilterDropDown, selectedMode)
+        UIDropDownMenu_SetText(addon.ui.itemFilterDropDown, ITEM_LIST_FILTER_LABELS[selectedMode] or selectedMode)
+    end
+
     local entries = addon:GetOverviewEntries()
     if #entries == 0 then
         local latestByKey = addon:GetLatestRequestMap()
@@ -3180,10 +3388,10 @@ function addon:RefreshMainWindow()
         local maxOverviewOffset = math.max(0, #entries - #addon.ui.overviewRows)
         local currentOverviewOffset = GetFauxScrollOffset(addon.ui.overviewScroll)
         if currentOverviewOffset > maxOverviewOffset then
-            SetFauxScrollOffset(addon.ui.overviewScroll, maxOverviewOffset, 16)
+            SetFauxScrollOffset(addon.ui.overviewScroll, maxOverviewOffset, OVERVIEW_ROW_HEIGHT)
             currentOverviewOffset = maxOverviewOffset
         end
-        FauxScrollFrame_Update(addon.ui.overviewScroll, #entries, #addon.ui.overviewRows, 16)
+        FauxScrollFrame_Update(addon.ui.overviewScroll, #entries, #addon.ui.overviewRows, OVERVIEW_ROW_HEIGHT)
         overviewOffset = currentOverviewOffset
     end
 
@@ -3224,13 +3432,13 @@ function addon:RefreshMainWindow()
             local hasAuditIssues = EntryHasMissingAuditIssues(entry)
             if entry.key == selectedKey then
                 if hasAuditIssues then
-                    row.text:SetTextColor(1.0, 0.72, 0.18)
+                    row.text:SetTextColor(1.0, 0.35, 0.35)
                 else
                     row.text:SetTextColor(1.0, 0.82, 0.0)
                 end
             else
                 if hasAuditIssues then
-                    row.text:SetTextColor(1.0, 0.55, 0.10)
+                    row.text:SetTextColor(1.0, 0.20, 0.20)
                 else
                     row.text:SetTextColor(1.0, 1.0, 1.0)
                 end
