@@ -1,0 +1,31 @@
+{
+  "results": [
+    {
+      "name": "Nifang",
+      "realm": "Icecrown",
+      "class": "PALADIN",
+      "spec": "Protection",
+      "guild": "Example Guild",
+      "level": 80,
+      "gearScore": 6201,
+      "gearScoreSource": "cavernoftime",
+      "source": "warmane+cot-bridge",
+      "items": [
+        {
+          "slot": "HeadSlot",
+          "itemId": 51277,
+          "name": "Lightsworn Faceguard",
+          "ilvl": 264,
+          "enchantId": 3818,
+          "gems": [40119, 40111]
+        }
+      ],
+      "enchants": {
+        "HeadSlot": 3818
+      },
+      "gems": {
+        "HeadSlot": [40119, 40111]
+      }
+    }
+  ]
+}
