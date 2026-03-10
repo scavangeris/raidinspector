@@ -12,6 +12,9 @@
    - bridge parser for real Warmane summary payload
    - Cavern of Time compatible gearscore mapping
    - item/enchant UI detail panel
+   - save/export report snapshots for later reuse
+   - current raid scan history with 30-day retention
+   - confirmation window before destructive clear actions
 
 ## Phase 1 - Foundation
 1. Define data contract between addon and bridge.
@@ -77,6 +80,17 @@
 2. Add user documentation and setup guide for bridge.
 3. Test in raid scenarios (10/25 players).
 4. Package addon + bridge release bundle.
+
+## Phase 9 - Persistence and Safety UX
+1. Add save/export workflow for generated reports:
+   - persist report snapshots to SavedVariables
+   - export latest or selected snapshot to chat/text format
+2. Add current raid scan archive with retention policy:
+   - store scan timestamp + roster + summary payload
+   - keep 30 days of history, prune older records automatically
+3. Add confirmation dialog for clear actions:
+   - prompt before `Clear` / `clearqueue`
+   - include explicit confirm/cancel actions
 
 ## Suggested First Build Milestone
 1. `/ri inspect <name>` creates queue entry.
