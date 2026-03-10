@@ -2,6 +2,19 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.10.0-alpha - 2026-03-10
+- Added `super simple` display mode:
+  - new mode selector option alongside `advanced` and `easy`
+  - dedicated `Req GS` and `+/-` inputs for simple pass/fail evaluation
+  - large `OK` / `NO` decision label above character stats
+  - simplified detail panel showing only the pass/fail inputs and reasons
+- `super simple` pass rule now requires:
+  - player gearscore inside the configured `+/-` range
+  - no missing enchants
+  - no missing gems
+  - no low-tier enchants
+- Clear button now uses the confirmation flow instead of bypassing it.
+
 ## 0.9.0-alpha - 2026-03-10
 - Added report snapshot persistence:
   - `/ri savereport [name-realm]` saves the current or selected report summary into SavedVariables.

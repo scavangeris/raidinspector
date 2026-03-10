@@ -13,9 +13,9 @@
    - save/export report snapshots for later reuse
    - current raid scan history with 30-day retention
    - confirmation window before destructive clear actions
+   - display mode `super simple` with required gearscore input and `OK/NO` decision label
 - Next:
    - set class colors on character info (color values TBD; to be provided later)
-   - add display mode `super simple` (alongside `advanced` and `easy`) with required gearscore input and `OK/NO` decision label
 
 ## Phase 1 - Foundation
 1. Define data contract between addon and bridge.

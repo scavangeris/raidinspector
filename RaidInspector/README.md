@@ -38,6 +38,9 @@ Because of this, Raid Inspector must use an external bridge process (desktop scr
 	- saved report snapshots (`/ri savereport`, `/ri exportsaved`)
 	- 30-day retained raid scan archive in SavedVariables
 	- confirmation before destructive `Clear` / `/ri clearqueue`
+- Display mode additions:
+	- `super simple` mode with required GS and `+/-` range inputs
+	- large `OK` / `NO` decision above character stats for quick screening
 
 ## Commands
 - `/ri help`
@@ -121,6 +124,10 @@ Phase 5 UI additions:
 	- gem fill status (`G:x/y`)
 - sort/filter controls in-window and slash command equivalents
 - one-click quick export to raid/party chat
+- display mode presets:
+	- `advanced`
+	- `easy`
+	- `super simple` with required GS and range inputs
 - quick test-action buttons in-window:
 	- `Target`, `Raid`, `Sync`, `Force`, `Stale 15m`, `Status`, `Clear`
 

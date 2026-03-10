@@ -6,7 +6,7 @@ RaidInspectorBridgeInbox = RaidInspectorBridgeInbox or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.9.0-alpha"
+addon.version = "0.10.0-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
@@ -36,11 +36,12 @@ local RAID_CATEGORY_MATCHERS = {
 local SORT_MODES = { "recent", "gs", "issues", "name" }
 local FILTER_MODES = { "all", "snapshot", "ready", "queued", "issues" }
 local ITEM_LIST_FILTER_MODES = { "all", "issues", "missing-enchant", "missing-gems" }
-local BUTTON_MODES = { "advanced", "easy" }
+local BUTTON_MODES = { "advanced", "easy", "super-simple" }
 
 local BUTTON_MODE_LABELS = {
     advanced = "Advanced",
     easy = "Easy",
+    ["super-simple"] = "Super Simple",
 }
 
 local SORT_LABELS = {
@@ -1725,6 +1726,9 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state.ui, "selectedKey", "")
     EnsureTable(RaidInspectorDB.state.ui, "itemListFilterMode", "all")
     EnsureTable(RaidInspectorDB.state.ui, "buttonMode", "advanced")
+    EnsureTable(RaidInspectorDB.state.ui, "superSimple", {})
+    EnsureTable(RaidInspectorDB.state.ui.superSimple, "requiredGearScore", 0)
+    EnsureTable(RaidInspectorDB.state.ui.superSimple, "gearScoreRange", 100)
     EnsureTable(RaidInspectorDB.state.ui, "minimap", {})
     EnsureTable(RaidInspectorDB.state.ui.minimap, "angle", 220)
     EnsureTable(RaidInspectorDB.state.ui, "exportChannels", {})
@@ -1781,6 +1785,46 @@ function addon:GetButtonMode()
     end
     RaidInspectorDB.state.ui.buttonMode = "advanced"
     return "advanced"
+end
+
+function addon:GetSuperSimpleRequiredGearScore()
+    EnsureTable(RaidInspectorDB.state.ui, "superSimple", {})
+    local required = tonumber(RaidInspectorDB.state.ui.superSimple.requiredGearScore) or 0
+    if required < 0 then
+        required = 0
+    end
+    required = math.floor(required + 0.5)
+    RaidInspectorDB.state.ui.superSimple.requiredGearScore = required
+    return required
+end
+
+function addon:SetSuperSimpleRequiredGearScore(value)
+    EnsureTable(RaidInspectorDB.state.ui, "superSimple", {})
+    local numeric = tonumber(Trim(value or "")) or 0
+    if numeric < 0 then
+        numeric = 0
+    end
+    RaidInspectorDB.state.ui.superSimple.requiredGearScore = math.floor(numeric + 0.5)
+end
+
+function addon:GetSuperSimpleGearScoreRange()
+    EnsureTable(RaidInspectorDB.state.ui, "superSimple", {})
+    local allowedRange = tonumber(RaidInspectorDB.state.ui.superSimple.gearScoreRange)
+    if not allowedRange or allowedRange < 0 then
+        allowedRange = 100
+    end
+    allowedRange = math.floor(allowedRange + 0.5)
+    RaidInspectorDB.state.ui.superSimple.gearScoreRange = allowedRange
+    return allowedRange
+end
+
+function addon:SetSuperSimpleGearScoreRange(value)
+    EnsureTable(RaidInspectorDB.state.ui, "superSimple", {})
+    local numeric = tonumber(Trim(value or ""))
+    if not numeric or numeric < 0 then
+        numeric = 100
+    end
+    RaidInspectorDB.state.ui.superSimple.gearScoreRange = math.floor(numeric + 0.5)
 end
 
 function addon:GetExportChannels()
@@ -2965,6 +3009,14 @@ function addon:ApplyButtonModeLayout()
         visible.force = false
         visible.stale = false
         order = { "sort", "filter", "target", "raid", "status", "export", "clear" }
+    elseif mode == "super-simple" then
+        visible.sort = false
+        visible.filter = false
+        visible.sync = false
+        visible.force = false
+        visible.stale = false
+        visible.status = false
+        order = { "target", "raid", "export", "clear" }
     end
 
     local key, button
@@ -2981,8 +3033,34 @@ function addon:ApplyButtonModeLayout()
     if buttons.status then
         if mode == "easy" then
             buttons.status:SetText("|cffffaa33Display|r")
+        elseif mode == "super-simple" then
+            buttons.status:SetText("|cffffaa33Decision|r")
         else
             buttons.status:SetText("|cffffaa33Status|r")
+        end
+    end
+
+    if addon.ui.superSimpleSettingsRow then
+        if mode == "super-simple" then
+            addon.ui.superSimpleSettingsRow:Show()
+        else
+            addon.ui.superSimpleSettingsRow:Hide()
+        end
+    end
+
+    if addon.ui.itemFilterLabel then
+        if mode == "super-simple" then
+            addon.ui.itemFilterLabel:Hide()
+        else
+            addon.ui.itemFilterLabel:Show()
+        end
+    end
+
+    if addon.ui.itemFilterDropDown then
+        if mode == "super-simple" then
+            addon.ui.itemFilterDropDown:Hide()
+        else
+            addon.ui.itemFilterDropDown:Show()
         end
     end
 
@@ -3229,8 +3307,79 @@ function addon:CreateMainWindow()
         addon:SetExportChannel("whisper", self:GetChecked() and true or false)
     end)
 
+    local superSimpleSettingsRow = CreateFrame("Frame", nil, f)
+    superSimpleSettingsRow:SetPoint("TOPLEFT", exportChannelsRow, "BOTTOMLEFT", 0, -6)
+    superSimpleSettingsRow:SetWidth(320)
+    superSimpleSettingsRow:SetHeight(24)
+
+    local superSimpleRequiredLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    superSimpleRequiredLabel:SetPoint("LEFT", superSimpleSettingsRow, "LEFT", 0, 0)
+    superSimpleRequiredLabel:SetText("Req GS:")
+
+    local superSimpleRequiredInput = CreateFrame("EditBox", "RaidInspectorSuperSimpleRequiredInput", f, "InputBoxTemplate")
+    superSimpleRequiredInput:SetAutoFocus(false)
+    superSimpleRequiredInput:SetWidth(56)
+    superSimpleRequiredInput:SetHeight(20)
+    superSimpleRequiredInput:SetPoint("LEFT", superSimpleRequiredLabel, "RIGHT", 6, 0)
+    superSimpleRequiredInput:SetMaxLetters(6)
+    if superSimpleRequiredInput.SetNumeric then
+        superSimpleRequiredInput:SetNumeric(true)
+    end
+
+    local superSimpleRangeLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    superSimpleRangeLabel:SetPoint("LEFT", superSimpleRequiredInput, "RIGHT", 12, 0)
+    superSimpleRangeLabel:SetText("+/-:")
+
+    local superSimpleRangeInput = CreateFrame("EditBox", "RaidInspectorSuperSimpleRangeInput", f, "InputBoxTemplate")
+    superSimpleRangeInput:SetAutoFocus(false)
+    superSimpleRangeInput:SetWidth(46)
+    superSimpleRangeInput:SetHeight(20)
+    superSimpleRangeInput:SetPoint("LEFT", superSimpleRangeLabel, "RIGHT", 6, 0)
+    superSimpleRangeInput:SetMaxLetters(4)
+    if superSimpleRangeInput.SetNumeric then
+        superSimpleRangeInput:SetNumeric(true)
+    end
+
+    local superSimpleHint = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    superSimpleHint:SetPoint("LEFT", superSimpleRangeInput, "RIGHT", 10, 0)
+    superSimpleHint:SetText("Needs clean gear + GS inside range")
+
+    local function SaveSuperSimpleSettings()
+        addon:SetSuperSimpleRequiredGearScore(superSimpleRequiredInput:GetText())
+        addon:SetSuperSimpleGearScoreRange(superSimpleRangeInput:GetText())
+        local required = addon:GetSuperSimpleRequiredGearScore()
+        local allowedRange = addon:GetSuperSimpleGearScoreRange()
+        superSimpleRequiredInput:SetText(required > 0 and tostring(required) or "")
+        superSimpleRangeInput:SetText(tostring(allowedRange))
+        addon:RefreshMainWindow()
+    end
+
+    superSimpleRequiredInput:SetScript("OnEnterPressed", function(self)
+        self:ClearFocus()
+        SaveSuperSimpleSettings()
+    end)
+    superSimpleRequiredInput:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+        self:SetText(addon:GetSuperSimpleRequiredGearScore() > 0 and tostring(addon:GetSuperSimpleRequiredGearScore()) or "")
+    end)
+    superSimpleRequiredInput:SetScript("OnEditFocusLost", SaveSuperSimpleSettings)
+
+    superSimpleRangeInput:SetScript("OnEnterPressed", function(self)
+        self:ClearFocus()
+        SaveSuperSimpleSettings()
+    end)
+    superSimpleRangeInput:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+        self:SetText(tostring(addon:GetSuperSimpleGearScoreRange()))
+    end)
+    superSimpleRangeInput:SetScript("OnEditFocusLost", SaveSuperSimpleSettings)
+
+    superSimpleRequiredInput:SetText(addon:GetSuperSimpleRequiredGearScore() > 0 and tostring(addon:GetSuperSimpleRequiredGearScore()) or "")
+    superSimpleRangeInput:SetText(tostring(addon:GetSuperSimpleGearScoreRange()))
+    superSimpleSettingsRow:Hide()
+
     local actionPanel = CreateFrame("Frame", nil, f)
-    actionPanel:SetPoint("TOPLEFT", exportChannelsRow, "BOTTOMLEFT", 0, -6)
+    actionPanel:SetPoint("TOPLEFT", superSimpleSettingsRow, "BOTTOMLEFT", 0, -6)
     actionPanel:SetWidth(214)
     actionPanel:SetHeight(130)
 
@@ -3357,7 +3506,7 @@ function addon:CreateMainWindow()
     SetActionButtonLabel(clearButton, "ffffaa33", "Clear")
     clearButton:SetScript("OnClick", function()
         SafeInvoke("clear", function()
-            addon:ClearQueue()
+            addon:RequestClearQueue()
         end)
     end)
 
@@ -3398,8 +3547,15 @@ function addon:CreateMainWindow()
     detailHeader:SetJustifyH("LEFT")
     detailHeader:SetText("Selected: none")
 
+    local detailDecision = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    detailDecision:SetPoint("TOPLEFT", detailHeader, "BOTTOMLEFT", 0, -6)
+    detailDecision:SetWidth(rightPanelWidth)
+    detailDecision:SetJustifyH("LEFT")
+    detailDecision:SetText("")
+    SetFontStringBold(detailDecision, true)
+
     local detailScore = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    detailScore:SetPoint("TOPLEFT", detailHeader, "BOTTOMLEFT", 0, -6)
+    detailScore:SetPoint("TOPLEFT", detailDecision, "BOTTOMLEFT", 0, -6)
     detailScore:SetWidth(rightPanelWidth)
     detailScore:SetJustifyH("LEFT")
     detailScore:SetText("")
@@ -3508,13 +3664,21 @@ function addon:CreateMainWindow()
     addon.ui.exportRaidCheck = exportRaidCheck
     addon.ui.exportSayCheck = exportSayCheck
     addon.ui.exportWhisperCheck = exportWhisperCheck
+    addon.ui.superSimpleSettingsRow = superSimpleSettingsRow
+    addon.ui.superSimpleRequiredLabel = superSimpleRequiredLabel
+    addon.ui.superSimpleRequiredInput = superSimpleRequiredInput
+    addon.ui.superSimpleRangeLabel = superSimpleRangeLabel
+    addon.ui.superSimpleRangeInput = superSimpleRangeInput
+    addon.ui.superSimpleHint = superSimpleHint
     addon.ui.overviewRows = rowsContainer.rows
     addon.ui.overviewScroll = overviewScroll
     addon.ui.overviewEntryCount = 0
     addon.ui.detailHeader = detailHeader
+    addon.ui.detailDecision = detailDecision
     addon.ui.detailScore = detailScore
     addon.ui.detailMeta = detailMeta
     addon.ui.detailAudit = detailAudit
+    addon.ui.itemFilterLabel = itemFilterLabel
     addon.ui.itemFilterDropDown = itemFilterDropDown
     addon.ui.detailRows = detailContainer.rows
     addon.ui.detailScroll = detailScroll
@@ -3694,15 +3858,92 @@ local function ItemMatchesListFilter(mode, slotKey, item)
     return true
 end
 
+local function ResultHasLowTierEnchant(result)
+    if type(result) ~= "table" or type(result.items) ~= "table" then
+        return false
+    end
+
+    local i
+    for i = 1, #result.items do
+        if IsLowTierEnchant(result.items[i]) then
+            return true
+        end
+    end
+
+    return false
+end
+
+function addon:EvaluateSuperSimpleResult(result)
+    local summary = type(result) == "table" and result.issueSummary or {}
+    local score = tonumber(result and result.gearScore)
+    local required = addon:GetSuperSimpleRequiredGearScore()
+    local allowedRange = addon:GetSuperSimpleGearScoreRange()
+    local missingEnchant = tonumber(summary.missingEnchant or 0) or 0
+    local missingGems = tonumber(summary.missingGems or 0) or 0
+    local hasLowTierEnchant = ResultHasLowTierEnchant(result)
+    local reasons = {}
+    local pass = true
+
+    if required <= 0 then
+        pass = false
+        reasons[#reasons + 1] = "set required GS"
+    end
+
+    if not score then
+        pass = false
+        reasons[#reasons + 1] = "GS unavailable"
+    end
+
+    if missingEnchant > 0 then
+        pass = false
+        reasons[#reasons + 1] = "missing enchants=" .. tostring(missingEnchant)
+    end
+
+    if missingGems > 0 then
+        pass = false
+        reasons[#reasons + 1] = "missing gems=" .. tostring(missingGems)
+    end
+
+    if hasLowTierEnchant then
+        pass = false
+        reasons[#reasons + 1] = "low-tier enchant"
+    end
+
+    local delta = nil
+    if score and required > 0 then
+        delta = score - required
+        if math.abs(delta) > allowedRange then
+            pass = false
+            reasons[#reasons + 1] = "outside +/-" .. tostring(allowedRange)
+        end
+    end
+
+    return {
+        pass = pass,
+        score = score,
+        required = required,
+        allowedRange = allowedRange,
+        delta = delta,
+        missingEnchant = missingEnchant,
+        missingGems = missingGems,
+        hasLowTierEnchant = hasLowTierEnchant,
+        reasons = reasons,
+    }
+end
+
 function addon:RefreshDetailPanel(selectedEntry)
     if not addon.ui or not addon.ui.detailHeader then
         return
     end
 
     addon.ui.lastDetailEntry = selectedEntry
+    local buttonMode = addon:GetButtonMode()
 
     if not selectedEntry then
         addon.ui.detailHeader:SetText("Selected: none")
+        if addon.ui.detailDecision then
+            addon.ui.detailDecision:SetText("")
+        end
         addon.ui.detailScore:SetText("Select a player from the left overview.")
         if addon.ui.detailMeta then
             addon.ui.detailMeta:SetText("")
@@ -3726,6 +3967,9 @@ function addon:RefreshDetailPanel(selectedEntry)
     addon.ui.detailHeader:SetText("Selected: " .. SafeText(req.name) .. "-" .. SafeText(req.realm) .. " [" .. selectedEntry.state .. "]")
 
     if not result then
+        if addon.ui.detailDecision then
+            addon.ui.detailDecision:SetText("")
+        end
         local reason = FormatStatusReason(req.statusReason)
         if reason == "bridge pending" then
             addon.ui.detailScore:SetText("No result yet (bridge pending). For name-only targets, run bridge fetch after logout/reload, then /ri sync.")
@@ -3759,6 +4003,10 @@ function addon:RefreshDetailPanel(selectedEntry)
     local scoreColored = result.gearScore and ColorText(scoreValue, GetGearScoreColorCode(result.gearScore)) or scoreValue
     local specColored = ColorText(specText, "ff9933")
 
+    if addon.ui.detailDecision then
+        addon.ui.detailDecision:SetText("")
+    end
+
     addon.ui.detailScore:SetText(
         "GS: " .. scoreColored .. " | Character: Lvl " .. levelText .. " | " .. classText .. " | Guild: " .. guildText
     )
@@ -3790,12 +4038,12 @@ function addon:RefreshDetailPanel(selectedEntry)
         socketsText = ColorText(socketsText, "ff6666")
     end
 
-    addon.ui.detailAudit:SetText(
-        "Audit: " .. missingEnchantText
-            .. " | " .. missingGemsText
-            .. " | " .. socketsText
-            .. " | items=" .. tostring(itemsAnalyzed)
-    )
+    local auditText = "Audit: " .. missingEnchantText
+        .. " | " .. missingGemsText
+        .. " | " .. socketsText
+        .. " | items=" .. tostring(itemsAnalyzed)
+
+    addon.ui.detailAudit:SetText(auditText)
 
     local itemsBySlot = {}
     local detailLines = {}
@@ -3813,22 +4061,72 @@ function addon:RefreshDetailPanel(selectedEntry)
         end
     end
 
-    for i = 1, #SLOT_ORDER do
-        local slotKey = SLOT_ORDER[i]
-        local slotItem = itemsBySlot[slotKey]
-        if ItemMatchesListFilter(filterMode, slotKey, slotItem) then
+    if buttonMode == "super-simple" then
+        local decision = addon:EvaluateSuperSimpleResult(result)
+        local decisionText = decision.pass and "OK" or "NO"
+        local decisionColor = "ff3333"
+        if addon.ui.detailDecision then
+            addon.ui.detailDecision:SetText(ColorText(decisionText, decisionColor))
+            SetFontStringBold(addon.ui.detailDecision, decision.pass)
+        end
+
+        local requiredText = decision.required > 0 and tostring(decision.required) or "not set"
+        local playerScoreText = decision.score and ColorText(tostring(decision.score), GetGearScoreColorCode(decision.score)) or "N/A"
+        local deltaText = decision.delta and tostring(decision.delta) or "n/a"
+        local auditState = (decision.missingEnchant == 0 and decision.missingGems == 0 and not decision.hasLowTierEnchant) and "clean" or "errors"
+
+        addon.ui.detailScore:SetText(
+            "GS: " .. playerScoreText
+                .. " | Required: " .. requiredText
+                .. " +/- " .. tostring(decision.allowedRange)
+                .. " | Delta: " .. deltaText
+        )
+
+        if addon.ui.detailMeta then
+            addon.ui.detailMeta:SetText(
+                "Character: Lvl " .. levelText .. " | " .. classText .. " | Talent: " .. specColored .. " | Guild: " .. guildText
+            )
+        end
+
+        local reasonsText = #decision.reasons > 0 and table.concat(decision.reasons, ", ") or "pass"
+        addon.ui.detailAudit:SetText(
+            "Decision: " .. ColorText(decisionText, decisionColor)
+                .. " | Audit=" .. auditState
+                .. " | Reasons: " .. reasonsText
+        )
+
+        detailLines = {
+            { text = "Required GS: " .. requiredText },
+            { text = "Allowed range: +/-" .. tostring(decision.allowedRange) },
+            { text = "Player GS: " .. playerScoreText },
+            { text = "GS delta: " .. deltaText },
+            { text = "Missing enchants: " .. tostring(decision.missingEnchant) },
+            { text = "Missing gems: " .. tostring(decision.missingGems) },
+            { text = "Low-tier enchants: " .. (decision.hasLowTierEnchant and ColorText("yes", "ff6666") or ColorText("no", "66ff66")) },
+            { text = "Decision rule: clean gear and GS inside configured +/- range" },
+        }
+    else
+        if addon.ui.detailDecision then
+            SetFontStringBold(addon.ui.detailDecision, false)
+        end
+
+        for i = 1, #SLOT_ORDER do
+            local slotKey = SLOT_ORDER[i]
+            local slotItem = itemsBySlot[slotKey]
+            if ItemMatchesListFilter(filterMode, slotKey, slotItem) then
+                table.insert(detailLines, {
+                    text = addon:BuildSlotLine(slotKey, slotItem),
+                    item = slotItem,
+                    slotKey = slotKey,
+                })
+            end
+        end
+
+        if unslotted > 0 and filterMode == "all" then
             table.insert(detailLines, {
-                text = addon:BuildSlotLine(slotKey, slotItem),
-                item = slotItem,
-                slotKey = slotKey,
+                text = ColorText("Other: " .. tostring(unslotted) .. " unslotted item(s)", "ffcc66"),
             })
         end
-    end
-
-    if unslotted > 0 and filterMode == "all" then
-        table.insert(detailLines, {
-            text = ColorText("Other: " .. tostring(unslotted) .. " unslotted item(s)", "ffcc66"),
-        })
     end
 
     if #detailLines == 0 then
@@ -3904,6 +4202,15 @@ function addon:RefreshMainWindow()
         local selectedMode = addon:GetButtonMode()
         UIDropDownMenu_SetSelectedValue(addon.ui.modeDropDown, selectedMode)
         UIDropDownMenu_SetText(addon.ui.modeDropDown, BUTTON_MODE_LABELS[selectedMode] or selectedMode)
+    end
+
+    if addon.ui.superSimpleRequiredInput and (not addon.ui.superSimpleRequiredInput.HasFocus or not addon.ui.superSimpleRequiredInput:HasFocus()) then
+        local required = addon:GetSuperSimpleRequiredGearScore()
+        addon.ui.superSimpleRequiredInput:SetText(required > 0 and tostring(required) or "")
+    end
+
+    if addon.ui.superSimpleRangeInput and (not addon.ui.superSimpleRangeInput.HasFocus or not addon.ui.superSimpleRangeInput:HasFocus()) then
+        addon.ui.superSimpleRangeInput:SetText(tostring(addon:GetSuperSimpleGearScoreRange()))
     end
 
     if addon.ui.itemFilterDropDown then
