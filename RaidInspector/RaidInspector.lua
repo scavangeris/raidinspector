@@ -17,6 +17,7 @@ local ACHIEVEMENT_COMPARE_THROTTLE_SECONDS = 2
 local ACHIEVEMENT_COMPARE_TIMEOUT_SECONDS = 8
 local REPORT_SNAPSHOT_LIMIT = 200
 local OVERVIEW_ROW_HEIGHT = 18
+local OVERVIEW_VISIBLE_ROWS = 14
 local DETAIL_ROW_HEIGHT = 18
 local WINDOW_WIDTH = 1000
 local WINDOW_HEIGHT = 500
@@ -2859,6 +2860,14 @@ function addon:BuildOverviewRows(container, rowCount)
     container.rows = container.rows or {}
     local i
     local rowWidth = tonumber(container:GetWidth()) or 432
+    local containerHeight = tonumber(container:GetHeight()) or 0
+    local maxVisibleRows = math.max(1, math.min(OVERVIEW_VISIBLE_ROWS, math.floor(containerHeight / OVERVIEW_ROW_HEIGHT)))
+
+    if rowCount then
+        rowCount = math.max(1, math.min(tonumber(rowCount) or maxVisibleRows, maxVisibleRows))
+    else
+        rowCount = maxVisibleRows
+    end
 
     for i = 1, rowCount do
         local row = CreateFrame("Button", nil, container)
@@ -3361,26 +3370,30 @@ function addon:CreateMainWindow()
         end)
     end)
 
-    local rowsContainer = CreateFrame("Frame", nil, f)
-    rowsContainer:SetPoint("TOPLEFT", actionPanel, "BOTTOMLEFT", 0, -10)
-    rowsContainer:SetWidth(432)
-    rowsContainer:SetHeight(300)
-    if rowsContainer.SetClipsChildren then
-        rowsContainer:SetClipsChildren(true)
-    end
-    addon:BuildOverviewRows(rowsContainer, 18)
+    local overviewHeight = OVERVIEW_ROW_HEIGHT * OVERVIEW_VISIBLE_ROWS
 
-    local overviewScroll = CreateFrame("ScrollFrame", "RaidInspectorOverviewScroll", rowsContainer, "FauxScrollFrameTemplate")
-    overviewScroll:SetPoint("TOPLEFT", rowsContainer, "TOPRIGHT", 0, -1)
-    overviewScroll:SetPoint("BOTTOMLEFT", rowsContainer, "BOTTOMRIGHT", 0, 1)
+    local rowsViewport = CreateFrame("ScrollFrame", nil, f)
+    rowsViewport:SetPoint("TOPLEFT", actionPanel, "BOTTOMLEFT", 0, -10)
+    rowsViewport:SetWidth(432)
+    rowsViewport:SetHeight(overviewHeight)
+
+    local rowsContainer = CreateFrame("Frame", nil, rowsViewport)
+    rowsContainer:SetWidth(432)
+    rowsContainer:SetHeight(overviewHeight)
+    rowsViewport:SetScrollChild(rowsContainer)
+    addon:BuildOverviewRows(rowsContainer, OVERVIEW_VISIBLE_ROWS)
+
+    local overviewScroll = CreateFrame("ScrollFrame", "RaidInspectorOverviewScroll", rowsViewport, "FauxScrollFrameTemplate")
+    overviewScroll:SetPoint("TOPLEFT", rowsViewport, "TOPRIGHT", 0, -1)
+    overviewScroll:SetPoint("BOTTOMLEFT", rowsViewport, "BOTTOMRIGHT", 0, 1)
     overviewScroll:SetScript("OnVerticalScroll", function(self, offset)
         FauxScrollFrame_OnVerticalScroll(self, offset, OVERVIEW_ROW_HEIGHT, function()
             addon:RefreshMainWindow()
         end)
     end)
 
-    rowsContainer:EnableMouseWheel(true)
-    rowsContainer:SetScript("OnMouseWheel", function(_, delta)
+    rowsViewport:EnableMouseWheel(true)
+    rowsViewport:SetScript("OnMouseWheel", function(_, delta)
         local maxOffset = math.max(0, (addon.ui.overviewEntryCount or 0) - #rowsContainer.rows)
         local current = GetFauxScrollOffset(overviewScroll)
         local nextOffset = math.max(0, math.min(maxOffset, current - delta))
