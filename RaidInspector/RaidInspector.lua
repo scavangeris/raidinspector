@@ -34,6 +34,12 @@ local RAID_CATEGORY_MATCHERS = {
 local SORT_MODES = { "recent", "gs", "issues", "name" }
 local FILTER_MODES = { "all", "snapshot", "ready", "queued", "issues" }
 local ITEM_LIST_FILTER_MODES = { "all", "issues", "missing-enchant", "missing-gems" }
+local BUTTON_MODES = { "advanced", "easy" }
+
+local BUTTON_MODE_LABELS = {
+    advanced = "Advanced",
+    easy = "Easy",
+}
 
 local SORT_LABELS = {
     recent = "Recent",
@@ -269,6 +275,28 @@ end
 
 local function ColorText(text, color)
     return "|cff" .. color .. tostring(text) .. "|r"
+end
+
+local function EscapeChatMessage(text)
+    local value = tostring(text or "")
+    return string.gsub(value, "|", "||")
+end
+
+local function SetFontStringBold(fontString, enabled)
+    if not fontString or not fontString.GetFont or not fontString.SetFont then
+        return
+    end
+
+    local fontName, fontHeight = fontString:GetFont()
+    if not fontName or not fontHeight then
+        return
+    end
+
+    if enabled then
+        fontString:SetFont(fontName, fontHeight, "OUTLINE")
+    else
+        fontString:SetFont(fontName, fontHeight, "")
+    end
 end
 
 local GS_LITE_QUALITY = {
@@ -1688,6 +1716,13 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state, "ui", {})
     EnsureTable(RaidInspectorDB.state.ui, "selectedKey", "")
     EnsureTable(RaidInspectorDB.state.ui, "itemListFilterMode", "all")
+    EnsureTable(RaidInspectorDB.state.ui, "buttonMode", "advanced")
+    EnsureTable(RaidInspectorDB.state.ui, "minimap", {})
+    EnsureTable(RaidInspectorDB.state.ui.minimap, "angle", 220)
+    EnsureTable(RaidInspectorDB.state.ui, "exportChannels", {})
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "raid", true)
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "say", false)
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "whisper", false)
 
     EnsureTable(RaidInspectorDB, "requests", {})
     EnsureTable(RaidInspectorDB, "results", {})
@@ -1722,6 +1757,46 @@ function addon:GetItemListFilterMode()
     end
     RaidInspectorDB.state.ui.itemListFilterMode = "all"
     return "all"
+end
+
+function addon:GetButtonMode()
+    local mode = RaidInspectorDB.state.ui.buttonMode
+    if BUTTON_MODE_LABELS[mode] then
+        return mode
+    end
+    RaidInspectorDB.state.ui.buttonMode = "advanced"
+    return "advanced"
+end
+
+function addon:GetExportChannels()
+    EnsureTable(RaidInspectorDB.state.ui, "exportChannels", {})
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "raid", true)
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "say", false)
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "whisper", false)
+    return RaidInspectorDB.state.ui.exportChannels
+end
+
+function addon:SetExportChannel(channel, enabled)
+    if channel ~= "raid" and channel ~= "say" and channel ~= "whisper" then
+        return false
+    end
+
+    local channels = addon:GetExportChannels()
+    channels[channel] = enabled and true or false
+    return true
+end
+
+function addon:SetButtonMode(mode)
+    if not BUTTON_MODE_LABELS[mode] then
+        return false
+    end
+
+    RaidInspectorDB.state.ui.buttonMode = mode
+    if addon.ApplyButtonModeLayout then
+        addon:ApplyButtonModeLayout()
+    end
+    addon:RefreshMainWindow()
+    return true
 end
 
 function addon:SetItemListFilterMode(mode)
@@ -2070,20 +2145,32 @@ function addon:QueueTarget()
         return
     end
 
-    local name = UnitName("target")
-    local realm = GetRealmName()
+    local name, targetRealm = UnitName("target")
+    local realm = targetRealm
+    if not realm or realm == "" then
+        realm = GetRealmName() or ""
+    end
 
     if not name or name == "" then
         Print("target has no valid name")
         return
     end
 
+    if realm == "" then
+        Print("target has no valid realm")
+        return
+    end
+
+    local key = MakePlayerKey(name, realm)
+
     addon:QueueInspect(name, realm, { allowDuplicate = false, silent = true, reason = "queued-target" })
+    addon:SetSelectedKey(key)
     local okLive, reason = addon:QueueLiveInspectUnit("target", false)
     addon:ProcessInspectQueue(true)
+    addon:RefreshMainWindow()
 
     if reason == "cannot-inspect" or reason == "unit-not-found" then
-        addon:SetLatestRequestState(MakePlayerKey(name, realm), "queued", reason)
+        addon:SetLatestRequestState(key, "queued", reason)
     end
 
     if okLive then
@@ -2540,6 +2627,80 @@ function addon:BuildDetailRows(container, rowCount)
     end
 end
 
+function addon:ApplyButtonModeLayout()
+    if not addon.ui or not addon.ui.actionPanel then
+        return
+    end
+
+    local mode = addon:GetButtonMode()
+    local buttons = {
+        sort = addon.ui.sortButton,
+        filter = addon.ui.filterButton,
+        target = addon.ui.targetButton,
+        raid = addon.ui.raidButton,
+        sync = addon.ui.syncButton,
+        force = addon.ui.forceSyncButton,
+        export = addon.ui.exportButton,
+        stale = addon.ui.staleButton,
+        status = addon.ui.statusButton,
+        clear = addon.ui.clearButton,
+    }
+
+    local visible = {
+        sort = true,
+        filter = true,
+        target = true,
+        raid = true,
+        sync = true,
+        force = true,
+        export = true,
+        stale = true,
+        status = true,
+        clear = true,
+    }
+
+    local order = { "sort", "filter", "target", "raid", "sync", "force", "export", "stale", "status", "clear" }
+    if mode == "easy" then
+        visible.sync = false
+        visible.force = false
+        visible.stale = false
+        order = { "sort", "filter", "target", "raid", "status", "export", "clear" }
+    end
+
+    local key, button
+    for key, button in pairs(buttons) do
+        if button then
+            if visible[key] then
+                button:Show()
+            else
+                button:Hide()
+            end
+        end
+    end
+
+    if buttons.status then
+        if mode == "easy" then
+            buttons.status:SetText("|cffffaa33Display|r")
+        else
+            buttons.status:SetText("|cffffaa33Status|r")
+        end
+    end
+
+    local index = 0
+    local i
+    for i = 1, #order do
+        key = order[i]
+        button = buttons[key]
+        if button and visible[key] then
+            local col = index % 2
+            local row = math.floor(index / 2)
+            button:ClearAllPoints()
+            button:SetPoint("TOPLEFT", addon.ui.actionPanel, "TOPLEFT", col * 106, -(row * 26))
+            index = index + 1
+        end
+    end
+end
+
 local function BuildInspectItemHyperlink(item)
     local itemId = tonumber(item and item.itemId)
     if not itemId then
@@ -2671,6 +2832,35 @@ function addon:CreateMainWindow()
     title:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -14)
     title:SetText("Raid Inspector")
 
+    local modeDropDown = CreateFrame("Frame", "RaidInspectorButtonModeDropDown", f, "UIDropDownMenuTemplate")
+    modeDropDown:SetPoint("LEFT", title, "RIGHT", 18, -2)
+    UIDropDownMenu_SetWidth(modeDropDown, 120)
+    UIDropDownMenu_JustifyText(modeDropDown, "LEFT")
+    UIDropDownMenu_Initialize(modeDropDown, function(_, level)
+        if level ~= 1 then
+            return
+        end
+
+        local i
+        for i = 1, #BUTTON_MODES do
+            local mode = BUTTON_MODES[i]
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = BUTTON_MODE_LABELS[mode] or mode
+            info.value = mode
+            info.checked = (addon:GetButtonMode() == mode)
+            info.func = function(btn)
+                local selectedMode = btn.value
+                addon:SetButtonMode(selectedMode)
+                UIDropDownMenu_SetSelectedValue(modeDropDown, selectedMode)
+                UIDropDownMenu_SetText(modeDropDown, BUTTON_MODE_LABELS[selectedMode] or selectedMode)
+            end
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end)
+    local selectedButtonMode = addon:GetButtonMode()
+    UIDropDownMenu_SetSelectedValue(modeDropDown, selectedButtonMode)
+    UIDropDownMenu_SetText(modeDropDown, BUTTON_MODE_LABELS[selectedButtonMode] or selectedButtonMode)
+
     local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
     subtitle:SetText("Raid overview + selected player details")
@@ -2684,12 +2874,6 @@ function addon:CreateMainWindow()
     statusText:SetWidth(WINDOW_WIDTH - (PANEL_SIDE_MARGIN * 2))
     statusText:SetText("")
 
-    local snapshotText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    snapshotText:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
-    snapshotText:SetWidth(WINDOW_WIDTH - (PANEL_SIDE_MARGIN * 2))
-    snapshotText:SetJustifyH("LEFT")
-    snapshotText:SetText("Snapshot: none")
-
     local function SetActionButtonLabel(button, colorCode, plainText)
         button:SetText("|c" .. colorCode .. plainText .. "|r")
     end
@@ -2700,8 +2884,53 @@ function addon:CreateMainWindow()
         button:SetFrameLevel(80)
     end
 
+    local exportChannelsRow = CreateFrame("Frame", nil, f)
+    exportChannelsRow:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
+    exportChannelsRow:SetWidth(320)
+    exportChannelsRow:SetHeight(20)
+
+    local exportChannelsLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    exportChannelsLabel:SetPoint("LEFT", exportChannelsRow, "LEFT", 0, 0)
+    exportChannelsLabel:SetText("Export:")
+
+    local exportRaidCheck = CreateFrame("CheckButton", "RaidInspectorExportRaidCheck", f, "UICheckButtonTemplate")
+    exportRaidCheck:SetPoint("LEFT", exportChannelsLabel, "RIGHT", 6, -1)
+    local exportRaidText = _G["RaidInspectorExportRaidCheckText"]
+    if exportRaidText then
+        exportRaidText:SetText("Raid")
+    end
+
+    local exportSayCheck = CreateFrame("CheckButton", "RaidInspectorExportSayCheck", f, "UICheckButtonTemplate")
+    exportSayCheck:SetPoint("LEFT", exportRaidCheck, "RIGHT", 42, 0)
+    local exportSayText = _G["RaidInspectorExportSayCheckText"]
+    if exportSayText then
+        exportSayText:SetText("Say")
+    end
+
+    local exportWhisperCheck = CreateFrame("CheckButton", "RaidInspectorExportWhisperCheck", f, "UICheckButtonTemplate")
+    exportWhisperCheck:SetPoint("LEFT", exportSayCheck, "RIGHT", 38, 0)
+    local exportWhisperText = _G["RaidInspectorExportWhisperCheckText"]
+    if exportWhisperText then
+        exportWhisperText:SetText("Whisper")
+    end
+
+    local exportChannels = addon:GetExportChannels()
+    exportRaidCheck:SetChecked(exportChannels.raid and true or false)
+    exportSayCheck:SetChecked(exportChannels.say and true or false)
+    exportWhisperCheck:SetChecked(exportChannels.whisper and true or false)
+
+    exportRaidCheck:SetScript("OnClick", function(self)
+        addon:SetExportChannel("raid", self:GetChecked() and true or false)
+    end)
+    exportSayCheck:SetScript("OnClick", function(self)
+        addon:SetExportChannel("say", self:GetChecked() and true or false)
+    end)
+    exportWhisperCheck:SetScript("OnClick", function(self)
+        addon:SetExportChannel("whisper", self:GetChecked() and true or false)
+    end)
+
     local actionPanel = CreateFrame("Frame", nil, f)
-    actionPanel:SetPoint("TOPLEFT", snapshotText, "BOTTOMLEFT", 0, -8)
+    actionPanel:SetPoint("TOPLEFT", exportChannelsRow, "BOTTOMLEFT", 0, -6)
     actionPanel:SetWidth(214)
     actionPanel:SetHeight(130)
 
@@ -2962,10 +3191,23 @@ function addon:CreateMainWindow()
     end)
 
     addon.ui.frame = f
+    addon.ui.modeDropDown = modeDropDown
     addon.ui.statusText = statusText
-    addon.ui.snapshotText = snapshotText
+    addon.ui.actionPanel = actionPanel
     addon.ui.sortButton = sortButton
     addon.ui.filterButton = filterButton
+    addon.ui.targetButton = targetButton
+    addon.ui.raidButton = raidButton
+    addon.ui.syncButton = syncButton
+    addon.ui.forceSyncButton = forceSyncButton
+    addon.ui.exportButton = exportButton
+    addon.ui.staleButton = staleButton
+    addon.ui.statusButton = statusButton
+    addon.ui.clearButton = clearButton
+    addon.ui.exportChannelsLabel = exportChannelsLabel
+    addon.ui.exportRaidCheck = exportRaidCheck
+    addon.ui.exportSayCheck = exportSayCheck
+    addon.ui.exportWhisperCheck = exportWhisperCheck
     addon.ui.overviewRows = rowsContainer.rows
     addon.ui.overviewScroll = overviewScroll
     addon.ui.overviewEntryCount = 0
@@ -2980,7 +3222,20 @@ function addon:CreateMainWindow()
     addon.ui.lastDetailKey = ""
     addon.ui.lastDetailEntry = nil
 
+    addon:ApplyButtonModeLayout()
+
     f:Hide()
+end
+
+function addon:CreateMinimapButton()
+    if addon.ui and addon.ui.minimapButton then
+        addon.ui.minimapButton:Hide()
+        addon.ui.minimapButton = nil
+    end
+
+    if RaidInspectorMinimapButton then
+        RaidInspectorMinimapButton:Hide()
+    end
 end
 
 function addon:BuildOverviewRowText(entry)
@@ -3322,6 +3577,8 @@ function addon:RefreshMainWindow()
         return
     end
 
+    addon:ApplyButtonModeLayout()
+
     local queued, ready, errorCount = addon:GetCounts()
     local fresh, stale = addon:GetFreshnessCounts(FRESHNESS_TTL_SECONDS)
     local playersWithIssues, totalIssues = addon:GetIssueTotals()
@@ -3335,23 +3592,18 @@ function addon:RefreshMainWindow()
             .. "  |  Errors: " .. errorCount
     )
 
-    if addon.ui.snapshotText then
-        local progress = addon:GetSnapshotProgress()
-        if progress then
-            addon.ui.snapshotText:SetText(
-                "Snapshot: " .. progress.ready .. "/" .. progress.total .. " fresh  |  stale=" .. progress.stale .. "  |  missing=" .. progress.missing
-            )
-        else
-            addon.ui.snapshotText:SetText("Snapshot: none (use /ri inspectraid)")
-        end
-    end
-
     if addon.ui.sortButton then
         addon.ui.sortButton:SetText("|cff66ff66S:" .. addon:GetSortMode() .. "|r")
     end
 
     if addon.ui.filterButton then
         addon.ui.filterButton:SetText("|cff66ff66F:" .. addon:GetFilterMode() .. "|r")
+    end
+
+    if addon.ui.modeDropDown then
+        local selectedMode = addon:GetButtonMode()
+        UIDropDownMenu_SetSelectedValue(addon.ui.modeDropDown, selectedMode)
+        UIDropDownMenu_SetText(addon.ui.modeDropDown, BUTTON_MODE_LABELS[selectedMode] or selectedMode)
     end
 
     if addon.ui.itemFilterDropDown then
@@ -3430,24 +3682,18 @@ function addon:RefreshMainWindow()
             row.key = entry.key
             row.text:SetText(addon:BuildOverviewRowText(entry))
             local hasAuditIssues = EntryHasMissingAuditIssues(entry)
-            if entry.key == selectedKey then
-                if hasAuditIssues then
-                    row.text:SetTextColor(1.0, 0.35, 0.35)
-                else
-                    row.text:SetTextColor(1.0, 0.82, 0.0)
-                end
+            if hasAuditIssues then
+                row.text:SetTextColor(1.0, 0.20, 0.20)
             else
-                if hasAuditIssues then
-                    row.text:SetTextColor(1.0, 0.20, 0.20)
-                else
-                    row.text:SetTextColor(1.0, 1.0, 1.0)
-                end
+                row.text:SetTextColor(0.35, 1.0, 0.35)
             end
+            SetFontStringBold(row.text, entry.key == selectedKey)
             row:Show()
         else
             row.key = nil
             row.text:SetText("")
             row.text:SetTextColor(1.0, 1.0, 1.0)
+            SetFontStringBold(row.text, false)
         end
     end
 
@@ -3562,26 +3808,20 @@ function addon:BuildExportSummary(entry)
     local result = entry.result
 
     if not result then
-        return "RI " .. req.name .. "-" .. req.realm .. " status=" .. entry.state .. " (no bridge result yet)"
+        return "RI " .. req.name .. "-" .. req.realm
+            .. " | GS:N/A"
+            .. " | MissingGems/Enchants:?/?"
     end
 
     local score = result.gearScore and tostring(result.gearScore) or "N/A"
-    local source = result.gearScoreSource and tostring(result.gearScoreSource) or "none"
     local summary = result.issueSummary or {}
     local missingEnchant = tonumber(summary.missingEnchant or 0) or 0
     local missingGems = tonumber(summary.missingGems or 0) or 0
-    local age = entry.ageMinutes >= 0 and tostring(entry.ageMinutes) .. "m" or "?"
-    local raid = result.raidAchievements or {}
-    local raidShort = "ICC25:" .. FlagText(raid.icc25) .. " RS25:" .. FlagText(raid.rs25)
 
     return "RI " .. req.name
         .. "-" .. req.realm
-        .. " GS:" .. score
-        .. " (" .. source .. ")"
-        .. " E:" .. tostring(missingEnchant)
-        .. " G:" .. tostring(missingGems)
-        .. " " .. raidShort
-        .. " age:" .. age
+        .. " | GS:" .. score
+        .. " | MissingGems/Enchants:" .. tostring(missingGems) .. "/" .. tostring(missingEnchant)
 end
 
 function addon:ExportSummary(arg)
@@ -3624,18 +3864,46 @@ function addon:ExportSummary(arg)
         Print("nothing to export")
         return
     end
+    local chatMessage = EscapeChatMessage(message)
 
-    local sent = false
-    if GetNumRaidMembers and GetNumRaidMembers() > 0 then
-        SendChatMessage(message, "RAID")
-        sent = true
-    elseif GetNumPartyMembers and GetNumPartyMembers() > 0 then
-        SendChatMessage(message, "PARTY")
-        sent = true
+    local channels = addon:GetExportChannels()
+    local attempted = 0
+    local sent = 0
+
+    if channels.raid then
+        attempted = attempted + 1
+        if GetNumRaidMembers and GetNumRaidMembers() > 0 then
+            SendChatMessage(chatMessage, "RAID")
+            sent = sent + 1
+        else
+            Print("export: RAID checked, but you are not in a raid")
+        end
     end
 
-    if not sent then
-        Print(message)
+    if channels.say then
+        attempted = attempted + 1
+        SendChatMessage(chatMessage, "SAY")
+        sent = sent + 1
+    end
+
+    if channels.whisper then
+        attempted = attempted + 1
+        local whisperTarget = selected and selected.req and Trim(selected.req.name or "") or ""
+        if whisperTarget ~= "" then
+            SendChatMessage(chatMessage, "WHISPER", nil, whisperTarget)
+            sent = sent + 1
+        else
+            Print("export: WHISPER checked, but selected player name is missing")
+        end
+    end
+
+    if attempted == 0 then
+        Print("export: no channels selected (Raid/Say/Whisper)")
+        return
+    end
+
+    if sent == 0 then
+        Print(chatMessage)
     end
 end
 

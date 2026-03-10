@@ -30,6 +30,10 @@ Because of this, Raid Inspector must use an external bridge process (desktop scr
 	- `bridge/sample_result.json`
 	- `bridge/write_bridge_inbox.py`
 - Full implementation plan is in `ROADMAP.md`.
+- Release assets:
+	- `CHANGELOG.md`
+	- `bridge/BRIDGE_SETUP.md`
+	- `tools/package_release.py`
 
 ## Commands
 - `/ri help`
@@ -39,10 +43,29 @@ Because of this, Raid Inspector must use an external bridge process (desktop scr
 - `/ri inspect <name> <realm>`
 - `/ri inspect <name-realm>`
 - `/ri inspecttarget`
+- `/ri inspectraid`
 - `/ri sync`
 - `/ri forcesync`
+- `/ri sort [recent|gs|issues|name]`
+- `/ri filter [all|snapshot|ready|queued|issues]`
+- `/ri export [name-realm]`
 - `/ri status`
+- `/ri refreshstale [minutes]`
 - `/ri clearqueue`
+
+## Live Inspect Mode (No Restart Needed)
+For nearby/inspectable players, the addon now supports in-session live inspection.
+
+- `Target` button or `/ri inspecttarget`:
+	- queues and inspects your current target immediately
+- `Raid` button or `/ri inspectraid`:
+	- queues raid snapshot and starts live inspect scan
+
+This path does not require restarting WoW or running external scripts.
+
+Limitations:
+- WoW inspect API requires the unit to be inspectable (range/visibility/permissions).
+- If a unit is not inspectable, keep bridge mode as fallback.
 
 ## SavedVariables Shape
 ```lua
@@ -67,6 +90,21 @@ RaidInspectorBridgeInbox = {
 	}
 }
 ```
+
+Raid workflow additions:
+- raid snapshot queueing (`/ri inspectraid`) with UI snapshot progress
+- stale data requeue helper (`/ri refreshstale [minutes]`)
+
+Phase 5 UI additions:
+- selectable raid overview list (left panel)
+- selected player detail panel with slot-by-slot table (right panel)
+- per-slot audit indicators:
+	- enchant status (`E:OK`, `E:MISS`, `E:LOW`)
+	- gem fill status (`G:x/y`)
+- sort/filter controls in-window and slash command equivalents
+- one-click quick export to raid/party chat
+- quick test-action buttons in-window:
+	- `Target`, `Raid`, `Sync`, `Force`, `Stale 15m`, `Status`, `Clear`
 
 Important: this inbox variable is stored in
 `WTF/Account/<ACCOUNT>/SavedVariables/RaidInspectorBridge.lua`
@@ -105,10 +143,58 @@ Useful flags:
 - `--dry-run` : fetch and print JSON, do not write bridge file.
 - `--verbose` : print each API URL being fetched.
 - `--include-raw` : include full Warmane response in the bridge payload.
+- `--cache-ttl-minutes 20` : skip fetch for keys with fresh existing addon cache.
+- `--retries 2` : retry count for transient network errors.
+- `--retry-backoff 1.0` : exponential backoff base seconds.
+- `--request-delay 0.2` : minimum delay between outbound HTTP requests.
 - `--timeout 20` : set per-request timeout in seconds.
+- `--achievements-timeout 20` : timeout for Warmane achievement category checks.
+- `--armory-html-timeout 20` : timeout for Warmane HTML enrichment fetch.
+- `--skip-armory-html` : disable HTML rel parsing fallback.
+- `--item-ilvl-timeout 20` : timeout for item-level lookup pages.
+- `--skip-item-ilvl` : disable item-level enrichment fallback.
+- `--skip-raid-achievements` : disable ICC/TOC/RS achievement presence checks.
+- `--item-ilvl-cache "path/to/item_ilvl_cache.json"` : custom cache path.
 - `--cot-url-template "https://.../{name}/{realm}"` : optional Cavern score enrichment endpoint.
 - `--cot-overwrite-existing-score` : let Cavern score replace an existing Warmane score.
 - `--cot-timeout 20` : timeout for Cavern score lookup.
+
+### Daemon-Like Bridge Loop
+For less manual testing, run the loop helper to call the fetcher periodically:
+
+```bash
+/usr/bin/python3 "Interface/AddOns/RaidInspector/bridge/daemon_loop.py" \
+	--raid-inspector-sv "WTF/Account/SCAVROGUE/SavedVariables/RaidInspector.lua" \
+	--bridge-output "WTF/Account/SCAVROGUE/SavedVariables/RaidInspectorBridge.lua" \
+	--interval 30 \
+	--fetch-args --status-filter all --cache-ttl-minutes 20 --retries 2 --retry-backoff 1.0 --request-delay 0.2 --verbose
+```
+
+Use `--once` to run a single cycle using the same wrapper command.
+
+### Bridge Output Additions
+The fetcher now enriches each player result with:
+- `estimatedGearScore` : fallback estimate (GearScoreLite-style first, avg-ilvl fallback second)
+- `issuesCount` : quick count (`missingEnchant + missingGems`)
+- `issueSummary` : detailed audit counters:
+	- `missingEnchant`
+	- `missingGems`
+	- `itemsWithoutSlot`
+	- `itemsAnalyzed`
+	- `itemsWithSockets`
+	- `totalSockets`
+	- `filledSockets`
+- `achievementPoints` : Warmane summary achievement points
+- `raidAchievements` : raid-presence flags
+	- `icc10`, `icc25`, `toc10`, `toc25`, `rs10`, `rs25`
+
+Current limitation: some Warmane summary responses do not include slot/socket/enchant metadata,
+so the fetcher uses an armory HTML enrichment fallback (`rel="item=...&ench=...&gems=..."`) to recover slot/enchant/gem data.
+If this HTML format changes, run with `--skip-armory-html` and the bridge will continue in summary-only mode.
+
+When item level is missing in summary data, the fetcher can enrich ilvl by scraping
+`https://wotlk.cavernoftime.com/item=<id>` pages and cache results in:
+`Interface/AddOns/RaidInspector/bridge/item_ilvl_cache.json`.
 
 ### Cavern Score Enrichment Notes
 - Cavern integration is optional and endpoint-template based.
@@ -117,3 +203,29 @@ Useful flags:
 	- `{name_raw}`, `{realm_raw}`, `{key_raw}` (not encoded)
 - If Cavern endpoint is unreachable or not JSON, fetch continues and Warmane data is still written.
 - In current testing, `https://mop.cavernoftime.com/api` paths returned HTML (not JSON), so no score was extracted automatically from that base path.
+
+### Reliability Hardening (Phase 7)
+- Retry + backoff: transient HTTP/network failures are retried (`--retries`, `--retry-backoff`).
+- Request pacing: outbound requests are rate-limited with `--request-delay`.
+- Atomic writes: bridge and item-ilvl cache files are written via temp-file + replace to reduce corruption risk.
+- Cache TTL guard: `--cache-ttl-minutes` skips network calls for recently updated keys from addon SavedVariables cache.
+- Schema guard: non-dict API payloads are wrapped for resilient parsing instead of hard-failing.
+
+## Release Packaging (Phase 8)
+Build a release zip that contains both addons (`RaidInspector` + `RaidInspectorBridge`).
+
+```bash
+cd "Interface/AddOns/RaidInspector"
+/usr/bin/python3 "tools/package_release.py"
+```
+
+Default output:
+- `Interface/AddOns/RaidInspectorRelease/RaidInspector-v<version>.zip`
+
+Optional arguments:
+- `--addons-root ".../Interface/AddOns"`
+- `--output-dir ".../output/folder"`
+- `--version "0.6.0-alpha"`
+
+Bridge operator guide:
+- `bridge/BRIDGE_SETUP.md`

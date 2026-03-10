@@ -12,6 +12,8 @@
    - bridge parser for real Warmane summary payload
    - Cavern of Time compatible gearscore mapping
    - item/enchant UI detail panel
+   - set class colors on character info (color values TBD; to be provided later)
+   - add display mode `super simple` (alongside `advanced` and `easy`) with required gearscore input and `OK/NO` decision label
    - save/export report snapshots for later reuse
    - current raid scan history with 30-day retention
    - confirmation window before destructive clear actions
@@ -54,6 +56,7 @@
 ## Phase 5 - UI Features
 1. Build main report window:
    - player header (name, class, realm, guild)
+   - apply class color styling to character info in header/details (exact palette pending)
    - total score and confidence/source
    - slot-by-slot item table
 2. Add enchant/gem audit indicators:
@@ -62,6 +65,16 @@
    - missing gem
 3. Add sort/filter controls for raid overview.
 4. Add quick export to chat (short summary format).
+5. Add display mode presets:
+   - keep `advanced` and `easy`
+   - add `super simple` mode
+   - `super simple` includes an extra input field for required gearscore
+   - evaluate inspected player as pass only when:
+      - no gear errors are present
+      - player gearscore is within configured `+/-` range of required gearscore
+   - show decision label above character stats:
+      - red bold `OK` when pass
+      - red `NO` when fail
 
 ## Phase 6 - Raid Workflow
 1. Add raid snapshot mode (scan all raid members).
