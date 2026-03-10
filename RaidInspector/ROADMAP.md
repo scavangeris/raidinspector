@@ -13,7 +13,6 @@
    - save/export report snapshots for later reuse
    - current raid scan history with 30-day retention
    - confirmation window before destructive clear actions
-   - display mode `super simple` with required gearscore input and `OK/NO` decision label
 - Next:
    - set class colors on character info (color values TBD; to be provided later)
 
@@ -64,16 +63,9 @@
    - missing gem
 3. Add sort/filter controls for raid overview.
 4. Add quick export to chat (short summary format).
-5. Add display mode presets:
-   - keep `advanced` and `easy`
-   - add `super simple` mode
-   - `super simple` includes an extra input field for required gearscore
-   - evaluate inspected player as pass only when:
-      - no gear errors are present
-      - player gearscore is within configured `+/-` range of required gearscore
-   - show decision label above character stats:
-      - red bold `OK` when pass
-      - red `NO` when fail
+5. Keep display mode presets:
+   - `advanced`
+   - `easy`
 
 ## Phase 6 - Raid Workflow
 1. Add raid snapshot mode (scan all raid members).

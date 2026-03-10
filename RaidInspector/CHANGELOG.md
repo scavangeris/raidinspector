@@ -2,6 +2,11 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.10.1-alpha - 2026-03-10
+- Removed the `super simple` display mode and its dedicated decision UI.
+- Export summaries now include talent/spec information.
+- Saved snapshot exports rebuild their message from stored payload data, so older saved reports can use the newer export format when talent data exists.
+
 ## 0.10.0-alpha - 2026-03-10
 - Added `super simple` display mode:
   - new mode selector option alongside `advanced` and `easy`
