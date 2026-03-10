@@ -2,6 +2,19 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.9.0-alpha - 2026-03-10
+- Added report snapshot persistence:
+  - `/ri savereport [name-realm]` saves the current or selected report summary into SavedVariables.
+  - `/ri export` now also stores a reusable saved snapshot before sending chat output.
+  - `/ri exportsaved [latest|id|name-realm]` re-exports a saved snapshot without needing the current overview state.
+- Added retained raid scan archive:
+  - each `/ri inspectraid` snapshot now writes a roster + summary payload archive entry.
+  - history is pruned automatically to 30 days.
+- Added safety UX for destructive clear actions:
+  - `Clear` button and `/ri clearqueue` now require confirmation by default.
+  - `/ri clearqueue confirm` bypasses the popup for explicit confirmation.
+- Bumped addon SavedVariables schema to `2` for new persistence fields.
+
 ## 0.8.1-alpha - 2026-03-09
 - UI layout polish:
   - moved action controls to a compact top-right toolbar

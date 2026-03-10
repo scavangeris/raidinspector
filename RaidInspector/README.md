@@ -34,6 +34,10 @@ Because of this, Raid Inspector must use an external bridge process (desktop scr
 	- `CHANGELOG.md`
 	- `bridge/BRIDGE_SETUP.md`
 	- `tools/package_release.py`
+- Persistence/safety additions:
+	- saved report snapshots (`/ri savereport`, `/ri exportsaved`)
+	- 30-day retained raid scan archive in SavedVariables
+	- confirmation before destructive `Clear` / `/ri clearqueue`
 
 ## Commands
 - `/ri help`
@@ -48,10 +52,12 @@ Because of this, Raid Inspector must use an external bridge process (desktop scr
 - `/ri forcesync`
 - `/ri sort [recent|gs|issues|name]`
 - `/ri filter [all|snapshot|ready|queued|issues]`
+- `/ri savereport [name-realm]`
 - `/ri export [name-realm]`
+- `/ri exportsaved [latest|id|name-realm]`
 - `/ri status`
 - `/ri refreshstale [minutes]`
-- `/ri clearqueue`
+- `/ri clearqueue [confirm]`
 
 ## Live Inspect Mode (No Restart Needed)
 For nearby/inspectable players, the addon now supports in-session live inspection.
@@ -70,14 +76,26 @@ Limitations:
 ## SavedVariables Shape
 ```lua
 RaidInspectorDB = {
-	meta = { schemaVersion = 1, lastLoadedAt = 0 },
+	meta = { schemaVersion = 2, lastLoadedAt = 0 },
 	settings = { window = { point = "CENTER", x = 0, y = 0 } },
-	state = { nextRequestId = 1 },
+	state = { nextRequestId = 1, lastSnapshot = { at = 0, historyId = 0, members = {} } },
 	requests = {
 		-- { id, name, realm, key, status, requestedAt, updatedAt }
 	},
 	results = {
 		-- ["name-realm"] = { gearScore = 0, items = {...}, updatedAt = 0, source = "bridge" }
+	},
+	reportSnapshots = {
+		nextId = 1,
+		items = {
+			-- { id, savedAt, key, name, realm, message, payload = {...} }
+		}
+	},
+	raidScanHistory = {
+		nextId = 1,
+		scans = {
+			-- { id, snapshotAt, updatedAt, roster = {...}, summaryPayloads = {...} }
+		}
 	}
 }
 

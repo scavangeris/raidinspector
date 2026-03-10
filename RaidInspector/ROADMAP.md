@@ -1,6 +1,6 @@
 # Raid Inspector Roadmap
 
-## Progress Snapshot (2026-03-09)
+## Progress Snapshot (2026-03-10)
 - Done:
    - addon skeleton + queue UI
    - request queue commands (`/ri inspect`, `/ri inspecttarget`)
@@ -8,15 +8,14 @@
    - bridge contract + sample writer script
    - real queue fetcher script (`bridge/fetch_from_queue.py`) using Warmane summary API
    - optional Cavern score enrichment in fetcher via `--cot-url-template`
-- Next:
    - bridge parser for real Warmane summary payload
-   - Cavern of Time compatible gearscore mapping
    - item/enchant UI detail panel
-   - set class colors on character info (color values TBD; to be provided later)
-   - add display mode `super simple` (alongside `advanced` and `easy`) with required gearscore input and `OK/NO` decision label
    - save/export report snapshots for later reuse
    - current raid scan history with 30-day retention
    - confirmation window before destructive clear actions
+- Next:
+   - set class colors on character info (color values TBD; to be provided later)
+   - add display mode `super simple` (alongside `advanced` and `easy`) with required gearscore input and `OK/NO` decision label
 
 ## Phase 1 - Foundation
 1. Define data contract between addon and bridge.

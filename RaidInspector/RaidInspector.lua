@@ -6,14 +6,16 @@ RaidInspectorBridgeInbox = RaidInspectorBridgeInbox or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.8.8-alpha"
+addon.version = "0.9.0-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
+local RAID_HISTORY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 local INSPECT_THROTTLE_SECONDS = 2
 local INSPECT_TIMEOUT_SECONDS = 8
 local ACHIEVEMENT_COMPARE_THROTTLE_SECONDS = 2
 local ACHIEVEMENT_COMPARE_TIMEOUT_SECONDS = 8
+local REPORT_SNAPSHOT_LIMIT = 200
 local OVERVIEW_ROW_HEIGHT = 18
 local DETAIL_ROW_HEIGHT = 18
 local WINDOW_WIDTH = 1000
@@ -1187,6 +1189,8 @@ function addon:FinalizeInspectCurrent(success, failureReason)
                 req.updatedAt = GetNow()
             end
 
+            addon:RefreshActiveRaidHistoryEntry()
+
             addon:QueueAchievementCompareUnit(current.unit, current.key, current.name, current.realm, current.guid)
         else
             Print("inspect build failed: " .. tostring(resultOrErr))
@@ -1206,6 +1210,8 @@ function addon:FinalizeInspectCurrent(success, failureReason)
         end
         req.updatedAt = GetNow()
     end
+
+    addon:RefreshActiveRaidHistoryEntry()
 
     if ClearInspectPlayer then
         ClearInspectPlayer()
@@ -1433,6 +1439,7 @@ function addon:FinalizeAchievementCompareCurrent(success, points, raidFlags)
     end
 
     result.updatedAt = GetNow()
+    addon:RefreshActiveRaidHistoryEntry()
 end
 
 function addon:QueueLiveInspectUnit(unit, queueRequest)
@@ -1712,6 +1719,7 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state, "nextRequestId", 1)
     EnsureTable(RaidInspectorDB.state, "lastSnapshot", {})
     EnsureTable(RaidInspectorDB.state.lastSnapshot, "at", 0)
+    EnsureTable(RaidInspectorDB.state.lastSnapshot, "historyId", 0)
     EnsureTable(RaidInspectorDB.state.lastSnapshot, "members", {})
     EnsureTable(RaidInspectorDB.state, "ui", {})
     EnsureTable(RaidInspectorDB.state.ui, "selectedKey", "")
@@ -1726,10 +1734,17 @@ function addon:InitDatabase()
 
     EnsureTable(RaidInspectorDB, "requests", {})
     EnsureTable(RaidInspectorDB, "results", {})
+    EnsureTable(RaidInspectorDB, "reportSnapshots", {})
+    EnsureTable(RaidInspectorDB.reportSnapshots, "nextId", 1)
+    EnsureTable(RaidInspectorDB.reportSnapshots, "items", {})
+    EnsureTable(RaidInspectorDB, "raidScanHistory", {})
+    EnsureTable(RaidInspectorDB.raidScanHistory, "nextId", 1)
+    EnsureTable(RaidInspectorDB.raidScanHistory, "scans", {})
 
-    RaidInspectorDB.meta.schemaVersion = 1
+    RaidInspectorDB.meta.schemaVersion = 2
     RaidInspectorDB.meta.lastLoadedAt = GetNow()
     EnsureTable(RaidInspectorDB.meta, "lastImportedBridgeGeneratedAt", 0)
+    addon:PruneRaidScanHistory()
 end
 
 function addon:GetSortMode()
@@ -1784,6 +1799,285 @@ function addon:SetExportChannel(channel, enabled)
     local channels = addon:GetExportChannels()
     channels[channel] = enabled and true or false
     return true
+end
+
+function addon:GetReportSnapshots()
+    EnsureTable(RaidInspectorDB, "reportSnapshots", {})
+    EnsureTable(RaidInspectorDB.reportSnapshots, "nextId", 1)
+    EnsureTable(RaidInspectorDB.reportSnapshots, "items", {})
+    return RaidInspectorDB.reportSnapshots
+end
+
+function addon:GetRaidScanHistory()
+    EnsureTable(RaidInspectorDB, "raidScanHistory", {})
+    EnsureTable(RaidInspectorDB.raidScanHistory, "nextId", 1)
+    EnsureTable(RaidInspectorDB.raidScanHistory, "scans", {})
+    return RaidInspectorDB.raidScanHistory
+end
+
+function addon:PruneRaidScanHistory()
+    local history = addon:GetRaidScanHistory()
+    local cutoff = GetNow() - RAID_HISTORY_RETENTION_SECONDS
+    local kept = {}
+    local activeHistoryId = tonumber(RaidInspectorDB.state.lastSnapshot and RaidInspectorDB.state.lastSnapshot.historyId) or 0
+    local activeKept = false
+    local i
+
+    for i = 1, #history.scans do
+        local entry = history.scans[i]
+        local snapshotAt = tonumber(entry and entry.snapshotAt) or tonumber(entry and entry.updatedAt) or 0
+        if snapshotAt >= cutoff then
+            kept[#kept + 1] = entry
+            if activeHistoryId > 0 and tonumber(entry.id) == activeHistoryId then
+                activeKept = true
+            end
+        end
+    end
+
+    history.scans = kept
+    if activeHistoryId > 0 and not activeKept and RaidInspectorDB.state.lastSnapshot then
+        RaidInspectorDB.state.lastSnapshot.historyId = 0
+    end
+end
+
+function addon:BuildStoredSummaryPayload(key, req, result, state, statusReason)
+    local nameFromKey, realmFromKey = ParseKey(key or "")
+    local payload = {
+        key = key,
+        name = (req and req.name) or (result and result.name) or nameFromKey or "Unknown",
+        realm = (req and req.realm) or (result and result.realm) or realmFromKey or "Unknown",
+        state = state or (req and req.status) or "queued",
+        statusReason = statusReason or (req and req.statusReason) or nil,
+        requestId = req and tonumber(req.id) or nil,
+        requestedAt = req and tonumber(req.requestedAt) or nil,
+        updatedAt = req and tonumber(req.updatedAt) or 0,
+    }
+
+    if type(result) == "table" then
+        payload.class = result.class
+        payload.spec = result.spec
+        payload.guild = result.guild
+        payload.level = result.level
+        payload.source = result.source
+        payload.error = result.error
+        payload.gearScore = result.gearScore
+        payload.gearScoreSource = result.gearScoreSource
+        payload.estimatedGearScore = result.estimatedGearScore
+        payload.issuesCount = tonumber(result.issuesCount) or 0
+        payload.issueSummary = CopyTable(result.issueSummary or {})
+        payload.achievementPoints = result.achievementPoints
+        payload.achievementPointsSource = result.achievementPointsSource
+        payload.raidAchievements = CopyTable(result.raidAchievements or {})
+        payload.updatedAt = tonumber(result.updatedAt) or tonumber(result.fetchedAt) or payload.updatedAt or 0
+    end
+
+    return payload
+end
+
+function addon:BuildRaidHistoryPayloadForKey(key)
+    local req = addon:GetLatestRequestForKey(key)
+    local result = RaidInspectorDB.results[key]
+    local state = req and req.status or "queued"
+
+    if state ~= "error" and type(result) == "table" then
+        state = "ready"
+    end
+
+    return addon:BuildStoredSummaryPayload(key, req, result, state, req and req.statusReason or nil)
+end
+
+function addon:FindRaidHistoryEntryById(historyId)
+    if not historyId or historyId == 0 then
+        return nil
+    end
+
+    local history = addon:GetRaidScanHistory()
+    local i
+    for i = #history.scans, 1, -1 do
+        local entry = history.scans[i]
+        if tonumber(entry.id) == tonumber(historyId) then
+            return entry
+        end
+    end
+
+    return nil
+end
+
+function addon:RefreshRaidHistoryEntry(entry)
+    if type(entry) ~= "table" then
+        return false
+    end
+
+    local members = type(entry.members) == "table" and entry.members or {}
+    local roster = {}
+    local key
+
+    for key in pairs(members) do
+        roster[#roster + 1] = key
+    end
+
+    table.sort(roster)
+    entry.members = members
+    entry.roster = roster
+    entry.summaryPayloads = {}
+
+    local i
+    for i = 1, #roster do
+        local rosterKey = roster[i]
+        entry.summaryPayloads[rosterKey] = addon:BuildRaidHistoryPayloadForKey(rosterKey)
+    end
+
+    entry.updatedAt = GetNow()
+    return true
+end
+
+function addon:RefreshActiveRaidHistoryEntry()
+    local snapshot = RaidInspectorDB.state.lastSnapshot
+    if type(snapshot) ~= "table" then
+        return false
+    end
+
+    local historyId = tonumber(snapshot.historyId) or 0
+    if historyId <= 0 then
+        return false
+    end
+
+    addon:PruneRaidScanHistory()
+    local entry = addon:FindRaidHistoryEntryById(historyId)
+    if not entry then
+        snapshot.historyId = 0
+        return false
+    end
+
+    entry.members = CopyTable(snapshot.members or {})
+    entry.snapshotAt = tonumber(snapshot.at) or entry.snapshotAt or GetNow()
+    return addon:RefreshRaidHistoryEntry(entry)
+end
+
+function addon:CreateRaidHistoryEntry(snapshotAt, members)
+    if type(members) ~= "table" or next(members) == nil then
+        return nil
+    end
+
+    addon:PruneRaidScanHistory()
+
+    local history = addon:GetRaidScanHistory()
+    local id = tonumber(history.nextId) or 1
+    history.nextId = id + 1
+
+    local entry = {
+        id = id,
+        snapshotAt = tonumber(snapshotAt) or GetNow(),
+        updatedAt = tonumber(snapshotAt) or GetNow(),
+        members = CopyTable(members),
+        roster = {},
+        summaryPayloads = {},
+    }
+
+    history.scans[#history.scans + 1] = entry
+    RaidInspectorDB.state.lastSnapshot.historyId = id
+    addon:RefreshRaidHistoryEntry(entry)
+    return entry
+end
+
+function addon:ResolveOverviewEntry(arg)
+    local entries = addon:GetOverviewEntries()
+    if #entries == 0 then
+        return nil, "no entries available"
+    end
+
+    local targetKey = Trim(arg or "")
+    if targetKey == "" then
+        targetKey = addon:GetSelectedKey()
+    elseif not string.find(targetKey, "%-") then
+        targetKey = MakePlayerKey(targetKey, GetRealmName() or "")
+    else
+        targetKey = string.lower(targetKey)
+    end
+
+    local selected = nil
+    local i
+    for i = 1, #entries do
+        if entries[i].key == targetKey then
+            selected = entries[i]
+            break
+        end
+    end
+
+    if not selected and targetKey ~= "" then
+        return nil, "target not found in current overview: " .. targetKey
+    end
+
+    if not selected then
+        selected = entries[1]
+    end
+
+    return selected
+end
+
+function addon:StoreReportSnapshot(entry, sourceTag)
+    if type(entry) ~= "table" or type(entry.req) ~= "table" then
+        return nil
+    end
+
+    local reports = addon:GetReportSnapshots()
+    local id = tonumber(reports.nextId) or 1
+    local payload = addon:BuildStoredSummaryPayload(entry.key, entry.req, entry.result, entry.state, entry.statusReason)
+    local snapshot = {
+        id = id,
+        savedAt = GetNow(),
+        source = sourceTag or "manual",
+        key = payload.key,
+        name = payload.name,
+        realm = payload.realm,
+        payload = payload,
+        message = addon:BuildExportSummaryFromPayload(payload),
+    }
+
+    reports.nextId = id + 1
+    reports.items[#reports.items + 1] = snapshot
+
+    while #reports.items > REPORT_SNAPSHOT_LIMIT do
+        table.remove(reports.items, 1)
+    end
+
+    return snapshot
+end
+
+function addon:FindSavedReport(arg)
+    local reports = addon:GetReportSnapshots()
+    if #reports.items == 0 then
+        return nil, "no saved reports"
+    end
+
+    local target = string.lower(Trim(arg or ""))
+    if target == "" or target == "latest" then
+        return reports.items[#reports.items]
+    end
+
+    local targetId = tonumber(target)
+    if targetId then
+        local i
+        for i = #reports.items, 1, -1 do
+            if tonumber(reports.items[i].id) == targetId then
+                return reports.items[i]
+            end
+        end
+        return nil, "saved report not found: #" .. tostring(targetId)
+    end
+
+    if not string.find(target, "%-") then
+        target = MakePlayerKey(target, GetRealmName() or "")
+    end
+
+    local i
+    for i = #reports.items, 1, -1 do
+        if reports.items[i].key == target then
+            return reports.items[i]
+        end
+    end
+
+    return nil, "saved report not found: " .. target
 end
 
 function addon:SetButtonMode(mode)
@@ -2053,8 +2347,10 @@ function addon:QueueRaidSnapshot()
         end
     end
 
-    RaidInspectorDB.state.lastSnapshot.at = GetNow()
+    local snapshotAt = GetNow()
+    RaidInspectorDB.state.lastSnapshot.at = snapshotAt
     RaidInspectorDB.state.lastSnapshot.members = members
+    addon:CreateRaidHistoryEntry(snapshotAt, members)
 
     addon:ProcessInspectQueue(true)
     Print("raid snapshot: queued=" .. queued .. ", skipped=" .. skipped .. ", total=" .. count .. " | live=" .. liveQueued .. ", liveSkipped=" .. liveSkipped)
@@ -2274,6 +2570,8 @@ function addon:ApplyBridgeResult(key, payload)
         end
     end
 
+    addon:RefreshActiveRaidHistoryEntry()
+
     return true
 end
 
@@ -2344,6 +2642,8 @@ function addon:ApplyBridgeAchievementEnrichment(key, payload)
         req.statusReason = nil
         req.updatedAt = GetNow()
     end
+
+    addon:RefreshActiveRaidHistoryEntry()
 
     return true
 end
@@ -3799,73 +4099,33 @@ function addon:HandleInspectCommand(args)
     end
 end
 
+function addon:BuildExportSummaryFromPayload(payload)
+    if type(payload) ~= "table" then
+        return nil
+    end
+
+    local score = payload.gearScore and tostring(payload.gearScore) or "N/A"
+    local summary = payload.issueSummary or {}
+    local missingEnchant = tonumber(summary.missingEnchant or 0) or 0
+    local missingGems = tonumber(summary.missingGems or 0) or 0
+
+    return "RI " .. tostring(payload.name or "Unknown")
+        .. "-" .. tostring(payload.realm or "Unknown")
+        .. " | GS:" .. score
+        .. " | MissingGems/Enchants:" .. tostring(missingGems) .. "/" .. tostring(missingEnchant)
+end
+
 function addon:BuildExportSummary(entry)
     if not entry then
         return nil
     end
 
-    local req = entry.req
-    local result = entry.result
-
-    if not result then
-        return "RI " .. req.name .. "-" .. req.realm
-            .. " | GS:N/A"
-            .. " | MissingGems/Enchants:?/?"
-    end
-
-    local score = result.gearScore and tostring(result.gearScore) or "N/A"
-    local summary = result.issueSummary or {}
-    local missingEnchant = tonumber(summary.missingEnchant or 0) or 0
-    local missingGems = tonumber(summary.missingGems or 0) or 0
-
-    return "RI " .. req.name
-        .. "-" .. req.realm
-        .. " | GS:" .. score
-        .. " | MissingGems/Enchants:" .. tostring(missingGems) .. "/" .. tostring(missingEnchant)
+    local payload = addon:BuildStoredSummaryPayload(entry.key, entry.req, entry.result, entry.state, entry.statusReason)
+    return addon:BuildExportSummaryFromPayload(payload)
 end
 
-function addon:ExportSummary(arg)
-    local entries = addon:GetOverviewEntries()
-    if #entries == 0 then
-        Print("no entries to export")
-        return
-    end
-
-    local targetKey = Trim(arg or "")
-    if targetKey == "" then
-        targetKey = addon:GetSelectedKey()
-    elseif not string.find(targetKey, "%-") then
-        local realm = GetRealmName() or ""
-        targetKey = MakePlayerKey(targetKey, realm)
-    else
-        targetKey = string.lower(targetKey)
-    end
-
-    local selected = nil
-    local i
-    for i = 1, #entries do
-        if entries[i].key == targetKey then
-            selected = entries[i]
-            break
-        end
-    end
-
-    if not selected and targetKey ~= "" then
-        Print("export target not found in current overview: " .. targetKey)
-        return
-    end
-
-    if not selected then
-        selected = entries[1]
-    end
-
-    local message = addon:BuildExportSummary(selected)
-    if not message then
-        Print("nothing to export")
-        return
-    end
+function addon:SendSummaryMessage(message, whisperTarget)
     local chatMessage = EscapeChatMessage(message)
-
     local channels = addon:GetExportChannels()
     local attempted = 0
     local sent = 0
@@ -3888,9 +4148,9 @@ function addon:ExportSummary(arg)
 
     if channels.whisper then
         attempted = attempted + 1
-        local whisperTarget = selected and selected.req and Trim(selected.req.name or "") or ""
-        if whisperTarget ~= "" then
-            SendChatMessage(chatMessage, "WHISPER", nil, whisperTarget)
+        local targetName = Trim(whisperTarget or "")
+        if targetName ~= "" then
+            SendChatMessage(chatMessage, "WHISPER", nil, targetName)
             sent = sent + 1
         else
             Print("export: WHISPER checked, but selected player name is missing")
@@ -3899,19 +4159,74 @@ function addon:ExportSummary(arg)
 
     if attempted == 0 then
         Print("export: no channels selected (Raid/Say/Whisper)")
-        return
+        return 0, 0, chatMessage
     end
 
     if sent == 0 then
         Print(chatMessage)
     end
+
+    return attempted, sent, chatMessage
+end
+
+function addon:SaveReportSnapshot(arg)
+    local entry, err = addon:ResolveOverviewEntry(arg)
+    if not entry then
+        Print(err)
+        return nil
+    end
+
+    local snapshot = addon:StoreReportSnapshot(entry, "manual")
+    if not snapshot then
+        Print("could not save report snapshot")
+        return nil
+    end
+
+    Print("saved report #" .. tostring(snapshot.id) .. ": " .. tostring(snapshot.name) .. "-" .. tostring(snapshot.realm))
+    return snapshot
+end
+
+function addon:ExportSavedReport(arg)
+    local snapshot, err = addon:FindSavedReport(arg)
+    if not snapshot then
+        Print(err)
+        return
+    end
+
+    local message = snapshot.message or addon:BuildExportSummaryFromPayload(snapshot.payload)
+    if not message then
+        Print("saved report is empty")
+        return
+    end
+
+    addon:SendSummaryMessage(message, snapshot.name)
+end
+
+function addon:ExportSummary(arg)
+    local selected, err = addon:ResolveOverviewEntry(arg)
+    if not selected then
+        Print(err)
+        return
+    end
+
+    local message = addon:BuildExportSummary(selected)
+    if not message then
+        Print("nothing to export")
+        return
+    end
+
+    addon:StoreReportSnapshot(selected, "export")
+    addon:SendSummaryMessage(message, selected and selected.req and selected.req.name)
 end
 
 function addon:PrintStatus()
+    addon:PruneRaidScanHistory()
     local queued, ready, errorCount = addon:GetCounts()
     local fresh, stale = addon:GetFreshnessCounts(FRESHNESS_TTL_SECONDS)
     local playersWithIssues, totalIssues = addon:GetIssueTotals()
     local bridge = addon:GetBridgeInboxStats()
+    local reports = addon:GetReportSnapshots()
+    local history = addon:GetRaidScanHistory()
     local livePending = addon.inspectQueue and #addon.inspectQueue or 0
     local liveActive = addon.inspectCurrent and (addon.inspectCurrent.name .. "-" .. addon.inspectCurrent.realm) or "-"
     local achievementPending = addon.achievementQueue and #addon.achievementQueue or 0
@@ -3925,6 +4240,7 @@ function addon:PrintStatus()
     Print("overview mode: sort=" .. addon:GetSortMode() .. ", filter=" .. addon:GetFilterMode())
     Print("live inspect: pending=" .. tostring(livePending) .. ", active=" .. tostring(liveActive))
     Print("achievement compare: supported=" .. achievementSupported .. ", pending=" .. tostring(achievementPending) .. ", active=" .. tostring(achievementActive))
+    Print("saved reports=" .. tostring(#reports.items) .. ", raid scan history=" .. tostring(#history.scans))
     Print("bridge inbox: count=" .. bridge.resultCount .. ", generatedAt=" .. bridge.generatedAt .. ", lastConsumedAt=" .. bridge.lastConsumedAt)
     Print("bridge import marker: lastImportedGeneratedAt=" .. bridge.lastImportedBridgeGeneratedAt)
 
@@ -3939,7 +4255,7 @@ end
 function addon:ClearQueue()
     RaidInspectorDB.requests = {}
     RaidInspectorDB.results = {}
-    RaidInspectorDB.state.lastSnapshot = { at = 0, members = {} }
+    RaidInspectorDB.state.lastSnapshot = { at = 0, historyId = 0, members = {} }
     RaidInspectorDB.state.nextRequestId = 1
     RaidInspectorDB.meta.lastImportedBridgeGeneratedAt = 0
 
@@ -3963,6 +4279,31 @@ function addon:ClearQueue()
     addon:SetSelectedKey("")
     Print("queue + results + bridge inbox cleared")
     addon:RefreshMainWindow()
+end
+
+function addon:RequestClearQueue()
+    if type(StaticPopup_Show) ~= "function" or type(StaticPopupDialogs) ~= "table" then
+        addon:ClearQueue()
+        return
+    end
+
+    StaticPopup_Hide("RAIDINSPECTOR_CONFIRM_CLEAR")
+    StaticPopup_Show("RAIDINSPECTOR_CONFIRM_CLEAR")
+end
+
+if type(StaticPopupDialogs) == "table" then
+    StaticPopupDialogs["RAIDINSPECTOR_CONFIRM_CLEAR"] = {
+        text = "Clear queued requests, cached results, and bridge inbox data?",
+        button1 = "Clear",
+        button2 = CANCEL or "Cancel",
+        OnAccept = function()
+            addon:ClearQueue()
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+        preferredIndex = 3,
+    }
 end
 
 function addon:OnAddonLoaded(loadedName)
@@ -4009,10 +4350,12 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri forcesync - re-import bridge inbox ignoring generatedAt")
             Print("/ri sort [recent|gs|issues|name] - set or cycle sort")
             Print("/ri filter [all|snapshot|ready|queued|issues] - set or cycle filter")
+            Print("/ri savereport [name-realm] - save current or selected report snapshot")
             Print("/ri export [name-realm] - quick summary to raid/party chat")
+            Print("/ri exportsaved [latest|id|name-realm] - export saved snapshot")
             Print("/ri status - show queue summary")
             Print("/ri refreshstale [minutes] - queue refresh for stale results")
-            Print("/ri clearqueue - remove all queued entries")
+            Print("/ri clearqueue [confirm] - clear queue/results with confirmation")
             return
         end
 
@@ -4082,8 +4425,18 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             return
         end
 
+        if command == "savereport" then
+            addon:SaveReportSnapshot(args)
+            return
+        end
+
         if command == "export" then
             addon:ExportSummary(args)
+            return
+        end
+
+        if command == "exportsaved" then
+            addon:ExportSavedReport(args)
             return
         end
 
@@ -4099,7 +4452,12 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
         end
 
         if command == "clearqueue" then
-            addon:ClearQueue()
+            local mode = string.lower(Trim(args or ""))
+            if mode == "confirm" or mode == "force" or mode == "yes" then
+                addon:ClearQueue()
+            else
+                addon:RequestClearQueue()
+            end
             return
         end
 
