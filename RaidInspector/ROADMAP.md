@@ -13,8 +13,12 @@
    - save/export report snapshots for later reuse
    - current raid scan history with 30-day retention
    - confirmation window before destructive clear actions
+   - class colors on overview and selected-player character info
 - Next:
-   - set class colors on character info (color values TBD; to be provided later)
+   - show data source/confidence in UI:
+      - overall result source (`local-inspect` vs `bridge`)
+      - gear score source
+      - achievement/raid-achievement source
 
 ## Phase 1 - Foundation
 1. Define data contract between addon and bridge.
@@ -54,7 +58,7 @@
 ## Phase 5 - UI Features
 1. Build main report window:
    - player header (name, class, realm, guild)
-   - apply class color styling to character info in header/details (exact palette pending)
+   - apply class color styling to character info in header/details
    - total score and confidence/source
    - slot-by-slot item table
 2. Add enchant/gem audit indicators:
