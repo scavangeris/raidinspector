@@ -18,6 +18,7 @@ Run from your game root:
 /usr/bin/python3 "Interface/AddOns/RaidInspector/bridge/fetch_from_queue.py" \
   --raid-inspector-sv "WTF/Account/SCAVROGUE/SavedVariables/RaidInspector.lua" \
   --bridge-output "WTF/Account/SCAVROGUE/SavedVariables/RaidInspectorBridge.lua" \
+  --report-output-dir "Interface/AddOns/RaidInspector/reports" \
   --status-filter all \
   --max 20 \
   --cache-ttl-minutes 20 \
@@ -31,6 +32,7 @@ Run from your game root:
 - `--status-filter queued`: fetch only queued requests.
 - `--status-filter all`: refresh all tracked keys.
 - `--cache-ttl-minutes`: skip network calls for fresh cached keys.
+- `--report-output-dir`: directory where detailed report JSON files are written.
 - `--retries` and `--retry-backoff`: transient failure retry behavior.
 - `--request-delay`: pacing between outbound HTTP requests.
 - `--achievements-timeout`: timeout used for raid achievement presence lookups.

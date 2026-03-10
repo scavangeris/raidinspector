@@ -11,6 +11,7 @@
    - bridge parser for real Warmane summary payload
    - item/enchant UI detail panel
    - save/export report snapshots for later reuse
+   - detailed report files saved under `reports/` with in-game dropdown loading via bridge sync
    - current raid scan history with 30-day retention
    - confirmation window before destructive clear actions
    - class colors on overview and selected-player character info
@@ -70,6 +71,10 @@
 5. Keep display mode presets:
    - `advanced`
    - `easy`
+
+## Current Notes
+- Main `Report` action now creates a bridge-backed detailed file report for the current overview.
+- Saved file reports are written into `Interface/AddOns/RaidInspector/reports/` and loaded back into the addon through `/ri sync`.
 
 ## Phase 6 - Raid Workflow
 1. Add raid snapshot mode (scan all raid members).

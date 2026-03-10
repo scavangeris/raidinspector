@@ -9,3 +9,7 @@ Thumbs.db
 
 # Archives
 *.zip
+
+# Generated addon reports
+RaidInspector/reports/*.json
+!RaidInspector/reports/.gitkeep

@@ -38,6 +38,10 @@ Because of this, Raid Inspector must use an external bridge process (desktop scr
 	- saved report snapshots (`/ri savereport`, `/ri exportsaved`)
 	- 30-day retained raid scan archive in SavedVariables
 	- confirmation before destructive `Clear` / `/ri clearqueue`
+- Detailed report additions:
+	- `Report` action queues a full roster report file for bridge export
+	- bridge writes timestamped JSON reports into `Interface/AddOns/RaidInspector/reports/`
+	- saved report files can be loaded from the in-game dropdown after `/ri sync`
 
 ## Commands
 - `/ri help`
@@ -52,9 +56,13 @@ Because of this, Raid Inspector must use an external bridge process (desktop scr
 - `/ri forcesync`
 - `/ri sort [recent|gs|issues|name]`
 - `/ri filter [all|snapshot|ready|queued|issues]`
+- `/ri report`
+- `/ri loadreport [latest|filename]`
+- `/ri share [name-realm]`
 - `/ri savereport [name-realm]`
-- `/ri export [name-realm]` includes GS, talent/spec, and gem/enchant counts
-- `/ri exportsaved [latest|id|name-realm]`
+- `/ri sharesaved [latest|id|name-realm]`
+- `/ri export` remains as a compatibility alias for `/ri report`
+- `/ri exportsaved` remains as a compatibility alias for `/ri sharesaved`
 - `/ri status`
 - `/ri refreshstale [minutes]`
 - `/ri clearqueue [confirm]`
@@ -76,9 +84,13 @@ Limitations:
 ## SavedVariables Shape
 ```lua
 RaidInspectorDB = {
-	meta = { schemaVersion = 2, lastLoadedAt = 0 },
+	meta = { schemaVersion = 3, lastLoadedAt = 0 },
 	settings = { window = { point = "CENTER", x = 0, y = 0 } },
-	state = { nextRequestId = 1, lastSnapshot = { at = 0, historyId = 0, members = {} } },
+	state = {
+		nextRequestId = 1,
+		lastSnapshot = { at = 0, historyId = 0, members = {} },
+		ui = { selectedSavedReportFile = "" },
+	},
 	requests = {
 		-- { id, name, realm, key, status, requestedAt, updatedAt }
 	},
@@ -89,6 +101,18 @@ RaidInspectorDB = {
 		nextId = 1,
 		items = {
 			-- { id, savedAt, key, name, realm, message, payload = {...} }
+		}
+	},
+	reportFileQueue = {
+		nextId = 1,
+		items = {
+			-- { id, createdAt, fileName, label, report = {...} }
+		}
+	},
+	savedReportFiles = {
+		generatedAt = 0,
+		items = {
+			-- { fileName, label, createdAt, playerCount, report = {...} }
 		}
 	},
 	raidScanHistory = {
@@ -105,7 +129,11 @@ RaidInspectorBridgeInbox = {
 	generatedAt = 0,
 	results = {
 		-- ["name-realm"] = { ...result payload... }
-	}
+	},
+	reportFiles = {
+		-- { fileName, label, createdAt, playerCount, report = {...} }
+	},
+	processedReportQueueIds = { 1, 2, 3 }
 }
 ```
 
@@ -116,11 +144,12 @@ Raid workflow additions:
 Phase 5 UI additions:
 - selectable raid overview list (left panel)
 - selected player detail panel with slot-by-slot table (right panel)
+- saved detailed report dropdown with live/saved switching
 - per-slot audit indicators:
 	- enchant status (`E:OK`, `E:MISS`, `E:LOW`)
 	- gem fill status (`G:x/y`)
 - sort/filter controls in-window and slash command equivalents
-- one-click quick export to raid/party chat
+- one-click detailed report generation to addon-folder JSON files
 - display mode presets:
 	- `advanced`
 	- `easy`
@@ -156,6 +185,7 @@ cd "/media/jatulis/GamesSSD/World of Warcraft 3.3.5a (no install) moded"
 /usr/bin/python3 "Interface/AddOns/RaidInspector/bridge/fetch_from_queue.py" \
 	--raid-inspector-sv "WTF/Account/SCAVROGUE/SavedVariables/RaidInspector.lua" \
 	--bridge-output "WTF/Account/SCAVROGUE/SavedVariables/RaidInspectorBridge.lua" \
+	--report-output-dir "Interface/AddOns/RaidInspector/reports" \
 	--status-filter queued \
 	--max 10
 ```
@@ -163,6 +193,7 @@ cd "/media/jatulis/GamesSSD/World of Warcraft 3.3.5a (no install) moded"
 Useful flags:
 - `--dry-run` : fetch and print JSON, do not write bridge file.
 - `--verbose` : print each API URL being fetched.
+- `--report-output-dir "Interface/AddOns/RaidInspector/reports"` : where detailed report JSON files are written.
 - `--include-raw` : include full Warmane response in the bridge payload.
 - `--cache-ttl-minutes 20` : skip fetch for keys with fresh existing addon cache.
 - `--retries 2` : retry count for transient network errors.

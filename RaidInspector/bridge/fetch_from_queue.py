@@ -47,6 +47,7 @@ DEFAULT_SLOT_ORDER = [
 ]
 
 DEFAULT_ITEM_ILVL_CACHE_PATH = pathlib.Path(__file__).with_name("item_ilvl_cache.json")
+DEFAULT_REPORT_OUTPUT_DIR = pathlib.Path(__file__).resolve().parent.parent / "reports"
 RETRYABLE_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
 GS_SCALE = 1.8618
 
@@ -276,6 +277,158 @@ def parse_field_bool(block: str, key: str) -> Optional[bool]:
     return None
 
 
+class LuaTableParser:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.length = len(text)
+        self.index = 0
+
+    def parse(self) -> Any:
+        self._skip_ws()
+        value = self._parse_value()
+        self._skip_ws()
+        return value
+
+    def _skip_ws(self) -> None:
+        while self.index < self.length and self.text[self.index].isspace():
+            self.index += 1
+
+    def _peek(self) -> str:
+        if self.index >= self.length:
+            return ""
+        return self.text[self.index]
+
+    def _consume(self, token: str) -> None:
+        if self._peek() != token:
+            raise ValueError(f"expected {token!r} at index {self.index}")
+        self.index += 1
+
+    def _parse_value(self) -> Any:
+        self._skip_ws()
+        ch = self._peek()
+        if ch == "{":
+            return self._parse_table()
+        if ch == '"':
+            return self._parse_string()
+        if ch in "-0123456789":
+            return self._parse_number()
+        if ch.isalpha() or ch == "_":
+            identifier = self._parse_identifier()
+            if identifier == "true":
+                return True
+            if identifier == "false":
+                return False
+            if identifier == "nil":
+                return None
+            return identifier
+        raise ValueError(f"unexpected character {ch!r} at index {self.index}")
+
+    def _parse_identifier(self) -> str:
+        start = self.index
+        while self.index < self.length and (self.text[self.index].isalnum() or self.text[self.index] == "_"):
+            self.index += 1
+        if self.index == start:
+            raise ValueError(f"expected identifier at index {self.index}")
+        return self.text[start:self.index]
+
+    def _parse_string(self) -> str:
+        self._consume('"')
+        out: List[str] = []
+        while self.index < self.length:
+            ch = self.text[self.index]
+            self.index += 1
+            if ch == '"':
+                return "".join(out)
+            if ch == "\\":
+                if self.index >= self.length:
+                    break
+                esc = self.text[self.index]
+                self.index += 1
+                if esc == "n":
+                    out.append("\n")
+                else:
+                    out.append(esc)
+            else:
+                out.append(ch)
+        raise ValueError("unterminated string")
+
+    def _parse_number(self) -> Any:
+        start = self.index
+        while self.index < self.length and self.text[self.index] in "+-0123456789.eE":
+            self.index += 1
+        token = self.text[start:self.index]
+        if any(ch in token for ch in ".eE"):
+            return float(token)
+        return int(token)
+
+    def _parse_table(self) -> Any:
+        self._consume("{")
+        self._skip_ws()
+        array_items: List[Any] = []
+        mapping: Dict[Any, Any] = {}
+
+        while True:
+            self._skip_ws()
+            ch = self._peek()
+            if ch == "}":
+                self.index += 1
+                break
+
+            key: Any = None
+            has_key = False
+            start_index = self.index
+
+            if ch == "[":
+                self.index += 1
+                key = self._parse_value()
+                self._skip_ws()
+                self._consume("]")
+                self._skip_ws()
+                self._consume("=")
+                has_key = True
+            elif ch.isalpha() or ch == "_":
+                identifier = self._parse_identifier()
+                self._skip_ws()
+                if self._peek() == "=":
+                    self.index += 1
+                    key = identifier
+                    has_key = True
+                else:
+                    self.index = start_index
+
+            value = self._parse_value()
+            if has_key:
+                mapping[key] = value
+            else:
+                array_items.append(value)
+
+            self._skip_ws()
+            if self._peek() in {",", ";"}:
+                self.index += 1
+
+        if mapping and not array_items:
+            numeric_keys = [key for key in mapping.keys() if isinstance(key, int) and key > 0]
+            if len(numeric_keys) == len(mapping):
+                numeric_keys.sort()
+                if numeric_keys == list(range(1, len(numeric_keys) + 1)):
+                    return [mapping[index] for index in numeric_keys]
+            return mapping
+
+        if array_items and not mapping:
+            return array_items
+
+        if mapping:
+            for offset, item in enumerate(array_items, start=1):
+                mapping[offset] = item
+            return mapping
+
+        return []
+
+
+def parse_lua_table(table_text: str) -> Any:
+    return LuaTableParser(table_text).parse()
+
+
 def parse_requests(saved_variables_path: pathlib.Path) -> List[Dict[str, Any]]:
     text = saved_variables_path.read_text(encoding="utf-8", errors="replace")
     requests_block = find_table_block(text, '["requests"] = {')
@@ -407,6 +560,110 @@ def parse_results_missing_achievement_requests(saved_variables_path: pathlib.Pat
         )
 
     return out
+
+
+def parse_report_queue(saved_variables_path: pathlib.Path) -> List[Dict[str, Any]]:
+    try:
+        text = saved_variables_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+
+    queue_block = find_table_block(text, '["reportFileQueue"] = {')
+    if not queue_block:
+        return []
+
+    items_block = find_table_block(queue_block, '["items"] = {')
+    if not items_block:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for entry in split_top_level_tables(items_block):
+        queue_id = parse_field_int(entry, "id")
+        created_at = parse_field_int(entry, "createdAt") or int(time.time())
+        file_name = parse_field_str(entry, "fileName") or f"raidinspector-report-{created_at}.json"
+        label = parse_field_str(entry, "label") or file_name
+        report_block = find_table_block(entry, '["report"] = {')
+        if not report_block:
+            continue
+
+        try:
+            report = parse_lua_table(report_block)
+        except Exception:
+            continue
+
+        if not isinstance(report, dict):
+            continue
+
+        report.setdefault("createdAt", created_at)
+        report.setdefault("fileName", file_name)
+        report.setdefault("reportLabel", label)
+        out.append(
+            {
+                "id": queue_id,
+                "createdAt": created_at,
+                "fileName": file_name,
+                "label": label,
+                "report": report,
+            }
+        )
+
+    return out
+
+
+def write_report_file(output_dir: pathlib.Path, item: Dict[str, Any]) -> pathlib.Path:
+    created_at = as_int(item.get("createdAt")) or int(time.time())
+    file_name = str(item.get("fileName") or f"raidinspector-report-{created_at}.json")
+    report = item.get("report") if isinstance(item.get("report"), dict) else {}
+    report.setdefault("createdAt", created_at)
+    report.setdefault("fileName", file_name)
+    report.setdefault("reportLabel", str(item.get("label") or file_name))
+
+    output_path = output_dir / file_name
+    atomic_write_text(output_path, json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+    return output_path
+
+
+def load_report_file(path: pathlib.Path) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def count_report_players(report: Dict[str, Any]) -> int:
+    order = report.get("order")
+    if isinstance(order, list):
+        return len(order)
+    players = report.get("players")
+    if isinstance(players, dict):
+        return len(players)
+    return 0
+
+
+def build_report_catalog(output_dir: pathlib.Path) -> List[Dict[str, Any]]:
+    if not output_dir.exists():
+        return []
+
+    items: List[Dict[str, Any]] = []
+    for path in sorted(output_dir.glob("*.json")):
+        report = load_report_file(path)
+        if not isinstance(report, dict):
+            continue
+
+        created_at = as_int(report.get("createdAt")) or int(path.stat().st_mtime)
+        items.append(
+            {
+                "fileName": path.name,
+                "label": str(report.get("reportLabel") or path.stem),
+                "createdAt": created_at,
+                "playerCount": count_report_players(report),
+                "report": report,
+            }
+        )
+
+    items.sort(key=lambda item: (-(as_int(item.get("createdAt")) or 0), str(item.get("fileName") or "")))
+    return items
 
 
 def dedupe_requests(requests: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1468,11 +1725,19 @@ def make_result(
     return result
 
 
-def write_bridge_file(output_path: pathlib.Path, results: Dict[str, Dict[str, Any]], generated_at: int) -> None:
+def write_bridge_file(
+    output_path: pathlib.Path,
+    results: Dict[str, Dict[str, Any]],
+    generated_at: int,
+    report_files: Optional[List[Dict[str, Any]]] = None,
+    processed_report_queue_ids: Optional[List[int]] = None,
+) -> None:
     payload = {
         "schemaVersion": 1,
         "generatedAt": generated_at,
         "results": results,
+        "reportFiles": report_files or [],
+        "processedReportQueueIds": processed_report_queue_ids or [],
     }
     atomic_write_text(output_path, "RaidInspectorBridgeInbox = " + to_lua(payload) + "\n", encoding="utf-8")
 
@@ -1481,6 +1746,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch queued requests from RaidInspector.lua and write bridge inbox")
     parser.add_argument("--raid-inspector-sv", required=True, help="Path to RaidInspector.lua saved variables")
     parser.add_argument("--bridge-output", required=True, help="Path to RaidInspectorBridge.lua output file")
+    parser.add_argument(
+        "--report-output-dir",
+        default=str(DEFAULT_REPORT_OUTPUT_DIR),
+        help="Directory where detailed report files are written",
+    )
     parser.add_argument("--status-filter", choices=["queued", "all"], default="queued")
     parser.add_argument("--max", type=int, default=0, help="Maximum requests to fetch; 0 means all")
     parser.add_argument(
@@ -1542,8 +1812,10 @@ def main() -> int:
 
     raid_sv_path = pathlib.Path(args.raid_inspector_sv)
     bridge_output_path = pathlib.Path(args.bridge_output)
+    report_output_dir = pathlib.Path(args.report_output_dir)
 
     requests = parse_requests(raid_sv_path)
+    report_queue_items = parse_report_queue(raid_sv_path)
 
     # When status-filter=all, also enrich existing local results that still lack AP/raid achievements.
     if args.status_filter == "all":
@@ -1576,15 +1848,29 @@ def main() -> int:
         if args.verbose and skipped_by_ttl > 0:
             print(f"Skipped {skipped_by_ttl} request(s) due to cache TTL ({args.cache_ttl_minutes}m)")
 
-    if not requests:
+    generated_at = int(time.time())
+    results: Dict[str, Dict[str, Any]] = {}
+    processed_report_queue_ids: List[int] = []
+
+    for item in report_queue_items:
+        try:
+            write_report_file(report_output_dir, item)
+            report_id = as_int(item.get("id"))
+            if report_id is not None:
+                processed_report_queue_ids.append(report_id)
+        except Exception as exc:
+            if args.verbose:
+                print(f"Report write failed for {item.get('fileName')}: {exc}")
+
+    report_files = build_report_catalog(report_output_dir)
+
+    if not requests and not report_files and not report_queue_items:
         if skipped_by_ttl > 0:
             print("No matching requests found (all candidates skipped by cache TTL).")
         else:
             print("No matching requests found.")
         return 0
 
-    generated_at = int(time.time())
-    results: Dict[str, Dict[str, Any]] = {}
     item_ilvl_cache_path = pathlib.Path(args.item_ilvl_cache)
     item_ilvl_cache = load_item_ilvl_cache(item_ilvl_cache_path)
     cache_dirty = False
@@ -1769,11 +2055,30 @@ def main() -> int:
         save_item_ilvl_cache(item_ilvl_cache_path, item_ilvl_cache)
 
     if args.dry_run:
-        print(json.dumps({"generatedAt": generated_at, "results": results}, indent=2, ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    "generatedAt": generated_at,
+                    "results": results,
+                    "reportFiles": report_files,
+                    "processedReportQueueIds": processed_report_queue_ids,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
         return 0
 
-    write_bridge_file(bridge_output_path, results, generated_at)
-    print(f"Wrote {len(results)} result(s) to: {bridge_output_path}")
+    write_bridge_file(
+        bridge_output_path,
+        results,
+        generated_at,
+        report_files=report_files,
+        processed_report_queue_ids=processed_report_queue_ids,
+    )
+    print(
+        f"Wrote {len(results)} result(s) and cataloged {len(report_files)} report file(s) to: {bridge_output_path}"
+    )
     return 0
 
 

@@ -2,7 +2,7 @@
 ## Title: Raid Inspector
 ## Notes: Raid gear and enchant inspector powered by external API bridge.
 ## Author: Local Dev
-## Version: 0.10.1-alpha
+## Version: 0.11.0-alpha
 ## SavedVariables: RaidInspectorDB
 
 RaidInspector.lua

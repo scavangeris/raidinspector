@@ -2,6 +2,23 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.11.0-alpha - 2026-03-10
+- Renamed the main `Export` action to `Report` and repurposed it for detailed roster reports.
+- Added bridge-backed report file export:
+  - queues a full multi-player report from the current overview
+  - writes timestamped JSON files into `Interface/AddOns/RaidInspector/reports/`
+  - preserves item, enchant, gem, GS, talent/spec, and audit data per player
+- Added in-game saved report loading:
+  - new saved-report dropdown in the main window
+  - bridge sync imports a catalog of saved report files back into the addon
+  - selecting a saved report loads it into the existing overview/detail panels
+- Added slash-command updates:
+  - `/ri report`
+  - `/ri loadreport [latest|filename]`
+  - `/ri share [name-realm]`
+  - `/ri sharesaved [latest|id|name-realm]`
+  - `/ri export` remains as a compatibility alias for `/ri report`
+
 ## 0.10.1-alpha - 2026-03-10
 - Removed the `super simple` display mode and its dedicated decision UI.
 - Export summaries now include talent/spec information.

@@ -6,7 +6,7 @@ RaidInspectorBridgeInbox = RaidInspectorBridgeInbox or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.10.1-alpha"
+addon.version = "0.11.0-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
@@ -16,6 +16,7 @@ local INSPECT_TIMEOUT_SECONDS = 8
 local ACHIEVEMENT_COMPARE_THROTTLE_SECONDS = 2
 local ACHIEVEMENT_COMPARE_TIMEOUT_SECONDS = 8
 local REPORT_SNAPSHOT_LIMIT = 200
+local REPORT_FILE_QUEUE_LIMIT = 25
 local OVERVIEW_ROW_HEIGHT = 18
 local OVERVIEW_VISIBLE_ROWS = 14
 local DETAIL_ROW_HEIGHT = 18
@@ -751,6 +752,29 @@ end
 local function ParseKey(key)
     local name, realm = string.match(key or "", "^(.+)%-(.+)$")
     return name, realm
+end
+
+local function FormatTimestampForFileName(timestamp)
+    local ts = tonumber(timestamp) or GetNow()
+    if type(date) == "function" then
+        return date("%Y-%m-%d_%H-%M-%S", ts)
+    end
+    return tostring(ts)
+end
+
+local function FormatTimestampForDisplay(timestamp)
+    local ts = tonumber(timestamp) or 0
+    if ts <= 0 then
+        return "-"
+    end
+    if type(date) == "function" then
+        return date("%Y-%m-%d %H:%M:%S", ts)
+    end
+    return tostring(ts)
+end
+
+local function BuildReportFileName(timestamp)
+    return "raidinspector-report-" .. FormatTimestampForFileName(timestamp) .. ".json"
 end
 
 local function SafeText(value)
@@ -1797,6 +1821,7 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state.lastSnapshot, "members", {})
     EnsureTable(RaidInspectorDB.state, "ui", {})
     EnsureTable(RaidInspectorDB.state.ui, "selectedKey", "")
+    EnsureTable(RaidInspectorDB.state.ui, "selectedSavedReportFile", "")
     EnsureTable(RaidInspectorDB.state.ui, "itemListFilterMode", "all")
     EnsureTable(RaidInspectorDB.state.ui, "buttonMode", "advanced")
     EnsureTable(RaidInspectorDB.state.ui, "minimap", {})
@@ -1811,11 +1836,17 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB, "reportSnapshots", {})
     EnsureTable(RaidInspectorDB.reportSnapshots, "nextId", 1)
     EnsureTable(RaidInspectorDB.reportSnapshots, "items", {})
+    EnsureTable(RaidInspectorDB, "reportFileQueue", {})
+    EnsureTable(RaidInspectorDB.reportFileQueue, "nextId", 1)
+    EnsureTable(RaidInspectorDB.reportFileQueue, "items", {})
+    EnsureTable(RaidInspectorDB, "savedReportFiles", {})
+    EnsureTable(RaidInspectorDB.savedReportFiles, "generatedAt", 0)
+    EnsureTable(RaidInspectorDB.savedReportFiles, "items", {})
     EnsureTable(RaidInspectorDB, "raidScanHistory", {})
     EnsureTable(RaidInspectorDB.raidScanHistory, "nextId", 1)
     EnsureTable(RaidInspectorDB.raidScanHistory, "scans", {})
 
-    RaidInspectorDB.meta.schemaVersion = 2
+    RaidInspectorDB.meta.schemaVersion = 3
     RaidInspectorDB.meta.lastLoadedAt = GetNow()
     EnsureTable(RaidInspectorDB.meta, "lastImportedBridgeGeneratedAt", 0)
     addon:PruneRaidScanHistory()
@@ -1882,6 +1913,94 @@ function addon:GetReportSnapshots()
     return RaidInspectorDB.reportSnapshots
 end
 
+function addon:GetReportFileQueue()
+    EnsureTable(RaidInspectorDB, "reportFileQueue", {})
+    EnsureTable(RaidInspectorDB.reportFileQueue, "nextId", 1)
+    EnsureTable(RaidInspectorDB.reportFileQueue, "items", {})
+    return RaidInspectorDB.reportFileQueue
+end
+
+function addon:GetSavedReportFiles()
+    EnsureTable(RaidInspectorDB, "savedReportFiles", {})
+    EnsureTable(RaidInspectorDB.savedReportFiles, "generatedAt", 0)
+    EnsureTable(RaidInspectorDB.savedReportFiles, "items", {})
+    return RaidInspectorDB.savedReportFiles
+end
+
+function addon:GetSelectedSavedReportFile()
+    return tostring(RaidInspectorDB.state.ui.selectedSavedReportFile or "")
+end
+
+function addon:FindSavedReportFileItem(fileName)
+    local target = string.lower(Trim(fileName or ""))
+    if target == "" then
+        return nil
+    end
+
+    local savedReports = addon:GetSavedReportFiles()
+    local i
+    for i = 1, #savedReports.items do
+        local item = savedReports.items[i]
+        if string.lower(tostring(item.fileName or "")) == target then
+            return item
+        end
+    end
+
+    return nil
+end
+
+function addon:GetActiveSavedReport()
+    return addon:FindSavedReportFileItem(addon:GetSelectedSavedReportFile())
+end
+
+function addon:SetSelectedSavedReportFile(fileName)
+    local normalized = Trim(fileName or "")
+    if normalized == "" then
+        RaidInspectorDB.state.ui.selectedSavedReportFile = ""
+        addon:SetSelectedKey("")
+        addon:RefreshMainWindow()
+        return true
+    end
+
+    local item = addon:FindSavedReportFileItem(normalized)
+    if not item then
+        return false
+    end
+
+    RaidInspectorDB.state.ui.selectedSavedReportFile = tostring(item.fileName or normalized)
+    addon:SetSelectedKey("")
+    addon:RefreshMainWindow()
+    return true
+end
+
+function addon:GetSavedReportPlayerCount(item)
+    if type(item) ~= "table" or type(item.report) ~= "table" then
+        return 0
+    end
+
+    local report = item.report
+    if type(report.order) == "table" then
+        return #report.order
+    end
+
+    local count = 0
+    local _
+    for _ in pairs(report.players or {}) do
+        count = count + 1
+    end
+    return count
+end
+
+function addon:BuildSavedReportMenuLabel(item)
+    local createdAt = tonumber(item and item.createdAt) or tonumber(item and item.report and item.report.createdAt) or 0
+    local label = Trim(item and (item.label or item.reportLabel or item.fileName) or "")
+    if label == "" then
+        label = tostring(item and item.fileName or "saved report")
+    end
+    return label .. " [" .. tostring(addon:GetSavedReportPlayerCount(item)) .. "]"
+        .. " @ " .. FormatTimestampForDisplay(createdAt)
+end
+
 function addon:GetRaidScanHistory()
     EnsureTable(RaidInspectorDB, "raidScanHistory", {})
     EnsureTable(RaidInspectorDB.raidScanHistory, "nextId", 1)
@@ -1934,6 +2053,9 @@ function addon:BuildStoredSummaryPayload(key, req, result, state, statusReason)
         payload.level = result.level
         payload.source = result.source
         payload.error = result.error
+        payload.items = CopyTable(result.items or {})
+        payload.enchants = CopyTable(result.enchants or {})
+        payload.gems = CopyTable(result.gems or {})
         payload.gearScore = result.gearScore
         payload.gearScoreSource = result.gearScoreSource
         payload.estimatedGearScore = result.estimatedGearScore
@@ -1942,10 +2064,260 @@ function addon:BuildStoredSummaryPayload(key, req, result, state, statusReason)
         payload.achievementPoints = result.achievementPoints
         payload.achievementPointsSource = result.achievementPointsSource
         payload.raidAchievements = CopyTable(result.raidAchievements or {})
+        payload.raw = CopyTable(result.raw)
         payload.updatedAt = tonumber(result.updatedAt) or tonumber(result.fetchedAt) or payload.updatedAt or 0
     end
 
     return payload
+end
+
+function addon:BuildReportEntryFromPayload(payload, index)
+    if type(payload) ~= "table" then
+        return nil
+    end
+
+    local key = string.lower(tostring(payload.key or MakePlayerKey(payload.name or "Unknown", payload.realm or "Unknown")))
+    local state = tostring(payload.state or ((payload.error and "error") or "ready"))
+    if state ~= "error" and not payload.error then
+        state = "ready"
+    end
+
+    local updatedAt = tonumber(payload.updatedAt) or 0
+    local req = {
+        id = tonumber(payload.requestId) or tonumber(index) or 0,
+        name = payload.name or "Unknown",
+        realm = payload.realm or "Unknown",
+        key = key,
+        status = state,
+        statusReason = payload.statusReason,
+        requestedAt = tonumber(payload.requestedAt) or updatedAt,
+        updatedAt = updatedAt,
+    }
+
+    local result = {
+        name = payload.name or "Unknown",
+        realm = payload.realm or "Unknown",
+        class = payload.class,
+        spec = payload.spec,
+        guild = payload.guild,
+        level = payload.level,
+        source = payload.source or "saved-report",
+        error = payload.error,
+        items = CopyTable(payload.items or {}),
+        enchants = CopyTable(payload.enchants or {}),
+        gems = CopyTable(payload.gems or {}),
+        gearScore = payload.gearScore,
+        gearScoreSource = payload.gearScoreSource,
+        estimatedGearScore = payload.estimatedGearScore,
+        issuesCount = tonumber(payload.issuesCount) or 0,
+        issueSummary = CopyTable(payload.issueSummary or {}),
+        achievementPoints = payload.achievementPoints,
+        achievementPointsSource = payload.achievementPointsSource,
+        raidAchievements = CopyTable(payload.raidAchievements or {}),
+        raw = CopyTable(payload.raw),
+        fetchedAt = updatedAt,
+        updatedAt = updatedAt,
+    }
+
+    return {
+        key = key,
+        req = req,
+        result = result,
+        state = state,
+        statusReason = payload.statusReason,
+        updatedAt = updatedAt,
+        ageMinutes = updatedAt > 0 and math.floor(math.max(0, GetNow() - updatedAt) / 60) or -1,
+        isFresh = updatedAt > 0 and (GetNow() - updatedAt) <= FRESHNESS_TTL_SECONDS,
+    }
+end
+
+function addon:GetActiveSavedReportEntries()
+    local item = addon:GetActiveSavedReport()
+    if type(item) ~= "table" or type(item.report) ~= "table" then
+        return nil
+    end
+
+    local report = item.report
+    local entries = {}
+    local players = type(report.players) == "table" and report.players or {}
+    local order = type(report.order) == "table" and report.order or {}
+    local i
+
+    for i = 1, #order do
+        local key = string.lower(tostring(order[i] or ""))
+        local payload = players[key]
+        local entry = addon:BuildReportEntryFromPayload(payload, i)
+        if entry then
+            entries[#entries + 1] = entry
+        end
+    end
+
+    if #entries == 0 then
+        local key
+        for key in pairs(players) do
+            local entry = addon:BuildReportEntryFromPayload(players[key], #entries + 1)
+            if entry then
+                entries[#entries + 1] = entry
+            end
+        end
+        table.sort(entries, function(a, b)
+            return string.lower(tostring(a.key or "")) < string.lower(tostring(b.key or ""))
+        end)
+    end
+
+    return entries
+end
+
+function addon:ImportSavedReportFiles(items, generatedAt)
+    local savedReports = addon:GetSavedReportFiles()
+    savedReports.generatedAt = tonumber(generatedAt) or GetNow()
+    savedReports.items = {}
+
+    local i
+    for i = 1, #(items or {}) do
+        local item = items[i]
+        if type(item) == "table" and Trim(item.fileName or "") ~= "" then
+            savedReports.items[#savedReports.items + 1] = CopyTable(item)
+        end
+    end
+
+    table.sort(savedReports.items, function(a, b)
+        local aCreated = tonumber(a and a.createdAt) or tonumber(a and a.report and a.report.createdAt) or 0
+        local bCreated = tonumber(b and b.createdAt) or tonumber(b and b.report and b.report.createdAt) or 0
+        if aCreated ~= bCreated then
+            return aCreated > bCreated
+        end
+        return string.lower(tostring(a.fileName or "")) < string.lower(tostring(b.fileName or ""))
+    end)
+
+    if addon:GetSelectedSavedReportFile() ~= "" and not addon:GetActiveSavedReport() then
+        RaidInspectorDB.state.ui.selectedSavedReportFile = ""
+    end
+
+    return #savedReports.items
+end
+
+function addon:ClearProcessedReportQueueItems(processedIds)
+    if type(processedIds) ~= "table" or #processedIds == 0 then
+        return 0
+    end
+
+    local processedMap = {}
+    local i
+    for i = 1, #processedIds do
+        local id = tonumber(processedIds[i])
+        if id then
+            processedMap[id] = true
+        end
+    end
+
+    local queue = addon:GetReportFileQueue()
+    local kept = {}
+    local removed = 0
+    for i = 1, #queue.items do
+        local item = queue.items[i]
+        local id = tonumber(item and item.id)
+        if id and processedMap[id] then
+            removed = removed + 1
+        else
+            kept[#kept + 1] = item
+        end
+    end
+
+    queue.items = kept
+    return removed
+end
+
+function addon:BuildCurrentDetailedReport()
+    local entries = addon:GetOverviewEntries()
+    if #entries == 0 then
+        return nil, "no overview entries available"
+    end
+
+    local createdAt = GetNow()
+    local fileName = BuildReportFileName(createdAt)
+    local report = {
+        schemaVersion = 1,
+        createdAt = createdAt,
+        fileName = fileName,
+        reportLabel = "Raid Inspector " .. FormatTimestampForDisplay(createdAt),
+        source = "raidinspector-addon",
+        sortMode = addon:GetSortMode(),
+        filterMode = addon:GetFilterMode(),
+        order = {},
+        players = {},
+    }
+
+    local i
+    for i = 1, #entries do
+        local entry = entries[i]
+        local payload = addon:BuildStoredSummaryPayload(entry.key, entry.req, entry.result, entry.state, entry.statusReason)
+        report.order[#report.order + 1] = payload.key
+        report.players[payload.key] = payload
+    end
+
+    return report
+end
+
+function addon:QueueDetailedReport()
+    local report, err = addon:BuildCurrentDetailedReport()
+    if not report then
+        Print(err)
+        return nil
+    end
+
+    local queue = addon:GetReportFileQueue()
+    local id = tonumber(queue.nextId) or 1
+    local item = {
+        id = id,
+        createdAt = tonumber(report.createdAt) or GetNow(),
+        fileName = tostring(report.fileName or BuildReportFileName(GetNow())),
+        label = tostring(report.reportLabel or "Raid Inspector Report"),
+        report = report,
+    }
+
+    queue.nextId = id + 1
+    queue.items[#queue.items + 1] = item
+    while #queue.items > REPORT_FILE_QUEUE_LIMIT do
+        table.remove(queue.items, 1)
+    end
+
+    Print("report queued: " .. item.fileName .. " (run bridge, then /ri sync to import catalog)")
+    return item
+end
+
+function addon:LoadSavedReportFile(arg)
+    local savedReports = addon:GetSavedReportFiles()
+    if #savedReports.items == 0 then
+        Print("no saved report files imported yet. run bridge, then /ri sync")
+        return nil
+    end
+
+    local target = string.lower(Trim(arg or ""))
+    local item = nil
+    if target == "" or target == "latest" then
+        item = savedReports.items[1]
+    else
+        local i
+        for i = 1, #savedReports.items do
+            local candidate = savedReports.items[i]
+            local fileName = string.lower(tostring(candidate.fileName or ""))
+            local label = string.lower(tostring(candidate.label or candidate.reportLabel or ""))
+            if fileName == target or label == target then
+                item = candidate
+                break
+            end
+        end
+    end
+
+    if not item then
+        Print("saved report file not found: " .. tostring(arg))
+        return nil
+    end
+
+    addon:SetSelectedSavedReportFile(item.fileName)
+    Print("loaded saved report: " .. addon:BuildSavedReportMenuLabel(item))
+    return item
 end
 
 function addon:BuildRaidHistoryPayloadForKey(key)
@@ -2242,6 +2614,8 @@ function addon:InitBridgeInbox()
     EnsureTable(RaidInspectorBridgeInbox, "generatedAt", 0)
     EnsureTable(RaidInspectorBridgeInbox, "lastConsumedAt", 0)
     EnsureTable(RaidInspectorBridgeInbox, "results", {})
+    EnsureTable(RaidInspectorBridgeInbox, "reportFiles", {})
+    EnsureTable(RaidInspectorBridgeInbox, "processedReportQueueIds", {})
 end
 
 function addon:GetCounts()
@@ -2310,10 +2684,17 @@ function addon:GetBridgeInboxStats()
     for _ in pairs(RaidInspectorBridgeInbox.results) do
         count = count + 1
     end
+
+    local reportCount = 0
+    if type(RaidInspectorBridgeInbox.reportFiles) == "table" then
+        reportCount = #RaidInspectorBridgeInbox.reportFiles
+    end
+
     return {
         generatedAt = tonumber(RaidInspectorBridgeInbox.generatedAt) or 0,
         lastConsumedAt = tonumber(RaidInspectorBridgeInbox.lastConsumedAt) or 0,
         resultCount = count,
+        reportFileCount = reportCount,
         lastImportedBridgeGeneratedAt = tonumber(RaidInspectorDB.meta.lastImportedBridgeGeneratedAt) or 0,
     }
 end
@@ -2725,7 +3106,10 @@ end
 function addon:ConsumeBridgeInbox(silent, force)
     addon:InitBridgeInbox()
 
-    if type(RaidInspectorBridgeInbox.results) ~= "table" or next(RaidInspectorBridgeInbox.results) == nil then
+    local hasResults = type(RaidInspectorBridgeInbox.results) == "table" and next(RaidInspectorBridgeInbox.results) ~= nil
+    local hasReportFiles = type(RaidInspectorBridgeInbox.reportFiles) == "table" and #RaidInspectorBridgeInbox.reportFiles > 0
+    local hasProcessedIds = type(RaidInspectorBridgeInbox.processedReportQueueIds) == "table" and #RaidInspectorBridgeInbox.processedReportQueueIds > 0
+    if not hasResults and not hasReportFiles and not hasProcessedIds then
         return 0
     end
 
@@ -2734,30 +3118,39 @@ function addon:ConsumeBridgeInbox(silent, force)
     local staleEnrichmentOnly = (not force and generatedAt > 0 and generatedAt <= lastImported)
 
     local imported = 0
-    local key
-    for key in pairs(RaidInspectorBridgeInbox.results) do
-        local payload = RaidInspectorBridgeInbox.results[key]
-        local normalizedKey = string.lower(key)
-        local applied = false
+    if hasResults then
+        local key
+        for key in pairs(RaidInspectorBridgeInbox.results) do
+            local payload = RaidInspectorBridgeInbox.results[key]
+            local normalizedKey = string.lower(key)
+            local applied = false
 
-        if staleEnrichmentOnly then
-            if type(RaidInspectorDB.results[normalizedKey]) == "table" then
-                applied = addon:ApplyBridgeAchievementEnrichment(normalizedKey, payload)
+            if staleEnrichmentOnly then
+                if type(RaidInspectorDB.results[normalizedKey]) == "table" then
+                    applied = addon:ApplyBridgeAchievementEnrichment(normalizedKey, payload)
+                else
+                    applied = addon:ApplyBridgeResult(normalizedKey, payload)
+                end
             else
                 applied = addon:ApplyBridgeResult(normalizedKey, payload)
             end
-        else
-            applied = addon:ApplyBridgeResult(normalizedKey, payload)
-        end
 
-        if applied then
-            imported = imported + 1
+            if applied then
+                imported = imported + 1
+            end
         end
     end
 
-    if staleEnrichmentOnly and imported == 0 then
+    if staleEnrichmentOnly and imported == 0 and not hasReportFiles and not hasProcessedIds then
         return 0
     end
+
+    local reportFileCount = 0
+    if type(RaidInspectorBridgeInbox.reportFiles) == "table" then
+        reportFileCount = addon:ImportSavedReportFiles(RaidInspectorBridgeInbox.reportFiles, generatedAt)
+    end
+
+    local clearedQueueItems = addon:ClearProcessedReportQueueItems(RaidInspectorBridgeInbox.processedReportQueueIds)
 
     RaidInspectorBridgeInbox.lastConsumedAt = GetNow()
     if generatedAt > 0 then
@@ -2766,15 +3159,33 @@ function addon:ConsumeBridgeInbox(silent, force)
         RaidInspectorDB.meta.lastImportedBridgeGeneratedAt = GetNow()
     end
 
-    if imported > 0 and not silent then
-        Print("sync complete: imported " .. imported .. " result(s)")
+    if not silent then
+        local messageParts = {}
+        if imported > 0 then
+            messageParts[#messageParts + 1] = "results=" .. tostring(imported)
+        end
+        if reportFileCount > 0 then
+            messageParts[#messageParts + 1] = "savedReports=" .. tostring(reportFileCount)
+        end
+        if clearedQueueItems > 0 then
+            messageParts[#messageParts + 1] = "writtenReports=" .. tostring(clearedQueueItems)
+        end
+
+        if #messageParts > 0 then
+            Print("sync complete: " .. table.concat(messageParts, ", "))
+        end
     end
 
     addon:RefreshMainWindow()
-    return imported
+    return imported + reportFileCount + clearedQueueItems
 end
 
 function addon:GetOverviewEntries()
+    local savedReportEntries = addon:GetActiveSavedReportEntries()
+    if savedReportEntries then
+        return savedReportEntries
+    end
+
     local latestByKey = addon:GetLatestRequestMap()
 
     local entries = {}
@@ -3022,7 +3433,7 @@ function addon:ApplyButtonModeLayout()
         raid = addon.ui.raidButton,
         sync = addon.ui.syncButton,
         force = addon.ui.forceSyncButton,
-        export = addon.ui.exportButton,
+        report = addon.ui.reportButton,
         stale = addon.ui.staleButton,
         status = addon.ui.statusButton,
         clear = addon.ui.clearButton,
@@ -3035,18 +3446,18 @@ function addon:ApplyButtonModeLayout()
         raid = true,
         sync = true,
         force = true,
-        export = true,
+        report = true,
         stale = true,
         status = true,
         clear = true,
     }
 
-    local order = { "sort", "filter", "target", "raid", "sync", "force", "export", "stale", "status", "clear" }
+    local order = { "sort", "filter", "target", "raid", "sync", "force", "report", "stale", "status", "clear" }
     if mode == "easy" then
         visible.sync = false
         visible.force = false
         visible.stale = false
-        order = { "sort", "filter", "target", "raid", "status", "export", "clear" }
+        order = { "sort", "filter", "target", "raid", "status", "report", "clear" }
     end
 
     local key, button
@@ -3266,53 +3677,66 @@ function addon:CreateMainWindow()
         button:SetFrameLevel(80)
     end
 
-    local exportChannelsRow = CreateFrame("Frame", nil, f)
-    exportChannelsRow:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
-    exportChannelsRow:SetWidth(320)
-    exportChannelsRow:SetHeight(20)
+    local savedReportsRow = CreateFrame("Frame", nil, f)
+    savedReportsRow:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
+    savedReportsRow:SetWidth(340)
+    savedReportsRow:SetHeight(20)
 
-    local exportChannelsLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    exportChannelsLabel:SetPoint("LEFT", exportChannelsRow, "LEFT", 0, 0)
-    exportChannelsLabel:SetText("Export:")
+    local savedReportsLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    savedReportsLabel:SetPoint("LEFT", savedReportsRow, "LEFT", 0, 0)
+    savedReportsLabel:SetText("Saved:")
 
-    local exportRaidCheck = CreateFrame("CheckButton", "RaidInspectorExportRaidCheck", f, "UICheckButtonTemplate")
-    exportRaidCheck:SetPoint("LEFT", exportChannelsLabel, "RIGHT", 6, -1)
-    local exportRaidText = _G["RaidInspectorExportRaidCheckText"]
-    if exportRaidText then
-        exportRaidText:SetText("Raid")
-    end
+    local savedReportDropDown = CreateFrame("Frame", "RaidInspectorSavedReportDropDown", f, "UIDropDownMenuTemplate")
+    savedReportDropDown:SetPoint("TOPLEFT", savedReportsLabel, "TOPLEFT", 42, 10)
+    UIDropDownMenu_SetWidth(savedReportDropDown, 250)
+    UIDropDownMenu_JustifyText(savedReportDropDown, "LEFT")
+    UIDropDownMenu_Initialize(savedReportDropDown, function(_, level)
+        if level ~= 1 then
+            return
+        end
 
-    local exportSayCheck = CreateFrame("CheckButton", "RaidInspectorExportSayCheck", f, "UICheckButtonTemplate")
-    exportSayCheck:SetPoint("LEFT", exportRaidCheck, "RIGHT", 42, 0)
-    local exportSayText = _G["RaidInspectorExportSayCheckText"]
-    if exportSayText then
-        exportSayText:SetText("Say")
-    end
+        local liveInfo = UIDropDownMenu_CreateInfo()
+        liveInfo.text = "Live Overview"
+        liveInfo.value = ""
+        liveInfo.checked = (addon:GetSelectedSavedReportFile() == "")
+        liveInfo.func = function()
+            addon:SetSelectedSavedReportFile("")
+            UIDropDownMenu_SetSelectedValue(savedReportDropDown, "")
+            UIDropDownMenu_SetText(savedReportDropDown, "Live Overview")
+        end
+        UIDropDownMenu_AddButton(liveInfo, level)
 
-    local exportWhisperCheck = CreateFrame("CheckButton", "RaidInspectorExportWhisperCheck", f, "UICheckButtonTemplate")
-    exportWhisperCheck:SetPoint("LEFT", exportSayCheck, "RIGHT", 38, 0)
-    local exportWhisperText = _G["RaidInspectorExportWhisperCheckText"]
-    if exportWhisperText then
-        exportWhisperText:SetText("Whisper")
-    end
+        local savedReports = addon:GetSavedReportFiles()
+        if #savedReports.items == 0 then
+            local emptyInfo = UIDropDownMenu_CreateInfo()
+            emptyInfo.text = "No saved reports"
+            emptyInfo.disabled = true
+            UIDropDownMenu_AddButton(emptyInfo, level)
+            return
+        end
 
-    local exportChannels = addon:GetExportChannels()
-    exportRaidCheck:SetChecked(exportChannels.raid and true or false)
-    exportSayCheck:SetChecked(exportChannels.say and true or false)
-    exportWhisperCheck:SetChecked(exportChannels.whisper and true or false)
-
-    exportRaidCheck:SetScript("OnClick", function(self)
-        addon:SetExportChannel("raid", self:GetChecked() and true or false)
+        local i
+        for i = 1, #savedReports.items do
+            local item = savedReports.items[i]
+            local fileName = tostring(item.fileName or "")
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = addon:BuildSavedReportMenuLabel(item)
+            info.value = fileName
+            info.checked = (addon:GetSelectedSavedReportFile() == fileName)
+            info.func = function(btn)
+                local selectedFile = tostring(btn.value or "")
+                addon:SetSelectedSavedReportFile(selectedFile)
+                UIDropDownMenu_SetSelectedValue(savedReportDropDown, selectedFile)
+                UIDropDownMenu_SetText(savedReportDropDown, addon:BuildSavedReportMenuLabel(item))
+            end
+            UIDropDownMenu_AddButton(info, level)
+        end
     end)
-    exportSayCheck:SetScript("OnClick", function(self)
-        addon:SetExportChannel("say", self:GetChecked() and true or false)
-    end)
-    exportWhisperCheck:SetScript("OnClick", function(self)
-        addon:SetExportChannel("whisper", self:GetChecked() and true or false)
-    end)
+    UIDropDownMenu_SetSelectedValue(savedReportDropDown, "")
+    UIDropDownMenu_SetText(savedReportDropDown, "Live Overview")
 
     local actionPanel = CreateFrame("Frame", nil, f)
-    actionPanel:SetPoint("TOPLEFT", exportChannelsRow, "BOTTOMLEFT", 0, -6)
+    actionPanel:SetPoint("TOPLEFT", savedReportsRow, "BOTTOMLEFT", 0, -6)
     actionPanel:SetWidth(214)
     actionPanel:SetHeight(130)
 
@@ -3394,15 +3818,15 @@ function addon:CreateMainWindow()
         end)
     end)
 
-    local exportButton = CreateFrame("Button", "RaidInspectorExportButton", f, "UIPanelButtonTemplate")
-    ActivateActionButton(exportButton)
-    exportButton:SetWidth(100)
-    exportButton:SetHeight(20)
-    exportButton:SetPoint("TOPLEFT", syncButton, "BOTTOMLEFT", 0, -6)
-    SetActionButtonLabel(exportButton, "ff66ff66", "Export")
-    exportButton:SetScript("OnClick", function()
-        SafeInvoke("export", function()
-            addon:ExportSummary("")
+    local reportButton = CreateFrame("Button", "RaidInspectorReportButton", f, "UIPanelButtonTemplate")
+    ActivateActionButton(reportButton)
+    reportButton:SetWidth(100)
+    reportButton:SetHeight(20)
+    reportButton:SetPoint("TOPLEFT", syncButton, "BOTTOMLEFT", 0, -6)
+    SetActionButtonLabel(reportButton, "ff66ff66", "Report")
+    reportButton:SetScript("OnClick", function()
+        SafeInvoke("report", function()
+            addon:QueueDetailedReport()
         end)
     end)
 
@@ -3410,7 +3834,7 @@ function addon:CreateMainWindow()
     ActivateActionButton(staleButton)
     staleButton:SetWidth(100)
     staleButton:SetHeight(20)
-    staleButton:SetPoint("LEFT", exportButton, "RIGHT", 6, 0)
+    staleButton:SetPoint("LEFT", reportButton, "RIGHT", 6, 0)
     SetActionButtonLabel(staleButton, "ffffaa33", "Stale")
     staleButton:SetScript("OnClick", function()
         SafeInvoke("stale", function()
@@ -3422,7 +3846,7 @@ function addon:CreateMainWindow()
     ActivateActionButton(statusButton)
     statusButton:SetWidth(100)
     statusButton:SetHeight(20)
-    statusButton:SetPoint("TOPLEFT", exportButton, "BOTTOMLEFT", 0, -6)
+    statusButton:SetPoint("TOPLEFT", reportButton, "BOTTOMLEFT", 0, -6)
     SetActionButtonLabel(statusButton, "ffffaa33", "Status")
     statusButton:SetScript("OnClick", function()
         SafeInvoke("status", function()
@@ -3586,14 +4010,11 @@ function addon:CreateMainWindow()
     addon.ui.raidButton = raidButton
     addon.ui.syncButton = syncButton
     addon.ui.forceSyncButton = forceSyncButton
-    addon.ui.exportButton = exportButton
+    addon.ui.reportButton = reportButton
     addon.ui.staleButton = staleButton
     addon.ui.statusButton = statusButton
     addon.ui.clearButton = clearButton
-    addon.ui.exportChannelsLabel = exportChannelsLabel
-    addon.ui.exportRaidCheck = exportRaidCheck
-    addon.ui.exportSayCheck = exportSayCheck
-    addon.ui.exportWhisperCheck = exportWhisperCheck
+    addon.ui.savedReportDropDown = savedReportDropDown
     addon.ui.overviewRows = rowsContainer.rows
     addon.ui.overviewScroll = overviewScroll
     addon.ui.overviewEntryCount = 0
@@ -3974,18 +4395,27 @@ function addon:RefreshMainWindow()
 
     addon:ApplyButtonModeLayout()
 
+    local activeSavedReport = addon:GetActiveSavedReport()
+
     local queued, ready, errorCount = addon:GetCounts()
     local fresh, stale = addon:GetFreshnessCounts(FRESHNESS_TTL_SECONDS)
     local playersWithIssues, totalIssues = addon:GetIssueTotals()
 
-    addon.ui.statusText:SetText(
-        "Queue: " .. queued
-            .. "  |  Ready: " .. ready
-            .. "  |  Fresh: " .. fresh
-            .. "  |  Stale: " .. stale
-            .. "  |  Issues: " .. totalIssues .. " (" .. playersWithIssues .. ")"
-            .. "  |  Errors: " .. errorCount
-    )
+    if activeSavedReport then
+        addon.ui.statusText:SetText(
+            "Saved Report: " .. addon:BuildSavedReportMenuLabel(activeSavedReport)
+                .. "  |  Source: file"
+        )
+    else
+        addon.ui.statusText:SetText(
+            "Queue: " .. queued
+                .. "  |  Ready: " .. ready
+                .. "  |  Fresh: " .. fresh
+                .. "  |  Stale: " .. stale
+                .. "  |  Issues: " .. totalIssues .. " (" .. playersWithIssues .. ")"
+                .. "  |  Errors: " .. errorCount
+        )
+    end
 
     if addon.ui.sortButton then
         addon.ui.sortButton:SetText("|cff66ff66S:" .. addon:GetSortMode() .. "|r")
@@ -4007,8 +4437,19 @@ function addon:RefreshMainWindow()
         UIDropDownMenu_SetText(addon.ui.itemFilterDropDown, ITEM_LIST_FILTER_LABELS[selectedMode] or selectedMode)
     end
 
+    if addon.ui.savedReportDropDown then
+        local selectedFile = addon:GetSelectedSavedReportFile()
+        UIDropDownMenu_SetSelectedValue(addon.ui.savedReportDropDown, selectedFile)
+        if selectedFile == "" then
+            UIDropDownMenu_SetText(addon.ui.savedReportDropDown, "Live Overview")
+        else
+            local item = addon:GetActiveSavedReport()
+            UIDropDownMenu_SetText(addon.ui.savedReportDropDown, item and addon:BuildSavedReportMenuLabel(item) or "Live Overview")
+        end
+    end
+
     local entries = addon:GetOverviewEntries()
-    if #entries == 0 then
+    if #entries == 0 and not activeSavedReport then
         local latestByKey = addon:GetLatestRequestMap()
         local key
         for key in pairs(latestByKey) do
@@ -4053,7 +4494,7 @@ function addon:RefreshMainWindow()
         end
     end
 
-    if selectedKey == "" or not addon:GetLatestRequestForKey(selectedKey) then
+    if selectedKey == "" or not selectedEntry then
         if #entries > 0 then
             selectedKey = entries[1].key
             addon:SetSelectedKey(selectedKey)
@@ -4233,7 +4674,7 @@ function addon:SendSummaryMessage(message, whisperTarget)
             SendChatMessage(chatMessage, "RAID")
             sent = sent + 1
         else
-            Print("export: RAID checked, but you are not in a raid")
+            Print("share: RAID checked, but you are not in a raid")
         end
     end
 
@@ -4250,12 +4691,12 @@ function addon:SendSummaryMessage(message, whisperTarget)
             SendChatMessage(chatMessage, "WHISPER", nil, targetName)
             sent = sent + 1
         else
-            Print("export: WHISPER checked, but selected player name is missing")
+            Print("share: WHISPER checked, but selected player name is missing")
         end
     end
 
     if attempted == 0 then
-        Print("export: no channels selected (Raid/Say/Whisper)")
+        Print("share: no channels selected (Raid/Say/Whisper)")
         return 0, 0, chatMessage
     end
 
@@ -4323,6 +4764,8 @@ function addon:PrintStatus()
     local playersWithIssues, totalIssues = addon:GetIssueTotals()
     local bridge = addon:GetBridgeInboxStats()
     local reports = addon:GetReportSnapshots()
+    local reportFileQueue = addon:GetReportFileQueue()
+    local savedReportFiles = addon:GetSavedReportFiles()
     local history = addon:GetRaidScanHistory()
     local livePending = addon.inspectQueue and #addon.inspectQueue or 0
     local liveActive = addon.inspectCurrent and (addon.inspectCurrent.name .. "-" .. addon.inspectCurrent.realm) or "-"
@@ -4338,7 +4781,8 @@ function addon:PrintStatus()
     Print("live inspect: pending=" .. tostring(livePending) .. ", active=" .. tostring(liveActive))
     Print("achievement compare: supported=" .. achievementSupported .. ", pending=" .. tostring(achievementPending) .. ", active=" .. tostring(achievementActive))
     Print("saved reports=" .. tostring(#reports.items) .. ", raid scan history=" .. tostring(#history.scans))
-    Print("bridge inbox: count=" .. bridge.resultCount .. ", generatedAt=" .. bridge.generatedAt .. ", lastConsumedAt=" .. bridge.lastConsumedAt)
+    Print("file reports: pending=" .. tostring(#reportFileQueue.items) .. ", catalog=" .. tostring(#savedReportFiles.items))
+    Print("bridge inbox: count=" .. bridge.resultCount .. ", reportFiles=" .. bridge.reportFileCount .. ", generatedAt=" .. bridge.generatedAt .. ", lastConsumedAt=" .. bridge.lastConsumedAt)
     Print("bridge import marker: lastImportedGeneratedAt=" .. bridge.lastImportedBridgeGeneratedAt)
 
     local progress = addon:GetSnapshotProgress()
@@ -4352,12 +4796,15 @@ end
 function addon:ClearQueue()
     RaidInspectorDB.requests = {}
     RaidInspectorDB.results = {}
+    RaidInspectorDB.reportFileQueue = { nextId = 1, items = {} }
     RaidInspectorDB.state.lastSnapshot = { at = 0, historyId = 0, members = {} }
     RaidInspectorDB.state.nextRequestId = 1
     RaidInspectorDB.meta.lastImportedBridgeGeneratedAt = 0
 
     addon:InitBridgeInbox()
     RaidInspectorBridgeInbox.results = {}
+    RaidInspectorBridgeInbox.reportFiles = {}
+    RaidInspectorBridgeInbox.processedReportQueueIds = {}
     RaidInspectorBridgeInbox.generatedAt = 0
     RaidInspectorBridgeInbox.lastConsumedAt = GetNow()
 
@@ -4374,7 +4821,7 @@ function addon:ClearQueue()
     end
     ClearAchievementComparisonUnitSafe()
     addon:SetSelectedKey("")
-    Print("queue + results + bridge inbox cleared")
+    Print("queue + results + pending report writes + bridge inbox cleared")
     addon:RefreshMainWindow()
 end
 
@@ -4447,9 +4894,11 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri forcesync - re-import bridge inbox ignoring generatedAt")
             Print("/ri sort [recent|gs|issues|name] - set or cycle sort")
             Print("/ri filter [all|snapshot|ready|queued|issues] - set or cycle filter")
+            Print("/ri report - queue a detailed roster report file in Interface/AddOns/RaidInspector/reports")
+            Print("/ri loadreport [latest|filename] - load a saved file report into the overview")
+            Print("/ri share [name-realm] - short summary to selected chat channels")
             Print("/ri savereport [name-realm] - save current or selected report snapshot")
-            Print("/ri export [name-realm] - quick summary to raid/party chat")
-            Print("/ri exportsaved [latest|id|name-realm] - export saved snapshot")
+            Print("/ri sharesaved [latest|id|name-realm] - share saved snapshot to chat")
             Print("/ri status - show queue summary")
             Print("/ri refreshstale [minutes] - queue refresh for stale results")
             Print("/ri clearqueue [confirm] - clear queue/results with confirmation")
@@ -4527,12 +4976,22 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             return
         end
 
-        if command == "export" then
+        if command == "report" or command == "export" then
+            addon:QueueDetailedReport()
+            return
+        end
+
+        if command == "loadreport" then
+            addon:LoadSavedReportFile(args)
+            return
+        end
+
+        if command == "share" then
             addon:ExportSummary(args)
             return
         end
 
-        if command == "exportsaved" then
+        if command == "sharesaved" or command == "exportsaved" then
             addon:ExportSavedReport(args)
             return
         end
