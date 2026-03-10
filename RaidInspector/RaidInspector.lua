@@ -280,6 +280,79 @@ local function ColorText(text, color)
     return "|cff" .. color .. tostring(text) .. "|r"
 end
 
+local function RGBToHexColorCode(red, green, blue)
+    local r = math.max(0, math.min(255, math.floor(((tonumber(red) or 0) * 255) + 0.5)))
+    local g = math.max(0, math.min(255, math.floor(((tonumber(green) or 0) * 255) + 0.5)))
+    local b = math.max(0, math.min(255, math.floor(((tonumber(blue) or 0) * 255) + 0.5)))
+    return string.format("%02x%02x%02x", r, g, b)
+end
+
+local function NormalizeClassKey(value)
+    local text = tostring(value or "")
+    text = string.upper(text)
+    return (string.gsub(text, "%s+", ""))
+end
+
+local function ResolveClassToken(classValue)
+    local normalized = NormalizeClassKey(classValue)
+    if normalized == "" then
+        return nil
+    end
+
+    if RAID_CLASS_COLORS and RAID_CLASS_COLORS[normalized] then
+        return normalized
+    end
+
+    local sourceTables = { LOCALIZED_CLASS_NAMES_MALE, LOCALIZED_CLASS_NAMES_FEMALE }
+    local index
+    for index = 1, #sourceTables do
+        local source = sourceTables[index]
+        if type(source) == "table" then
+            local token, localizedName
+            for token, localizedName in pairs(source) do
+                if NormalizeClassKey(localizedName) == normalized then
+                    return token
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+local function GetClassColorCode(classValue)
+    local token = ResolveClassToken(classValue)
+    if not token then
+        return nil
+    end
+
+    local colorInfo = nil
+    if CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[token] then
+        colorInfo = CUSTOM_CLASS_COLORS[token]
+    elseif RAID_CLASS_COLORS and RAID_CLASS_COLORS[token] then
+        colorInfo = RAID_CLASS_COLORS[token]
+    end
+
+    if not colorInfo then
+        return nil
+    end
+
+    local colorStr = tostring(colorInfo.colorStr or "")
+    if string.len(colorStr) >= 6 then
+        return string.sub(colorStr, string.len(colorStr) - 5)
+    end
+
+    return RGBToHexColorCode(colorInfo.r, colorInfo.g, colorInfo.b)
+end
+
+local function ColorClassText(text, classValue)
+    local colorCode = GetClassColorCode(classValue)
+    if not colorCode then
+        return tostring(text)
+    end
+    return ColorText(text, colorCode)
+end
+
 local function EscapeChatMessage(text)
     local value = tostring(text or "")
     return string.gsub(value, "|", "||")
@@ -3582,9 +3655,13 @@ function addon:BuildOverviewRowText(entry)
         reasonText = " | " .. FormatStatusReason(entry.statusReason)
     end
 
+    local nameText = SafeText(reqName) .. "-" .. SafeText(reqRealm)
+    if result and result.class then
+        nameText = ColorClassText(nameText, result.class)
+    end
+
     return "#" .. tostring(reqId)
-        .. " " .. SafeText(reqName)
-        .. "-" .. SafeText(reqRealm)
+        .. " " .. nameText
         .. " [" .. state .. "] GS=" .. gsText
         .. auditText
         .. reasonText
@@ -3736,7 +3813,11 @@ function addon:RefreshDetailPanel(selectedEntry)
 
     local req = selectedEntry.req
     local result = selectedEntry.result
-    addon.ui.detailHeader:SetText("Selected: " .. SafeText(req.name) .. "-" .. SafeText(req.realm) .. " [" .. selectedEntry.state .. "]")
+    local selectedNameText = SafeText(req.name) .. "-" .. SafeText(req.realm)
+    if result and result.class then
+        selectedNameText = ColorClassText(selectedNameText, result.class)
+    end
+    addon.ui.detailHeader:SetText("Selected: " .. selectedNameText .. " [" .. selectedEntry.state .. "]")
 
     if not result then
         local reason = FormatStatusReason(req.statusReason)
@@ -3770,10 +3851,11 @@ function addon:RefreshDetailPanel(selectedEntry)
     local levelText = result.level and tostring(result.level) or "?"
     local scoreValue = result.gearScore and tostring(result.gearScore) or "N/A"
     local scoreColored = result.gearScore and ColorText(scoreValue, GetGearScoreColorCode(result.gearScore)) or scoreValue
+    local classColored = ColorClassText(classText, result.class)
     local specColored = ColorText(specText, "ff9933")
 
     addon.ui.detailScore:SetText(
-        "GS: " .. scoreColored .. " | Character: Lvl " .. levelText .. " | " .. classText .. " | Guild: " .. guildText
+        "GS: " .. scoreColored .. " | Character: Lvl " .. levelText .. " | " .. classColored .. " | Guild: " .. guildText
     )
 
     if addon.ui.detailMeta then
