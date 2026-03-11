@@ -2,6 +2,21 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.12.0-alpha - 2026-03-10
+- Added bridgeless branch behavior for fully in-game use:
+  - removed bridge import from login/runtime flow
+  - disabled `/ri sync` and `/ri forcesync` with an in-game guidance message
+  - manual `/ri inspect` now only queues players that exist in current target/party/raid context
+- Reworked detailed reports to stay fully in SavedVariables:
+  - `Report` now saves the current overview directly into the addon database
+  - saved-report dropdown loads those local reports without external files or bridge sync
+  - existing queued report-file payloads are migrated into local saved reports on load
+- Updated the main window for local-only workflow:
+  - `Sync` button becomes `Share`
+  - `Force` button becomes `Save`
+  - `Stale` button is relabeled `Refresh`
+  - status/detail text now describes live inspect instead of bridge usage
+
 ## 0.11.0-alpha - 2026-03-10
 - Renamed the main `Export` action to `Report` and repurposed it for detailed roster reports.
 - Added bridge-backed report file export:

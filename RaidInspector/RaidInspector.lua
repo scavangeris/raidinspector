@@ -6,19 +6,22 @@ RaidInspectorBridgeInbox = RaidInspectorBridgeInbox or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.11.0-alpha"
+addon.version = "0.12.0-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
 local RAID_HISTORY_RETENTION_SECONDS = 30 * 24 * 60 * 60
 local INSPECT_THROTTLE_SECONDS = 2
 local INSPECT_TIMEOUT_SECONDS = 8
+local INSPECT_TALENT_MIN_WAIT_SECONDS = 1
+local INSPECT_TALENT_GRACE_SECONDS = 3
 local ACHIEVEMENT_COMPARE_THROTTLE_SECONDS = 2
 local ACHIEVEMENT_COMPARE_TIMEOUT_SECONDS = 8
 local REPORT_SNAPSHOT_LIMIT = 200
 local REPORT_FILE_QUEUE_LIMIT = 25
 local OVERVIEW_ROW_HEIGHT = 18
-local OVERVIEW_VISIBLE_ROWS = 14
+local OVERVIEW_VISIBLE_ROWS = 12
+local OVERVIEW_BOTTOM_INSET = 28
 local DETAIL_ROW_HEIGHT = 18
 local WINDOW_WIDTH = 1000
 local WINDOW_HEIGHT = 500
@@ -645,17 +648,32 @@ local function GetComparisonAchievementCompletedSafe(achievementId)
     return nil
 end
 
-local function GetInspectTalentTabCount()
-    if not GetNumTalentTabs then
+local function GetInspectTalentGroup(unit)
+    if type(GetActiveTalentGroup) ~= "function" or not UnitExists(unit) then
+        return nil
+    end
+
+    local isInspect = not UnitIsUnit("player", unit)
+    local ok, group = pcall(GetActiveTalentGroup, isInspect)
+    if ok and tonumber(group) and tonumber(group) > 0 then
+        return tonumber(group)
+    end
+
+    ok, group = pcall(GetActiveTalentGroup)
+    if ok and tonumber(group) and tonumber(group) > 0 then
+        return tonumber(group)
+    end
+
+    return nil
+end
+
+local function GetInspectTalentTabCount(unit)
+    if type(GetNumTalentTabs) ~= "function" or not UnitExists(unit) then
         return 0
     end
 
-    local ok, count = pcall(GetNumTalentTabs, true, false)
-    if ok and tonumber(count) and tonumber(count) > 0 then
-        return tonumber(count)
-    end
-
-    ok, count = pcall(GetNumTalentTabs, true)
+    local isInspect = not UnitIsUnit("player", unit)
+    local ok, count = pcall(GetNumTalentTabs, isInspect)
     if ok and tonumber(count) and tonumber(count) > 0 then
         return tonumber(count)
     end
@@ -668,17 +686,20 @@ local function GetInspectTalentTabCount()
     return 0
 end
 
-local function GetInspectTalentTabInfo(index)
-    if not GetTalentTabInfo then
+local function GetInspectTalentTabInfo(unit, index, explicitGroup)
+    if type(GetTalentTabInfo) ~= "function" or not UnitExists(unit) then
         return nil, 0
     end
 
-    local ok, name, _, points = pcall(GetTalentTabInfo, index, true, false)
+    local isInspect = not UnitIsUnit("player", unit)
+    local group = explicitGroup or GetInspectTalentGroup(unit)
+
+    local ok, name, _, points = pcall(GetTalentTabInfo, index, isInspect, nil, group)
     if ok and name then
         return name, tonumber(points) or 0
     end
 
-    ok, name, _, points = pcall(GetTalentTabInfo, index, true)
+    ok, name, _, points = pcall(GetTalentTabInfo, index, isInspect)
     if ok and name then
         return name, tonumber(points) or 0
     end
@@ -691,35 +712,102 @@ local function GetInspectTalentTabInfo(index)
     return nil, 0
 end
 
+local function BuildInspectTalentSnapshot(unit, explicitGroup)
+    local numTabs = GetInspectTalentTabCount(unit)
+    if numTabs <= 0 then
+        return nil
+    end
+
+    local snapshot = {
+        group = explicitGroup,
+        totalPoints = 0,
+        bestName = nil,
+        bestPoints = -1,
+        points = {},
+    }
+
+    local i
+    for i = 1, numTabs do
+        local name, spent = GetInspectTalentTabInfo(unit, i, explicitGroup)
+        spent = tonumber(spent) or 0
+        snapshot.points[#snapshot.points + 1] = spent
+        snapshot.totalPoints = snapshot.totalPoints + spent
+        if name and spent > snapshot.bestPoints then
+            snapshot.bestName = tostring(name)
+            snapshot.bestPoints = spent
+        end
+    end
+
+    return snapshot
+end
+
 local function DetectUnitSpecFromTalents(unit)
     if not UnitExists(unit) then
         return nil
     end
 
-    local numTabs = GetInspectTalentTabCount()
-    if numTabs <= 0 then
-        return nil
+    local triedGroups = {}
+    local candidateGroups = {}
+    local activeGroup = GetInspectTalentGroup(unit)
+    if activeGroup and activeGroup >= 1 then
+        candidateGroups[#candidateGroups + 1] = activeGroup
+        triedGroups[activeGroup] = true
     end
+    if not triedGroups[1] then
+        candidateGroups[#candidateGroups + 1] = 1
+        triedGroups[1] = true
+    end
+    if not triedGroups[2] then
+        candidateGroups[#candidateGroups + 1] = 2
+        triedGroups[2] = true
+    end
+    candidateGroups[#candidateGroups + 1] = nil
 
-    local points = {}
-    local bestName = nil
-    local bestPoints = -1
+    local bestSnapshot = nil
     local i
-    for i = 1, numTabs do
-        local name, spent = GetInspectTalentTabInfo(i)
-        spent = tonumber(spent) or 0
-        points[#points + 1] = tostring(spent)
-        if name and spent > bestPoints then
-            bestName = tostring(name)
-            bestPoints = spent
+    for i = 1, #candidateGroups do
+        local snapshot = BuildInspectTalentSnapshot(unit, candidateGroups[i])
+        if snapshot and snapshot.totalPoints > 0 then
+            if not bestSnapshot or snapshot.totalPoints > bestSnapshot.totalPoints then
+                bestSnapshot = snapshot
+            end
         end
     end
 
-    if not bestName or bestPoints <= 0 then
+    if not bestSnapshot or not bestSnapshot.bestName or bestSnapshot.bestPoints <= 0 then
         return nil
     end
 
-    return bestName .. " (" .. table.concat(points, "/") .. ")"
+    local pointText = {}
+    for i = 1, #bestSnapshot.points do
+        pointText[#pointText + 1] = tostring(bestSnapshot.points[i])
+    end
+
+    return bestSnapshot.bestName .. " (" .. table.concat(pointText, "/") .. ")"
+end
+
+local function HasInspectTalentData(unit)
+    if not UnitExists(unit) then
+        return false
+    end
+
+    local activeGroup = GetInspectTalentGroup(unit)
+    local groups = { activeGroup, 1, 2, nil }
+    local seen = {}
+    local i
+    for i = 1, #groups do
+        local group = groups[i]
+        local key = tostring(group)
+        if not seen[key] then
+            seen[key] = true
+            local snapshot = BuildInspectTalentSnapshot(unit, group)
+            if snapshot and snapshot.totalPoints > 0 then
+                return true
+            end
+        end
+    end
+
+    return false
 end
 
 local function MakePlayerKey(name, realm)
@@ -774,7 +862,18 @@ local function FormatTimestampForDisplay(timestamp)
 end
 
 local function BuildReportFileName(timestamp)
-    return "raidinspector-report-" .. FormatTimestampForFileName(timestamp) .. ".json"
+    return "raidinspector-report-" .. FormatTimestampForFileName(timestamp)
+end
+
+local function SortSavedReportItems(items)
+    table.sort(items, function(a, b)
+        local aCreated = tonumber(a and a.createdAt) or tonumber(a and a.report and a.report.createdAt) or 0
+        local bCreated = tonumber(b and b.createdAt) or tonumber(b and b.report and b.report.createdAt) or 0
+        if aCreated ~= bCreated then
+            return aCreated > bCreated
+        end
+        return string.lower(tostring(a and a.fileName or "")) < string.lower(tostring(b and b.fileName or ""))
+    end)
 end
 
 local function SafeText(value)
@@ -797,8 +896,7 @@ local function FormatStatusReason(reason)
         ["unit-changed"] = "unit changed",
         ["inspect-timeout"] = "inspect timeout",
         ["inspect-build-failed"] = "inspect build failed",
-        ["bridge-error"] = "bridge error",
-        ["bridge-pending"] = "bridge pending",
+        ["local-only"] = "not in current target, party, or raid",
     }
     if not reason or reason == "" then
         return ""
@@ -903,8 +1001,16 @@ local function NormalizeSlot(slot)
     return SLOT_ALIASES[raw]
 end
 
+local function GetRecordedEnchantId(item)
+    local enchantId = tonumber(item and item.enchantId)
+    if enchantId and enchantId > 0 then
+        return enchantId
+    end
+    return nil
+end
+
 local function IsLowTierEnchant(item)
-    local enchantId = tonumber(item.enchantId)
+    local enchantId = GetRecordedEnchantId(item)
     local ilvl = tonumber(item.ilvl) or 0
     if not enchantId then
         return false
@@ -996,7 +1102,7 @@ local function EstimateGearScoreLiteItem(item)
         score = 0
     end
 
-    if cfg.enchantable and not tonumber(item.enchantId) then
+    if cfg.enchantable and not GetRecordedEnchantId(item) then
         local percent = 1 + ((-2 * cfg.slotMod) / 100)
         score = math.floor((score * percent) + 0.5)
     end
@@ -1205,7 +1311,7 @@ local function AnalyzeItemIssues(items)
 
         if not slot or slot == "" then
             itemsWithoutSlot = itemsWithoutSlot + 1
-        elseif ENCHANTABLE_SLOTS[slot] and not OPTIONAL_ENCHANT_SLOTS[slot] and not tonumber(item.enchantId) then
+        elseif ENCHANTABLE_SLOTS[slot] and not OPTIONAL_ENCHANT_SLOTS[slot] and not GetRecordedEnchantId(item) then
             missingEnchant = missingEnchant + 1
         end
 
@@ -1260,17 +1366,26 @@ function addon:FinalizeInspectCurrent(success, failureReason)
     end
 
     local current = addon.inspectCurrent
+    local talentDataReady = current.talentReadySeen == true
+    if not talentDataReady and UnitExists(current.unit) then
+        talentDataReady = HasInspectTalentData(current.unit)
+    end
     addon.inspectCurrent = nil
 
     local req = addon:GetLatestRequestForKey(current.key)
     if success and UnitExists(current.unit) then
-        local ok, resultOrErr = pcall(addon.BuildLocalInspectResult, addon, current.unit, current.key, current.name, current.realm)
+        local ok, resultOrErr = pcall(
+            addon.BuildLocalInspectResult,
+            addon,
+            current.unit,
+            current.key,
+            current.name,
+            current.realm,
+            talentDataReady
+        )
         if ok and type(resultOrErr) == "table" then
             local previous = RaidInspectorDB.results[current.key]
             if type(previous) == "table" then
-                if (not resultOrErr.spec or resultOrErr.spec == "") and previous.spec and previous.spec ~= "" then
-                    resultOrErr.spec = previous.spec
-                end
                 if resultOrErr.achievementPoints == nil and previous.achievementPoints ~= nil then
                     resultOrErr.achievementPoints = previous.achievementPoints
                     resultOrErr.achievementPointsSource = previous.achievementPointsSource
@@ -1594,7 +1709,7 @@ function addon:QueueLiveInspectUnit(unit, queueRequest)
     return true
 end
 
-function addon:BuildLocalInspectResult(unit, key, name, realm)
+function addon:BuildLocalInspectResult(unit, key, name, realm, inspectTalentsReady)
     local items = {}
     local enchants = {}
     local gemsBySlot = {}
@@ -1640,7 +1755,10 @@ function addon:BuildLocalInspectResult(unit, key, name, realm)
     local now = GetNow()
     local issueSummary = AnalyzeItemIssues(items)
     local localizedClass, englishClass = UnitClass(unit)
-    local detectedSpec = DetectUnitSpecFromTalents(unit)
+    local detectedSpec = nil
+    if inspectTalentsReady then
+        detectedSpec = DetectUnitSpecFromTalents(unit)
+    end
     local estimatedGS, estimatedSource = EstimateGearScoreFromUnit(unit, englishClass)
     if not estimatedGS then
         estimatedGS, estimatedSource = EstimateGearScoreFromItems(items, englishClass)
@@ -1720,10 +1838,6 @@ function addon:ProcessInspectQueue(force)
         return
     end
 
-    if ClearInspectPlayer then
-        ClearInspectPlayer()
-    end
-    NotifyInspect(entry.unit)
     addon.inspectCurrent = {
         unit = entry.unit,
         guid = entry.guid,
@@ -1732,7 +1846,18 @@ function addon:ProcessInspectQueue(force)
         realm = entry.realm,
         startedAt = GetNow(),
         lastPollAt = 0,
+        inspectReadySeen = false,
+        inspectReadyAt = 0,
+        talentReadySeen = false,
+        talentReadyAt = 0,
+        itemsReadyAt = 0,
     }
+
+    if ClearInspectPlayer then
+        ClearInspectPlayer()
+    end
+    NotifyInspect(entry.unit)
+
     addon.inspectLastRequestAt = GetNow()
 
     local req = addon:GetLatestRequestForKey(entry.key)
@@ -1752,7 +1877,21 @@ function addon:OnInspectReady(guid)
         return
     end
 
-    addon:FinalizeInspectCurrent(true, nil)
+    addon.inspectCurrent.inspectReadySeen = true
+    addon.inspectCurrent.inspectReadyAt = GetNow()
+end
+
+function addon:OnInspectTalentReady()
+    if not addon.inspectCurrent then
+        return
+    end
+
+    if addon.inspectCurrent.guid and UnitGUID(addon.inspectCurrent.unit) ~= addon.inspectCurrent.guid then
+        return
+    end
+
+    addon.inspectCurrent.talentReadySeen = true
+    addon.inspectCurrent.talentReadyAt = GetNow()
 end
 
 function addon:OnUpdate(elapsed)
@@ -1767,14 +1906,43 @@ function addon:OnUpdate(elapsed)
         if UnitExists(addon.inspectCurrent.unit) and (now - (addon.inspectCurrent.lastPollAt or 0)) >= 1 then
             addon.inspectCurrent.lastPollAt = now
             if addon:GetInspectLinkCount(addon.inspectCurrent.unit) > 0 then
-                addon:FinalizeInspectCurrent(true, nil)
-                addon:ProcessInspectQueue(false)
-                return
+                if not addon.inspectCurrent.itemsReadyAt or addon.inspectCurrent.itemsReadyAt <= 0 then
+                    addon.inspectCurrent.itemsReadyAt = now
+                end
+            end
+
+            local itemsReadyAt = tonumber(addon.inspectCurrent.itemsReadyAt) or 0
+            if itemsReadyAt > 0 then
+                local talentReadySeen = addon.inspectCurrent.talentReadySeen == true
+                local talentReadyAt = tonumber(addon.inspectCurrent.talentReadyAt) or 0
+                local talentWaitElapsed = talentReadySeen
+                    and talentReadyAt > 0
+                    and (now - talentReadyAt) >= INSPECT_TALENT_MIN_WAIT_SECONDS
+                local talentGraceElapsed = talentReadySeen
+                    and talentReadyAt > 0
+                    and (now - talentReadyAt) >= INSPECT_TALENT_GRACE_SECONDS
+                local eventMissingTooLong = (now - itemsReadyAt) >= INSPECT_TALENT_GRACE_SECONDS
+
+                if talentReadySeen then
+                    if talentWaitElapsed and (HasInspectTalentData(addon.inspectCurrent.unit) or talentGraceElapsed) then
+                        addon:FinalizeInspectCurrent(true, nil)
+                        addon:ProcessInspectQueue(false)
+                        return
+                    end
+                elseif eventMissingTooLong then
+                    addon:FinalizeInspectCurrent(true, nil)
+                    addon:ProcessInspectQueue(false)
+                    return
+                end
             end
         end
 
         if (now - addon.inspectCurrent.startedAt) > INSPECT_TIMEOUT_SECONDS then
-            addon:FinalizeInspectCurrent(false, "inspect-timeout")
+            if (tonumber(addon.inspectCurrent.itemsReadyAt) or 0) > 0 then
+                addon:FinalizeInspectCurrent(true, nil)
+            else
+                addon:FinalizeInspectCurrent(false, "inspect-timeout")
+            end
         end
     end
 
@@ -1846,9 +2014,9 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.raidScanHistory, "nextId", 1)
     EnsureTable(RaidInspectorDB.raidScanHistory, "scans", {})
 
-    RaidInspectorDB.meta.schemaVersion = 3
+    RaidInspectorDB.meta.schemaVersion = 4
     RaidInspectorDB.meta.lastLoadedAt = GetNow()
-    EnsureTable(RaidInspectorDB.meta, "lastImportedBridgeGeneratedAt", 0)
+    addon:MigrateReportFileQueueToSavedReports()
     addon:PruneRaidScanHistory()
 end
 
@@ -1925,6 +2093,48 @@ function addon:GetSavedReportFiles()
     EnsureTable(RaidInspectorDB.savedReportFiles, "generatedAt", 0)
     EnsureTable(RaidInspectorDB.savedReportFiles, "items", {})
     return RaidInspectorDB.savedReportFiles
+end
+
+function addon:MigrateReportFileQueueToSavedReports()
+    local queue = RaidInspectorDB.reportFileQueue
+    if type(queue) ~= "table" or type(queue.items) ~= "table" or #queue.items == 0 then
+        return 0
+    end
+
+    local savedReports = addon:GetSavedReportFiles()
+    local migrated = 0
+    local i
+    for i = 1, #queue.items do
+        local item = queue.items[i]
+        if type(item) == "table" and type(item.report) == "table" then
+            local createdAt = tonumber(item.createdAt) or tonumber(item.report.createdAt) or GetNow()
+            local fileName = tostring(item.fileName or item.report.fileName or BuildReportFileName(createdAt))
+            if not addon:FindSavedReportFileItem(fileName) then
+                savedReports.items[#savedReports.items + 1] = {
+                    createdAt = createdAt,
+                    fileName = fileName,
+                    label = tostring(item.label or item.report.reportLabel or "Raid Inspector Report"),
+                    report = CopyTable(item.report),
+                }
+                migrated = migrated + 1
+            end
+        end
+    end
+
+    if migrated > 0 then
+        savedReports.generatedAt = GetNow()
+        SortSavedReportItems(savedReports.items)
+        while #savedReports.items > REPORT_FILE_QUEUE_LIMIT do
+            table.remove(savedReports.items)
+        end
+    end
+
+    RaidInspectorDB.reportFileQueue = {
+        nextId = tonumber(queue.nextId) or 1,
+        items = {},
+    }
+
+    return migrated
 end
 
 function addon:GetSelectedSavedReportFile()
@@ -2181,14 +2391,7 @@ function addon:ImportSavedReportFiles(items, generatedAt)
         end
     end
 
-    table.sort(savedReports.items, function(a, b)
-        local aCreated = tonumber(a and a.createdAt) or tonumber(a and a.report and a.report.createdAt) or 0
-        local bCreated = tonumber(b and b.createdAt) or tonumber(b and b.report and b.report.createdAt) or 0
-        if aCreated ~= bCreated then
-            return aCreated > bCreated
-        end
-        return string.lower(tostring(a.fileName or "")) < string.lower(tostring(b.fileName or ""))
-    end)
+    SortSavedReportItems(savedReports.items)
 
     if addon:GetSelectedSavedReportFile() ~= "" and not addon:GetActiveSavedReport() then
         RaidInspectorDB.state.ui.selectedSavedReportFile = ""
@@ -2266,30 +2469,40 @@ function addon:QueueDetailedReport()
         return nil
     end
 
-    local queue = addon:GetReportFileQueue()
-    local id = tonumber(queue.nextId) or 1
+    local savedReports = addon:GetSavedReportFiles()
+    local fileName = tostring(report.fileName or BuildReportFileName(GetNow()))
+    if addon:FindSavedReportFileItem(fileName) then
+        local suffix = 2
+        while addon:FindSavedReportFileItem(fileName .. "-" .. tostring(suffix)) do
+            suffix = suffix + 1
+        end
+        fileName = fileName .. "-" .. tostring(suffix)
+    end
+    report.fileName = fileName
+
     local item = {
-        id = id,
         createdAt = tonumber(report.createdAt) or GetNow(),
-        fileName = tostring(report.fileName or BuildReportFileName(GetNow())),
+        fileName = fileName,
         label = tostring(report.reportLabel or "Raid Inspector Report"),
         report = report,
     }
 
-    queue.nextId = id + 1
-    queue.items[#queue.items + 1] = item
-    while #queue.items > REPORT_FILE_QUEUE_LIMIT do
-        table.remove(queue.items, 1)
+    savedReports.generatedAt = GetNow()
+    savedReports.items[#savedReports.items + 1] = item
+    SortSavedReportItems(savedReports.items)
+    while #savedReports.items > REPORT_FILE_QUEUE_LIMIT do
+        table.remove(savedReports.items)
     end
 
-    Print("report queued: " .. item.fileName .. " (run bridge, then /ri sync to import catalog)")
+    addon:SetSelectedSavedReportFile(item.fileName)
+    Print("report saved: " .. addon:BuildSavedReportMenuLabel(item))
     return item
 end
 
 function addon:LoadSavedReportFile(arg)
     local savedReports = addon:GetSavedReportFiles()
     if #savedReports.items == 0 then
-        Print("no saved report files imported yet. run bridge, then /ri sync")
+        Print("no saved reports yet")
         return nil
     end
 
@@ -2311,7 +2524,7 @@ function addon:LoadSavedReportFile(arg)
     end
 
     if not item then
-        Print("saved report file not found: " .. tostring(arg))
+        Print("saved report not found: " .. tostring(arg))
         return nil
     end
 
@@ -2820,6 +3033,7 @@ function addon:QueueStaleRefresh(minAgeMinutes)
 
     local now = GetNow()
     local queued = 0
+    local unavailable = 0
     local seen = {}
     local i
 
@@ -2838,14 +3052,26 @@ function addon:QueueStaleRefresh(minAgeMinutes)
             local updatedAt = tonumber(result.updatedAt) or tonumber(result.fetchedAt) or 0
             local ageMinutes = math.floor(math.max(0, now - updatedAt) / 60)
             if updatedAt <= 0 or ageMinutes >= minMinutes then
-                if addon:QueueInspect(req.name, req.realm, { allowDuplicate = true, silent = true, reason = "queued-refresh" }) then
-                    queued = queued + 1
+                local foundUnit = addon:FindUnitByName(req.name)
+                if foundUnit then
+                    addon:QueueInspect(req.name, req.realm, { allowDuplicate = true, silent = true, reason = "queued-refresh" })
+                    local okLive, liveReason = addon:QueueLiveInspectUnit(foundUnit, false)
+                    if okLive then
+                        queued = queued + 1
+                    else
+                        unavailable = unavailable + 1
+                        addon:SetLatestRequestState(key, "queued", liveReason)
+                    end
+                else
+                    unavailable = unavailable + 1
+                    addon:SetLatestRequestState(key, "queued", "local-only")
                 end
             end
         end
     end
 
-    Print("stale refresh: queued " .. queued .. " player(s), threshold=" .. minMinutes .. "m")
+    addon:ProcessInspectQueue(true)
+    Print("stale refresh: queued=" .. queued .. ", unavailable=" .. unavailable .. ", threshold=" .. minMinutes .. "m")
     addon:RefreshMainWindow()
 end
 
@@ -3346,6 +3572,7 @@ function addon:BuildOverviewRows(container, rowCount)
     local rowWidth = tonumber(container:GetWidth()) or 432
     local containerHeight = tonumber(container:GetHeight()) or 0
     local maxVisibleRows = math.max(1, math.min(OVERVIEW_VISIBLE_ROWS, math.floor(containerHeight / OVERVIEW_ROW_HEIGHT)))
+    local parentLevel = (container.GetParent and container:GetParent() and container:GetParent():GetFrameLevel()) or 0
 
     if rowCount then
         rowCount = math.max(1, math.min(tonumber(rowCount) or maxVisibleRows, maxVisibleRows))
@@ -3359,7 +3586,7 @@ function addon:BuildOverviewRows(container, rowCount)
         row:SetHeight(OVERVIEW_ROW_HEIGHT)
         row:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -(i - 1) * OVERVIEW_ROW_HEIGHT)
         row:SetFrameStrata("DIALOG")
-        row:SetFrameLevel(40)
+        row:SetFrameLevel(parentLevel + 10)
         row:RegisterForClicks("LeftButtonUp")
         row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
 
@@ -3425,6 +3652,12 @@ function addon:ApplyButtonModeLayout()
         return
     end
 
+    local ACTION_BUTTON_WIDTH = 100
+    local ACTION_BUTTON_HEIGHT = 20
+    local ACTION_BUTTON_SPACING_X = 6
+    local ACTION_BUTTON_SPACING_Y = 6
+    local ACTION_BUTTON_COLUMNS = 3
+
     local mode = addon:GetButtonMode()
     local buttons = {
         sort = addon.ui.sortButton,
@@ -3454,10 +3687,8 @@ function addon:ApplyButtonModeLayout()
 
     local order = { "sort", "filter", "target", "raid", "sync", "force", "report", "stale", "status", "clear" }
     if mode == "easy" then
-        visible.sync = false
-        visible.force = false
         visible.stale = false
-        order = { "sort", "filter", "target", "raid", "status", "report", "clear" }
+        order = { "sort", "filter", "target", "raid", "sync", "force", "report", "status", "clear" }
     end
 
     local key, button
@@ -3479,16 +3710,34 @@ function addon:ApplyButtonModeLayout()
         end
     end
 
+    local visibleCount = 0
+    for i = 1, #order do
+        key = order[i]
+        if buttons[key] and visible[key] then
+            visibleCount = visibleCount + 1
+        end
+    end
+
+    local buttonRows = math.max(1, math.ceil(visibleCount / ACTION_BUTTON_COLUMNS))
+    addon.ui.actionPanel:SetWidth((ACTION_BUTTON_WIDTH * ACTION_BUTTON_COLUMNS) + (ACTION_BUTTON_SPACING_X * (ACTION_BUTTON_COLUMNS - 1)))
+    addon.ui.actionPanel:SetHeight((ACTION_BUTTON_HEIGHT * buttonRows) + (ACTION_BUTTON_SPACING_Y * (buttonRows - 1)))
+
     local index = 0
     local i
     for i = 1, #order do
         key = order[i]
         button = buttons[key]
         if button and visible[key] then
-            local col = index % 2
-            local row = math.floor(index / 2)
+            local col = index - (math.floor(index / ACTION_BUTTON_COLUMNS) * ACTION_BUTTON_COLUMNS)
+            local row = math.floor(index / ACTION_BUTTON_COLUMNS)
             button:ClearAllPoints()
-            button:SetPoint("TOPLEFT", addon.ui.actionPanel, "TOPLEFT", col * 106, -(row * 26))
+            button:SetPoint(
+                "TOPLEFT",
+                addon.ui.actionPanel,
+                "TOPLEFT",
+                col * (ACTION_BUTTON_WIDTH + ACTION_BUTTON_SPACING_X),
+                -(row * (ACTION_BUTTON_HEIGHT + ACTION_BUTTON_SPACING_Y))
+            )
             index = index + 1
         end
     end
@@ -3537,7 +3786,7 @@ function addon:ShowDetailRowTooltip(row)
 
     local enchantText = "n/a"
     if ENCHANTABLE_SLOTS[data.slotKey] then
-        local enchantId = tonumber(item.enchantId)
+        local enchantId = GetRecordedEnchantId(item)
         if not enchantId then
             if OPTIONAL_ENCHANT_SLOTS[data.slotKey] then
                 enchantText = "optional"
@@ -3591,6 +3840,8 @@ function addon:CreateMainWindow()
     local f = CreateFrame("Frame", "RaidInspectorMainFrame", UIParent)
     f:SetWidth(WINDOW_WIDTH)
     f:SetHeight(WINDOW_HEIGHT)
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(120)
     f:SetBackdrop({
         bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
         edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
@@ -3599,6 +3850,12 @@ function addon:CreateMainWindow()
         edgeSize = 16,
         insets = { left = 5, right = 5, top = 5, bottom = 5 },
     })
+    if f.SetBackdropColor then
+        f:SetBackdropColor(0.02, 0.02, 0.02, 0.96)
+    end
+    if f.SetBackdropBorderColor then
+        f:SetBackdropBorderColor(0.85, 0.72, 0.18, 1)
+    end
     f:SetMovable(true)
     f:EnableMouse(true)
     f:RegisterForDrag("LeftButton")
@@ -3673,21 +3930,57 @@ function addon:CreateMainWindow()
 
     local function ActivateActionButton(button)
         button:EnableMouse(true)
-        button:SetFrameStrata("DIALOG")
-        button:SetFrameLevel(80)
+        local parent = button.GetParent and button:GetParent() or nil
+        local parentStrata = parent and parent:GetFrameStrata() or "DIALOG"
+        local parentLevel = parent and parent:GetFrameLevel() or 0
+        button:SetFrameStrata(parentStrata)
+        button:SetFrameLevel(parentLevel + 20)
     end
 
+    local shareChannelsRow = CreateFrame("Frame", nil, f)
+    shareChannelsRow:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
+    shareChannelsRow:SetWidth(420)
+    shareChannelsRow:SetHeight(20)
+
+    local shareChannelsLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    shareChannelsLabel:SetPoint("LEFT", shareChannelsRow, "LEFT", 0, 0)
+    shareChannelsLabel:SetText("Share:")
+
+    local raidShareCheck = CreateFrame("CheckButton", "RaidInspectorShareRaidCheck", f, "UICheckButtonTemplate")
+    raidShareCheck:SetPoint("LEFT", shareChannelsLabel, "RIGHT", 6, 0)
+    raidShareCheck:SetHitRectInsets(0, -24, 0, 0)
+    _G[raidShareCheck:GetName() .. "Text"]:SetText("Raid")
+    raidShareCheck:SetScript("OnClick", function(self)
+        addon:SetExportChannel("raid", self:GetChecked() and true or false)
+    end)
+
+    local sayShareCheck = CreateFrame("CheckButton", "RaidInspectorShareSayCheck", f, "UICheckButtonTemplate")
+    sayShareCheck:SetPoint("LEFT", raidShareCheck, "RIGHT", 44, 0)
+    sayShareCheck:SetHitRectInsets(0, -24, 0, 0)
+    _G[sayShareCheck:GetName() .. "Text"]:SetText("Say")
+    sayShareCheck:SetScript("OnClick", function(self)
+        addon:SetExportChannel("say", self:GetChecked() and true or false)
+    end)
+
+    local whisperShareCheck = CreateFrame("CheckButton", "RaidInspectorShareWhisperCheck", f, "UICheckButtonTemplate")
+    whisperShareCheck:SetPoint("LEFT", sayShareCheck, "RIGHT", 44, 0)
+    whisperShareCheck:SetHitRectInsets(0, -38, 0, 0)
+    _G[whisperShareCheck:GetName() .. "Text"]:SetText("Whisper")
+    whisperShareCheck:SetScript("OnClick", function(self)
+        addon:SetExportChannel("whisper", self:GetChecked() and true or false)
+    end)
+
     local savedReportsRow = CreateFrame("Frame", nil, f)
-    savedReportsRow:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
+    savedReportsRow:SetPoint("TOPLEFT", shareChannelsRow, "BOTTOMLEFT", 0, -8)
     savedReportsRow:SetWidth(340)
     savedReportsRow:SetHeight(20)
 
     local savedReportsLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     savedReportsLabel:SetPoint("LEFT", savedReportsRow, "LEFT", 0, 0)
-    savedReportsLabel:SetText("Saved:")
+    savedReportsLabel:SetText("Reports:")
 
     local savedReportDropDown = CreateFrame("Frame", "RaidInspectorSavedReportDropDown", f, "UIDropDownMenuTemplate")
-    savedReportDropDown:SetPoint("TOPLEFT", savedReportsLabel, "TOPLEFT", 42, 10)
+    savedReportDropDown:SetPoint("TOPLEFT", savedReportsLabel, "TOPLEFT", 46, 10)
     UIDropDownMenu_SetWidth(savedReportDropDown, 250)
     UIDropDownMenu_JustifyText(savedReportDropDown, "LEFT")
     UIDropDownMenu_Initialize(savedReportDropDown, function(_, level)
@@ -3736,9 +4029,9 @@ function addon:CreateMainWindow()
     UIDropDownMenu_SetText(savedReportDropDown, "Live Overview")
 
     local actionPanel = CreateFrame("Frame", nil, f)
-    actionPanel:SetPoint("TOPLEFT", savedReportsRow, "BOTTOMLEFT", 0, -6)
-    actionPanel:SetWidth(214)
-    actionPanel:SetHeight(130)
+    actionPanel:SetPoint("TOPLEFT", savedReportsRow, "BOTTOMLEFT", 0, -8)
+    actionPanel:SetWidth(318)
+    actionPanel:SetHeight(98)
 
     local sortButton = CreateFrame("Button", "RaidInspectorSortButton", f, "UIPanelButtonTemplate")
     ActivateActionButton(sortButton)
@@ -3793,13 +4086,10 @@ function addon:CreateMainWindow()
     syncButton:SetWidth(100)
     syncButton:SetHeight(20)
     syncButton:SetPoint("TOPLEFT", targetButton, "BOTTOMLEFT", 0, -6)
-    SetActionButtonLabel(syncButton, "ff66ff66", "Sync")
+    SetActionButtonLabel(syncButton, "ff66ff66", "Share")
     syncButton:SetScript("OnClick", function()
-        SafeInvoke("sync", function()
-            local imported = addon:ConsumeBridgeInbox(false, false)
-            if imported == 0 then
-                Print("sync complete: no new bridge results found")
-            end
+        SafeInvoke("share", function()
+            addon:ExportSummary("")
         end)
     end)
 
@@ -3808,13 +4098,10 @@ function addon:CreateMainWindow()
     forceSyncButton:SetWidth(100)
     forceSyncButton:SetHeight(20)
     forceSyncButton:SetPoint("LEFT", syncButton, "RIGHT", 6, 0)
-    SetActionButtonLabel(forceSyncButton, "ff66ff66", "Force")
+    SetActionButtonLabel(forceSyncButton, "ff66ff66", "Save")
     forceSyncButton:SetScript("OnClick", function()
-        SafeInvoke("forcesync", function()
-            local imported = addon:ConsumeBridgeInbox(false, true)
-            if imported == 0 then
-                Print("force sync complete: no bridge results found")
-            end
+        SafeInvoke("savereport", function()
+            addon:SaveReportSnapshot("")
         end)
     end)
 
@@ -3835,7 +4122,7 @@ function addon:CreateMainWindow()
     staleButton:SetWidth(100)
     staleButton:SetHeight(20)
     staleButton:SetPoint("LEFT", reportButton, "RIGHT", 6, 0)
-    SetActionButtonLabel(staleButton, "ffffaa33", "Stale")
+    SetActionButtonLabel(staleButton, "ffffaa33", "Refresh")
     staleButton:SetScript("OnClick", function()
         SafeInvoke("stale", function()
             addon:QueueStaleRefresh("15")
@@ -3867,18 +4154,24 @@ function addon:CreateMainWindow()
         end)
     end)
 
-    local overviewHeight = OVERVIEW_ROW_HEIGHT * OVERVIEW_VISIBLE_ROWS
-
     local rowsViewport = CreateFrame("ScrollFrame", nil, f)
-    rowsViewport:SetPoint("TOPLEFT", actionPanel, "BOTTOMLEFT", 0, -10)
+    rowsViewport:SetPoint("TOPLEFT", actionPanel, "BOTTOMLEFT", 0, -8)
+    rowsViewport:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PANEL_SIDE_MARGIN, OVERVIEW_BOTTOM_INSET)
     rowsViewport:SetWidth(432)
-    rowsViewport:SetHeight(overviewHeight)
+    if rowsViewport.SetClipsChildren then
+        rowsViewport:SetClipsChildren(true)
+    end
+
+    local overviewAvailableHeight = tonumber(rowsViewport:GetHeight()) or (OVERVIEW_ROW_HEIGHT * OVERVIEW_VISIBLE_ROWS)
+    local overviewVisibleRowCount = math.max(1, math.min(OVERVIEW_VISIBLE_ROWS, math.floor(overviewAvailableHeight / OVERVIEW_ROW_HEIGHT)))
+    local overviewHeight = overviewVisibleRowCount * OVERVIEW_ROW_HEIGHT
 
     local rowsContainer = CreateFrame("Frame", nil, rowsViewport)
+    rowsContainer:SetPoint("TOPLEFT", rowsViewport, "TOPLEFT", 0, 0)
     rowsContainer:SetWidth(432)
     rowsContainer:SetHeight(overviewHeight)
     rowsViewport:SetScrollChild(rowsContainer)
-    addon:BuildOverviewRows(rowsContainer, OVERVIEW_VISIBLE_ROWS)
+    addon:BuildOverviewRows(rowsContainer, overviewVisibleRowCount)
 
     local overviewScroll = CreateFrame("ScrollFrame", "RaidInspectorOverviewScroll", rowsViewport, "FauxScrollFrameTemplate")
     overviewScroll:SetPoint("TOPLEFT", rowsViewport, "TOPRIGHT", 0, -1)
@@ -4003,6 +4296,10 @@ function addon:CreateMainWindow()
     addon.ui.frame = f
     addon.ui.modeDropDown = modeDropDown
     addon.ui.statusText = statusText
+    addon.ui.shareChannelsLabel = shareChannelsLabel
+    addon.ui.raidShareCheck = raidShareCheck
+    addon.ui.sayShareCheck = sayShareCheck
+    addon.ui.whisperShareCheck = whisperShareCheck
     addon.ui.actionPanel = actionPanel
     addon.ui.sortButton = sortButton
     addon.ui.filterButton = filterButton
@@ -4100,6 +4397,22 @@ local function EntryHasMissingAuditIssues(entry)
     return missingEnchant > 0 or missingGems > 0
 end
 
+local function EntryIsPendingNotInspectable(entry)
+    if type(entry) ~= "table" then
+        return false
+    end
+
+    if tostring(entry.statusReason or "") ~= "cannot-inspect" then
+        return false
+    end
+
+    if entry.state ~= "ready" then
+        return true
+    end
+
+    return entry.isFresh ~= true
+end
+
 function addon:BuildSlotLine(slotKey, item)
     local slotLabel = SLOT_LABELS[slotKey] or slotKey
     if not item then
@@ -4125,7 +4438,7 @@ function addon:BuildSlotLine(slotKey, item)
     local enchantText = "E:n/a"
     local missingEnchant = false
     if ENCHANTABLE_SLOTS[slotKey] then
-        local enchantId = tonumber(item.enchantId)
+        local enchantId = GetRecordedEnchantId(item)
         if not enchantId then
             if OPTIONAL_ENCHANT_SLOTS[slotKey] then
                 enchantText = "E:OPT"
@@ -4180,7 +4493,7 @@ local function ItemMatchesListFilter(mode, slotKey, item)
 
     local missingEnchant = false
     if ENCHANTABLE_SLOTS[slotKey] then
-        local enchantId = tonumber(item.enchantId)
+        local enchantId = GetRecordedEnchantId(item)
         if not enchantId and not OPTIONAL_ENCHANT_SLOTS[slotKey] then
             missingEnchant = true
         end
@@ -4242,12 +4555,10 @@ function addon:RefreshDetailPanel(selectedEntry)
 
     if not result then
         local reason = FormatStatusReason(req.statusReason)
-        if reason == "bridge pending" then
-            addon.ui.detailScore:SetText("No result yet (bridge pending). For name-only targets, run bridge fetch after logout/reload, then /ri sync.")
-        elseif reason ~= "" then
-            addon.ui.detailScore:SetText("No result yet (" .. reason .. "). Use Target/Raid for live inspect, or Sync/Force for bridge data.")
+        if reason ~= "" then
+            addon.ui.detailScore:SetText("No result yet (" .. reason .. "). Use Target/Raid while the player is inspectable.")
         else
-            addon.ui.detailScore:SetText("No result yet. Use Target/Raid for live inspect, or Sync/Force for bridge data.")
+            addon.ui.detailScore:SetText("No result yet. Use Target/Raid while the player is inspectable.")
         end
         if addon.ui.detailMeta then
             addon.ui.detailMeta:SetText("")
@@ -4404,7 +4715,7 @@ function addon:RefreshMainWindow()
     if activeSavedReport then
         addon.ui.statusText:SetText(
             "Saved Report: " .. addon:BuildSavedReportMenuLabel(activeSavedReport)
-                .. "  |  Source: file"
+                .. "  |  Source: saved variables"
         )
     else
         addon.ui.statusText:SetText(
@@ -4446,6 +4757,17 @@ function addon:RefreshMainWindow()
             local item = addon:GetActiveSavedReport()
             UIDropDownMenu_SetText(addon.ui.savedReportDropDown, item and addon:BuildSavedReportMenuLabel(item) or "Live Overview")
         end
+    end
+
+    local channels = addon:GetExportChannels()
+    if addon.ui.raidShareCheck then
+        addon.ui.raidShareCheck:SetChecked(channels.raid == true)
+    end
+    if addon.ui.sayShareCheck then
+        addon.ui.sayShareCheck:SetChecked(channels.say == true)
+    end
+    if addon.ui.whisperShareCheck then
+        addon.ui.whisperShareCheck:SetChecked(channels.whisper == true)
     end
 
     local entries = addon:GetOverviewEntries()
@@ -4518,18 +4840,29 @@ function addon:RefreshMainWindow()
             row.key = entry.key
             row.text:SetText(addon:BuildOverviewRowText(entry))
             local hasAuditIssues = EntryHasMissingAuditIssues(entry)
-            if hasAuditIssues then
+            local isPendingNotInspectable = EntryIsPendingNotInspectable(entry)
+            local isSelected = entry.key == selectedKey
+            if isPendingNotInspectable then
+                row.text:SetTextColor(1.0, 0.65, 0.10)
+            elseif hasAuditIssues then
                 row.text:SetTextColor(1.0, 0.20, 0.20)
             else
                 row.text:SetTextColor(0.35, 1.0, 0.35)
             end
-            SetFontStringBold(row.text, entry.key == selectedKey)
+            SetFontStringBold(row.text, isSelected)
+            if isSelected then
+                row:LockHighlight()
+            else
+                row:UnlockHighlight()
+            end
             row:Show()
         else
             row.key = nil
             row.text:SetText("")
             row.text:SetTextColor(1.0, 1.0, 1.0)
             SetFontStringBold(row.text, false)
+            row:UnlockHighlight()
+            row:Hide()
         end
     end
 
@@ -4616,22 +4949,15 @@ function addon:HandleInspectCommand(args)
         realm = splitRealm
     end
 
-    addon:QueueInspect(name, realm, { reason = "queued-manual" })
-
     local foundUnit = addon:FindUnitByName(name)
     if foundUnit then
+        addon:QueueInspect(name, realm, { reason = "queued-manual" })
         local okLive = addon:QueueLiveInspectUnit(foundUnit, false)
         if okLive then
             addon:ProcessInspectQueue(true)
         end
     else
-        local resolvedRealm = Trim(realm)
-        if resolvedRealm == "" then
-            resolvedRealm = GetCVar("realmName") or ""
-        end
-        if resolvedRealm ~= "" then
-            addon:SetLatestRequestState(MakePlayerKey(name, resolvedRealm), "queued", "bridge-pending")
-        end
+        Print("inspect failed: " .. tostring(name) .. " is not in your current target, party, or raid")
     end
 end
 
@@ -4762,9 +5088,7 @@ function addon:PrintStatus()
     local queued, ready, errorCount = addon:GetCounts()
     local fresh, stale = addon:GetFreshnessCounts(FRESHNESS_TTL_SECONDS)
     local playersWithIssues, totalIssues = addon:GetIssueTotals()
-    local bridge = addon:GetBridgeInboxStats()
     local reports = addon:GetReportSnapshots()
-    local reportFileQueue = addon:GetReportFileQueue()
     local savedReportFiles = addon:GetSavedReportFiles()
     local history = addon:GetRaidScanHistory()
     local livePending = addon.inspectQueue and #addon.inspectQueue or 0
@@ -4781,32 +5105,22 @@ function addon:PrintStatus()
     Print("live inspect: pending=" .. tostring(livePending) .. ", active=" .. tostring(liveActive))
     Print("achievement compare: supported=" .. achievementSupported .. ", pending=" .. tostring(achievementPending) .. ", active=" .. tostring(achievementActive))
     Print("saved reports=" .. tostring(#reports.items) .. ", raid scan history=" .. tostring(#history.scans))
-    Print("file reports: pending=" .. tostring(#reportFileQueue.items) .. ", catalog=" .. tostring(#savedReportFiles.items))
-    Print("bridge inbox: count=" .. bridge.resultCount .. ", reportFiles=" .. bridge.reportFileCount .. ", generatedAt=" .. bridge.generatedAt .. ", lastConsumedAt=" .. bridge.lastConsumedAt)
-    Print("bridge import marker: lastImportedGeneratedAt=" .. bridge.lastImportedBridgeGeneratedAt)
+    Print("detailed reports=" .. tostring(#savedReportFiles.items) .. ", activeSaved=" .. tostring(addon:GetSelectedSavedReportFile() ~= ""))
 
     local progress = addon:GetSnapshotProgress()
     if progress then
         Print("snapshot: fresh=" .. progress.ready .. "/" .. progress.total .. ", stale=" .. progress.stale .. ", missing=" .. progress.missing)
     end
 
-    Print("bridge status: optional for remote/name-only data; close WoW before running bridge writer, then relog/reload")
+    Print("mode: bridgeless live inspect + SavedVariables reports")
 end
 
 function addon:ClearQueue()
     RaidInspectorDB.requests = {}
     RaidInspectorDB.results = {}
-    RaidInspectorDB.reportFileQueue = { nextId = 1, items = {} }
     RaidInspectorDB.state.lastSnapshot = { at = 0, historyId = 0, members = {} }
     RaidInspectorDB.state.nextRequestId = 1
-    RaidInspectorDB.meta.lastImportedBridgeGeneratedAt = 0
-
-    addon:InitBridgeInbox()
-    RaidInspectorBridgeInbox.results = {}
-    RaidInspectorBridgeInbox.reportFiles = {}
-    RaidInspectorBridgeInbox.processedReportQueueIds = {}
-    RaidInspectorBridgeInbox.generatedAt = 0
-    RaidInspectorBridgeInbox.lastConsumedAt = GetNow()
+    RaidInspectorDB.reportFileQueue = { nextId = 1, items = {} }
 
     addon.inspectQueue = {}
     addon.inspectQueuedKeys = {}
@@ -4821,7 +5135,7 @@ function addon:ClearQueue()
     end
     ClearAchievementComparisonUnitSafe()
     addon:SetSelectedKey("")
-    Print("queue + results + pending report writes + bridge inbox cleared")
+    Print("queue + results cleared")
     addon:RefreshMainWindow()
 end
 
@@ -4837,7 +5151,7 @@ end
 
 if type(StaticPopupDialogs) == "table" then
     StaticPopupDialogs["RAIDINSPECTOR_CONFIRM_CLEAR"] = {
-        text = "Clear queued requests, cached results, and bridge inbox data?",
+        text = "Clear queued requests and cached live-inspect results?",
         button1 = "Clear",
         button2 = CANCEL or "Cancel",
         OnAccept = function()
@@ -4856,18 +5170,13 @@ function addon:OnAddonLoaded(loadedName)
     end
 
     addon:InitDatabase()
-    addon:InitBridgeInbox()
     addon:InitInspectRuntime()
     addon:CreateMainWindow()
 end
 
 function addon:OnPlayerLogin()
     addon:InitInspectRuntime()
-    local imported = addon:ConsumeBridgeInbox(true)
     Print("loaded (" .. addon.version .. ")")
-    if imported > 0 then
-        Print("imported " .. imported .. " bridge result(s) on login")
-    end
     Print("type /ri help for commands")
     addon:RefreshMainWindow()
 end
@@ -4885,17 +5194,15 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("commands:")
             Print("/ri show - open main window")
             Print("/ri hide - close main window")
-            Print("/ri inspect <name> <realm> - queue character")
-            Print("/ri inspect <name-realm> - queue character")
+            Print("/ri inspect <name> <realm> - inspect a matching target/party/raid unit")
+            Print("/ri inspect <name-realm> - inspect a matching target/party/raid unit")
             Print("/ri inspecttarget - queue + live inspect current target")
             Print("/ri inspectraid - snapshot + live inspect current raid members")
             Print("/ri inspecttarget and /ri inspectraid also attempt in-game AP comparison (inspectable targets)")
-            Print("/ri sync - import bridge inbox results")
-            Print("/ri forcesync - re-import bridge inbox ignoring generatedAt")
             Print("/ri sort [recent|gs|issues|name] - set or cycle sort")
             Print("/ri filter [all|snapshot|ready|queued|issues] - set or cycle filter")
-            Print("/ri report - queue a detailed roster report file in Interface/AddOns/RaidInspector/reports")
-            Print("/ri loadreport [latest|filename] - load a saved file report into the overview")
+            Print("/ri report - save a detailed roster report into SavedVariables")
+            Print("/ri loadreport [latest|report-id] - load a saved report into the overview")
             Print("/ri share [name-realm] - short summary to selected chat channels")
             Print("/ri savereport [name-realm] - save current or selected report snapshot")
             Print("/ri sharesaved [latest|id|name-realm] - share saved snapshot to chat")
@@ -4935,19 +5242,8 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             return
         end
 
-        if command == "sync" then
-            local imported = addon:ConsumeBridgeInbox(false, false)
-            if imported == 0 then
-                Print("sync complete: no new bridge results found")
-            end
-            return
-        end
-
-        if command == "forcesync" then
-            local imported = addon:ConsumeBridgeInbox(false, true)
-            if imported == 0 then
-                Print("force sync complete: no bridge results found")
-            end
+        if command == "sync" or command == "forcesync" then
+            Print("bridgeless mode: sync is disabled; use Target/Raid for live inspect")
             return
         end
 
@@ -5029,6 +5325,7 @@ end
 events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 events:RegisterEvent("INSPECT_READY")
+events:RegisterEvent("INSPECT_TALENT_READY")
 events:SetScript("OnEvent", function(_, event, ...)
     local arg1 = select(1, ...)
     SafeInvoke("event " .. tostring(event), function()
@@ -5038,6 +5335,8 @@ events:SetScript("OnEvent", function(_, event, ...)
             addon:OnPlayerLogin()
         elseif event == "INSPECT_READY" then
             addon:OnInspectReady(arg1)
+        elseif event == "INSPECT_TALENT_READY" then
+            addon:OnInspectTalentReady()
         end
     end)
 end)
