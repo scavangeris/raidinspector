@@ -17,6 +17,8 @@ local INSPECT_TALENT_MIN_WAIT_SECONDS = 1
 local INSPECT_TALENT_GRACE_SECONDS = 3
 local ACHIEVEMENT_COMPARE_THROTTLE_SECONDS = 2
 local ACHIEVEMENT_COMPARE_TIMEOUT_SECONDS = 8
+local LFM_POST_DELAY_OPTIONS = { 10, 20, 30, 60 }
+local DEFAULT_LFM_POST_DELAY_SECONDS = 10
 local REPORT_SNAPSHOT_LIMIT = 200
 local REPORT_FILE_QUEUE_LIMIT = 25
 local OVERVIEW_ROW_HEIGHT = 18
@@ -46,6 +48,11 @@ local BUTTON_MODES = { "advanced", "easy" }
 local BUTTON_MODE_LABELS = {
     advanced = "Advanced",
     easy = "Easy",
+}
+
+local MAIN_TAB_LABELS = {
+    inspector = "Inspector",
+    lfm = "LFM",
 }
 
 local SORT_LABELS = {
@@ -360,6 +367,31 @@ end
 local function EscapeChatMessage(text)
     local value = tostring(text or "")
     return string.gsub(value, "|", "||")
+end
+
+local function FindJoinedChannelByAlias(aliasList)
+    if type(GetChannelList) ~= "function" or type(aliasList) ~= "table" then
+        return nil, nil
+    end
+
+    local channels = { GetChannelList() }
+    local i
+    for i = 1, #channels, 3 do
+        local channelId = tonumber(channels[i])
+        local channelName = tostring(channels[i + 1] or "")
+        if channelId and channelId > 0 and channelName ~= "" then
+            local normalizedName = string.lower(channelName)
+            local idx
+            for idx = 1, #aliasList do
+                local alias = string.lower(tostring(aliasList[idx] or ""))
+                if alias ~= "" and string.find(normalizedName, alias, 1, true) then
+                    return channelId, channelName
+                end
+            end
+        end
+    end
+
+    return nil, nil
 end
 
 local function SetFontStringBold(fontString, enabled)
@@ -712,6 +744,92 @@ local function GetInspectTalentTabInfo(unit, index, explicitGroup)
     return nil, 0
 end
 
+local function NormalizeTalentToken(text)
+    local lowered = string.lower(tostring(text or ""))
+    lowered = string.gsub(lowered, "[^a-z0-9]+", "")
+    return lowered
+end
+
+local function GetInspectTalentCount(unit, tabIndex, explicitGroup)
+    if type(GetNumTalents) ~= "function" or not UnitExists(unit) then
+        return 0
+    end
+
+    local isInspect = not UnitIsUnit("player", unit)
+    local group = explicitGroup or GetInspectTalentGroup(unit)
+
+    local ok, count = pcall(GetNumTalents, tabIndex, isInspect, nil, group)
+    if ok and tonumber(count) and tonumber(count) > 0 then
+        return tonumber(count)
+    end
+
+    ok, count = pcall(GetNumTalents, tabIndex, isInspect, group)
+    if ok and tonumber(count) and tonumber(count) > 0 then
+        return tonumber(count)
+    end
+
+    ok, count = pcall(GetNumTalents, tabIndex, isInspect)
+    if ok and tonumber(count) and tonumber(count) > 0 then
+        return tonumber(count)
+    end
+
+    ok, count = pcall(GetNumTalents, tabIndex)
+    if ok and tonumber(count) and tonumber(count) > 0 then
+        return tonumber(count)
+    end
+
+    return 0
+end
+
+local function GetInspectTalentInfo(unit, tabIndex, talentIndex, explicitGroup)
+    if type(GetTalentInfo) ~= "function" or not UnitExists(unit) then
+        return nil, 0, 0
+    end
+
+    local isInspect = not UnitIsUnit("player", unit)
+    local group = explicitGroup or GetInspectTalentGroup(unit)
+
+    local ok, name, _, _, _, rank, maxRank = pcall(GetTalentInfo, tabIndex, talentIndex, isInspect, nil, group)
+    if ok and name then
+        return name, tonumber(rank) or 0, tonumber(maxRank) or 0
+    end
+
+    ok, name, _, _, _, rank, maxRank = pcall(GetTalentInfo, tabIndex, talentIndex, isInspect, group)
+    if ok and name then
+        return name, tonumber(rank) or 0, tonumber(maxRank) or 0
+    end
+
+    ok, name, _, _, _, rank, maxRank = pcall(GetTalentInfo, tabIndex, talentIndex, isInspect)
+    if ok and name then
+        return name, tonumber(rank) or 0, tonumber(maxRank) or 0
+    end
+
+    ok, name, _, _, _, rank, maxRank = pcall(GetTalentInfo, tabIndex, talentIndex)
+    if ok and name then
+        return name, tonumber(rank) or 0, tonumber(maxRank) or 0
+    end
+
+    return nil, 0, 0
+end
+
+local function BuildInspectTalentTabMap(unit, tabIndex, explicitGroup)
+    local talentCount = GetInspectTalentCount(unit, tabIndex, explicitGroup)
+    local talents = {}
+    local i
+    for i = 1, talentCount do
+        local talentName, rank, maxRank = GetInspectTalentInfo(unit, tabIndex, i, explicitGroup)
+        local key = NormalizeTalentToken(talentName)
+        if key ~= "" then
+            talents[key] = {
+                name = talentName,
+                rank = rank,
+                maxRank = maxRank,
+            }
+        end
+    end
+    return talents
+end
+
 local function BuildInspectTalentSnapshot(unit, explicitGroup)
     local numTabs = GetInspectTalentTabCount(unit)
     if numTabs <= 0 then
@@ -723,7 +841,9 @@ local function BuildInspectTalentSnapshot(unit, explicitGroup)
         totalPoints = 0,
         bestName = nil,
         bestPoints = -1,
+        bestIndex = nil,
         points = {},
+        tabs = {},
     }
 
     local i
@@ -731,10 +851,16 @@ local function BuildInspectTalentSnapshot(unit, explicitGroup)
         local name, spent = GetInspectTalentTabInfo(unit, i, explicitGroup)
         spent = tonumber(spent) or 0
         snapshot.points[#snapshot.points + 1] = spent
+        snapshot.tabs[i] = {
+            name = name,
+            spent = spent,
+            talents = BuildInspectTalentTabMap(unit, i, explicitGroup),
+        }
         snapshot.totalPoints = snapshot.totalPoints + spent
         if name and spent > snapshot.bestPoints then
             snapshot.bestName = tostring(name)
             snapshot.bestPoints = spent
+            snapshot.bestIndex = i
         end
     end
 
@@ -783,7 +909,77 @@ local function DetectUnitSpecFromTalents(unit)
         pointText[#pointText + 1] = tostring(bestSnapshot.points[i])
     end
 
-    return bestSnapshot.bestName .. " (" .. table.concat(pointText, "/") .. ")"
+    local _, englishClass = UnitClass(unit)
+    local classToken = ResolveClassToken(englishClass)
+    local bestName = bestSnapshot.bestName
+    local bestNameToken = NormalizeTalentToken(bestName)
+    local bestTab = bestSnapshot.tabs and bestSnapshot.tabs[tonumber(bestSnapshot.bestIndex) or 0]
+
+    if bestNameToken == "feralcombat" or bestNameToken == "feral" then
+        local feralTab = bestTab
+        local thickHide = feralTab and feralTab.talents and feralTab.talents["thickhide"]
+        if type(thickHide) == "table" and tonumber(thickHide.maxRank) and tonumber(thickHide.maxRank) > 0 then
+            if tonumber(thickHide.rank) >= tonumber(thickHide.maxRank) then
+                bestName = "Feral Tank"
+            else
+                bestName = "Feral DPS"
+            end
+        end
+    end
+
+    if classToken == "DEATHKNIGHT" and bestNameToken == "blood" then
+        local bloodTalents = bestTab and bestTab.talents or nil
+        local vampiricBlood = bloodTalents and bloodTalents["vampiricblood"]
+        local willOfNecropolis = bloodTalents and bloodTalents["willofthenecropolis"]
+        local improvedRuneTap = bloodTalents and bloodTalents["improvedrunetap"]
+        local heartStrike = bloodTalents and bloodTalents["heartstrike"]
+
+        local hasTankMarkers = (type(vampiricBlood) == "table" and tonumber(vampiricBlood.rank) and tonumber(vampiricBlood.rank) > 0)
+            or (type(willOfNecropolis) == "table" and tonumber(willOfNecropolis.rank) and tonumber(willOfNecropolis.rank) > 0)
+            or (type(improvedRuneTap) == "table" and tonumber(improvedRuneTap.rank) and tonumber(improvedRuneTap.rank) > 0)
+
+        local hasHeartStrike = type(heartStrike) == "table" and tonumber(heartStrike.rank) and tonumber(heartStrike.rank) > 0
+
+        if hasTankMarkers then
+            bestName = "Blood Tank"
+        elseif hasHeartStrike then
+            bestName = "Blood DPS"
+        end
+    end
+
+    if classToken == "PALADIN" and bestNameToken == "protection" then
+        local protTalents = bestTab and bestTab.talents or nil
+        local holyShield = protTalents and protTalents["holyshield"]
+        local ardentDefender = protTalents and protTalents["ardentdefender"]
+        local touchedByLight = protTalents and protTalents["touchedbythelight"]
+
+        local hasTankMarkers = (type(holyShield) == "table" and tonumber(holyShield.rank) and tonumber(holyShield.rank) > 0)
+            or (type(ardentDefender) == "table" and tonumber(ardentDefender.rank) and tonumber(ardentDefender.rank) > 0)
+            or (type(touchedByLight) == "table" and tonumber(touchedByLight.rank) and tonumber(touchedByLight.rank) > 0)
+
+        if hasTankMarkers then
+            bestName = "Protection Tank"
+        else
+            bestName = "Protection DPS"
+        end
+    end
+
+    if classToken == "PALADIN" and bestNameToken == "holy" then
+        local holyTalents = bestTab and bestTab.talents or nil
+        local beaconOfLight = holyTalents and holyTalents["beaconoflight"]
+        local sacredCleansing = holyTalents and holyTalents["sacredcleansing"]
+
+        local hasHealerMarkers = (type(beaconOfLight) == "table" and tonumber(beaconOfLight.rank) and tonumber(beaconOfLight.rank) > 0)
+            or (type(sacredCleansing) == "table" and tonumber(sacredCleansing.rank) and tonumber(sacredCleansing.rank) > 0)
+
+        if hasHealerMarkers then
+            bestName = "Holy Healer"
+        else
+            bestName = "Holy DPS"
+        end
+    end
+
+    return tostring(bestName) .. " (" .. table.concat(pointText, "/") .. ")"
 end
 
 local function HasInspectTalentData(unit)
@@ -1347,6 +1543,50 @@ function addon:InitInspectRuntime()
     addon.achievementQueuedKeys = addon.achievementQueuedKeys or {}
     addon.achievementCurrent = nil
     addon.achievementLastRequestAt = addon.achievementLastRequestAt or 0
+
+    addon.lfmPostQueue = addon.lfmPostQueue or {}
+    addon.lfmPostSentCount = addon.lfmPostSentCount or 0
+    addon.lfmPostSelectedCount = addon.lfmPostSelectedCount or 0
+    addon.lfmPostNextAt = addon.lfmPostNextAt or 0
+end
+
+function addon:ProcessLFMPostQueue(force)
+    if not addon.lfmPostQueue or #addon.lfmPostQueue == 0 then
+        addon.lfmPostNextAt = 0
+        return false
+    end
+
+    local now = GetNow()
+    local nextAt = tonumber(addon.lfmPostNextAt) or 0
+    if not force and now < nextAt then
+        return false
+    end
+
+    local entry = table.remove(addon.lfmPostQueue, 1)
+    if type(entry) ~= "table" then
+        return false
+    end
+
+    if entry.chatType == "CHANNEL" then
+        SendChatMessage(entry.message, "CHANNEL", nil, entry.channelId)
+    else
+        SendChatMessage(entry.message, entry.chatType)
+    end
+
+    addon.lfmPostSentCount = (tonumber(addon.lfmPostSentCount) or 0) + 1
+    local postDelaySeconds = addon:GetLFMPostDelaySeconds()
+
+    if #addon.lfmPostQueue > 0 then
+        addon.lfmPostNextAt = now + postDelaySeconds
+        Print("lfm: next channel post in " .. tostring(postDelaySeconds) .. "s (" .. tostring(#addon.lfmPostQueue) .. " remaining)")
+    else
+        addon.lfmPostNextAt = 0
+        local selectedCount = tonumber(addon.lfmPostSelectedCount) or addon.lfmPostSentCount
+        Print("lfm: posted to " .. tostring(addon.lfmPostSentCount) .. "/" .. tostring(selectedCount) .. " selected channel(s)")
+    end
+
+    addon:RefreshMainWindow()
+    return true
 end
 
 function addon:GetInspectLinkCount(unit)
@@ -1927,11 +2167,13 @@ function addon:OnUpdate(elapsed)
                     if talentWaitElapsed and (HasInspectTalentData(addon.inspectCurrent.unit) or talentGraceElapsed) then
                         addon:FinalizeInspectCurrent(true, nil)
                         addon:ProcessInspectQueue(false)
+                        addon:ProcessLFMPostQueue(false)
                         return
                     end
                 elseif eventMissingTooLong then
                     addon:FinalizeInspectCurrent(true, nil)
                     addon:ProcessInspectQueue(false)
+                    addon:ProcessLFMPostQueue(false)
                     return
                 end
             end
@@ -1957,6 +2199,7 @@ function addon:OnUpdate(elapsed)
                 local raidFlags = addon:BuildRaidAchievementFlagsFromComparison()
                 addon:FinalizeAchievementCompareCurrent(true, points, raidFlags)
                 addon:ProcessAchievementCompareQueue(false)
+                addon:ProcessLFMPostQueue(false)
                 return
             end
         end
@@ -1967,6 +2210,7 @@ function addon:OnUpdate(elapsed)
     end
 
     addon:ProcessAchievementCompareQueue(false)
+    addon:ProcessLFMPostQueue(false)
 end
 
 function addon:InitDatabase()
@@ -1992,12 +2236,20 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state.ui, "selectedSavedReportFile", "")
     EnsureTable(RaidInspectorDB.state.ui, "itemListFilterMode", "all")
     EnsureTable(RaidInspectorDB.state.ui, "buttonMode", "advanced")
+    EnsureTable(RaidInspectorDB.state.ui, "activeTab", "inspector")
     EnsureTable(RaidInspectorDB.state.ui, "minimap", {})
     EnsureTable(RaidInspectorDB.state.ui.minimap, "angle", 220)
     EnsureTable(RaidInspectorDB.state.ui, "exportChannels", {})
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "raid", true)
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "say", false)
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "whisper", false)
+    EnsureTable(RaidInspectorDB.state.ui, "lfm", {})
+    EnsureTable(RaidInspectorDB.state.ui.lfm, "message", "")
+    EnsureTable(RaidInspectorDB.state.ui.lfm, "channels", {})
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "yell", false)
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "general", true)
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "global", true)
+    EnsureTable(RaidInspectorDB.state.ui.lfm, "postDelaySeconds", DEFAULT_LFM_POST_DELAY_SECONDS)
 
     EnsureTable(RaidInspectorDB, "requests", {})
     EnsureTable(RaidInspectorDB, "results", {})
@@ -2056,6 +2308,94 @@ function addon:GetButtonMode()
     return "advanced"
 end
 
+function addon:GetActiveTab()
+    local tab = RaidInspectorDB.state.ui.activeTab
+    if MAIN_TAB_LABELS[tab] then
+        return tab
+    end
+    RaidInspectorDB.state.ui.activeTab = "inspector"
+    return "inspector"
+end
+
+function addon:GetLFMState()
+    EnsureTable(RaidInspectorDB.state.ui, "lfm", {})
+    EnsureTable(RaidInspectorDB.state.ui.lfm, "message", "")
+    EnsureTable(RaidInspectorDB.state.ui.lfm, "channels", {})
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "yell", false)
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "general", true)
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "global", true)
+    EnsureTable(RaidInspectorDB.state.ui.lfm, "postDelaySeconds", DEFAULT_LFM_POST_DELAY_SECONDS)
+    return RaidInspectorDB.state.ui.lfm
+end
+
+function addon:GetLFMChannels()
+    local state = addon:GetLFMState()
+    return state.channels
+end
+
+function addon:SetLFMChannel(channel, enabled)
+    if channel ~= "yell" and channel ~= "general" and channel ~= "global" then
+        return false
+    end
+
+    local channels = addon:GetLFMChannels()
+    channels[channel] = enabled and true or false
+    return true
+end
+
+function addon:GetLFMMessage()
+    local state = addon:GetLFMState()
+    return tostring(state.message or "")
+end
+
+function addon:SetLFMMessage(message)
+    local state = addon:GetLFMState()
+    state.message = tostring(message or "")
+    return true
+end
+
+function addon:GetLFMPostDelaySeconds()
+    local state = addon:GetLFMState()
+    local value = tonumber(state.postDelaySeconds)
+    local i
+    for i = 1, #LFM_POST_DELAY_OPTIONS do
+        if value == LFM_POST_DELAY_OPTIONS[i] then
+            return value
+        end
+    end
+
+    state.postDelaySeconds = DEFAULT_LFM_POST_DELAY_SECONDS
+    return DEFAULT_LFM_POST_DELAY_SECONDS
+end
+
+function addon:SetLFMPostDelaySeconds(seconds)
+    local value = tonumber(seconds)
+    local i
+    for i = 1, #LFM_POST_DELAY_OPTIONS do
+        if value == LFM_POST_DELAY_OPTIONS[i] then
+            local state = addon:GetLFMState()
+            state.postDelaySeconds = value
+            return true
+        end
+    end
+    return false
+end
+
+function addon:GetLFMChannelAvailability()
+    local generalId, generalName = FindJoinedChannelByAlias({ "general" })
+    local globalId, globalName = FindJoinedChannelByAlias({ "global" })
+
+    return {
+        yell = true,
+        general = generalId and true or false,
+        global = globalId and true or false,
+        generalId = generalId,
+        globalId = globalId,
+        generalName = generalName,
+        globalName = globalName,
+    }
+end
+
 function addon:GetExportChannels()
     EnsureTable(RaidInspectorDB.state.ui, "exportChannels", {})
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "raid", true)
@@ -2071,6 +2411,102 @@ function addon:SetExportChannel(channel, enabled)
 
     local channels = addon:GetExportChannels()
     channels[channel] = enabled and true or false
+    return true
+end
+
+function addon:RefreshTabVisibility()
+    if not addon.ui or not addon.ui.frame then
+        return
+    end
+
+    local activeTab = addon:GetActiveTab()
+    local inspectorVisible = activeTab == "inspector"
+
+    local function SetWidgetVisible(widget, visible)
+        if not widget then
+            return
+        end
+        if visible then
+            widget:Show()
+        else
+            widget:Hide()
+        end
+    end
+
+    local inspectorWidgets = {
+        addon.ui.modeDropDown,
+        addon.ui.shareChannelsRow,
+        addon.ui.shareChannelsLabel,
+        addon.ui.raidShareCheck,
+        addon.ui.sayShareCheck,
+        addon.ui.whisperShareCheck,
+        addon.ui.savedReportsRow,
+        addon.ui.savedReportsLabel,
+        addon.ui.savedReportDropDown,
+        addon.ui.actionPanel,
+        addon.ui.sortButton,
+        addon.ui.filterButton,
+        addon.ui.targetButton,
+        addon.ui.raidButton,
+        addon.ui.syncButton,
+        addon.ui.forceSyncButton,
+        addon.ui.reportButton,
+        addon.ui.staleButton,
+        addon.ui.statusButton,
+        addon.ui.clearButton,
+        addon.ui.rowsViewport,
+        addon.ui.overviewScroll,
+        addon.ui.compositionHeader,
+        addon.ui.compositionSummary,
+        addon.ui.detailHeader,
+        addon.ui.detailScore,
+        addon.ui.detailMeta,
+        addon.ui.detailAudit,
+        addon.ui.itemFilterLabel,
+        addon.ui.itemFilterDropDown,
+        addon.ui.detailContainer,
+        addon.ui.detailScroll,
+    }
+
+    local i
+    for i = 1, #inspectorWidgets do
+        SetWidgetVisible(inspectorWidgets[i], inspectorVisible)
+    end
+
+    SetWidgetVisible(addon.ui.lfmPanel, not inspectorVisible)
+
+    if addon.ui.inspectorTabButton then
+        if inspectorVisible then
+            addon.ui.inspectorTabButton:SetText("|cff66ff66Inspector|r")
+        else
+            addon.ui.inspectorTabButton:SetText("|cffbbbbbbInspector|r")
+        end
+    end
+
+    if addon.ui.lfmTabButton then
+        if inspectorVisible then
+            addon.ui.lfmTabButton:SetText("|cffbbbbbbLFM|r")
+        else
+            addon.ui.lfmTabButton:SetText("|cff66ff66LFM|r")
+        end
+    end
+
+    if addon.ui.subtitle then
+        if inspectorVisible then
+            addon.ui.subtitle:SetText("Raid overview + selected player details")
+        else
+            addon.ui.subtitle:SetText("LFM composer + multi-channel posting")
+        end
+    end
+end
+
+function addon:SetActiveTab(tab)
+    if not MAIN_TAB_LABELS[tab] then
+        return false
+    end
+
+    RaidInspectorDB.state.ui.activeTab = tab
+    addon:RefreshTabVisibility()
     return true
 end
 
@@ -2373,6 +2809,46 @@ function addon:GetActiveSavedReportEntries()
         table.sort(entries, function(a, b)
             return string.lower(tostring(a.key or "")) < string.lower(tostring(b.key or ""))
         end)
+    end
+
+    return entries
+end
+
+function addon:GetCompositionEntries()
+    local savedReportEntries = addon:GetActiveSavedReportEntries()
+    if savedReportEntries then
+        return savedReportEntries
+    end
+
+    local latestByKey = addon:GetLatestRequestMap()
+    local entries = {}
+    local key
+    local now = GetNow()
+
+    for key in pairs(latestByKey) do
+        local req = latestByKey[key]
+        local result = RaidInspectorDB.results[key]
+        local state = req.status or "queued"
+        local updatedAt = 0
+
+        if state ~= "error" and result then
+            state = "ready"
+        end
+
+        if result then
+            updatedAt = tonumber(result.updatedAt) or tonumber(result.fetchedAt) or 0
+        end
+
+        table.insert(entries, {
+            key = key,
+            req = req,
+            result = result,
+            state = state,
+            statusReason = req.statusReason,
+            updatedAt = updatedAt,
+            ageMinutes = updatedAt > 0 and math.floor(math.max(0, now - updatedAt) / 60) or -1,
+            isFresh = updatedAt > 0 and (now - updatedAt) <= FRESHNESS_TTL_SECONDS,
+        })
     end
 
     return entries
@@ -3075,6 +3551,135 @@ function addon:QueueStaleRefresh(minAgeMinutes)
     addon:RefreshMainWindow()
 end
 
+function addon:RefreshOverviewEntryByKey(key)
+    local normalizedKey = string.lower(tostring(key or ""))
+    if normalizedKey == "" then
+        Print("refresh: missing key")
+        return false
+    end
+
+    if addon:GetSelectedSavedReportFile() ~= "" then
+        Print("refresh is disabled while a saved report is loaded")
+        return false
+    end
+
+    local req = addon:GetLatestRequestForKey(normalizedKey)
+    local name = req and req.name or nil
+    local realm = req and req.realm or nil
+    if not name or name == "" or not realm or realm == "" then
+        local parsedName, parsedRealm = ParseKey(normalizedKey)
+        name = name or parsedName
+        realm = realm or parsedRealm
+    end
+
+    if not name or name == "" or not realm or realm == "" then
+        Print("refresh failed: bad player key")
+        return false
+    end
+
+    local foundUnit = addon:FindUnitByName(name)
+    if foundUnit then
+        addon:QueueInspect(name, realm, { allowDuplicate = true, silent = true, reason = "queued-refresh" })
+        local okLive, liveReason = addon:QueueLiveInspectUnit(foundUnit, false)
+        if okLive then
+            addon:SetSelectedKey(normalizedKey)
+            addon:ProcessInspectQueue(true)
+            addon:RefreshMainWindow()
+            Print("refresh queued: " .. tostring(name) .. "-" .. tostring(realm))
+            return true
+        end
+        addon:SetLatestRequestState(normalizedKey, "queued", liveReason)
+        addon:ProcessInspectQueue(true)
+        addon:RefreshMainWindow()
+        Print("refresh unavailable: " .. tostring(name) .. "-" .. tostring(realm) .. " (" .. FormatStatusReason(liveReason) .. ")")
+        return false
+    end
+
+    addon:SetLatestRequestState(normalizedKey, "queued", "local-only")
+    addon:RefreshMainWindow()
+    Print("refresh unavailable: " .. tostring(name) .. "-" .. tostring(realm) .. " is not in target/party/raid")
+    return false
+end
+
+function addon:RemoveOverviewEntryByKey(key)
+    local normalizedKey = string.lower(tostring(key or ""))
+    if normalizedKey == "" then
+        Print("remove: missing key")
+        return false
+    end
+
+    if addon:GetSelectedSavedReportFile() ~= "" then
+        Print("remove is disabled while a saved report is loaded")
+        return false
+    end
+
+    local removedRequests = 0
+    local keptRequests = {}
+    local i
+    for i = 1, #RaidInspectorDB.requests do
+        local req = RaidInspectorDB.requests[i]
+        if tostring(req.key or "") == normalizedKey then
+            removedRequests = removedRequests + 1
+        else
+            keptRequests[#keptRequests + 1] = req
+        end
+    end
+    RaidInspectorDB.requests = keptRequests
+
+    local hadResult = RaidInspectorDB.results[normalizedKey] ~= nil
+    RaidInspectorDB.results[normalizedKey] = nil
+
+    local keptInspectQueue = {}
+    for i = 1, #(addon.inspectQueue or {}) do
+        local entry = addon.inspectQueue[i]
+        if tostring(entry and entry.key or "") ~= normalizedKey then
+            keptInspectQueue[#keptInspectQueue + 1] = entry
+        end
+    end
+    addon.inspectQueue = keptInspectQueue
+    addon.inspectQueuedKeys[normalizedKey] = nil
+    if addon.inspectCurrent and addon.inspectCurrent.key == normalizedKey then
+        addon.inspectCurrent = nil
+        if ClearInspectPlayer then
+            ClearInspectPlayer()
+        end
+    end
+
+    local keptAchievementQueue = {}
+    for i = 1, #(addon.achievementQueue or {}) do
+        local entry = addon.achievementQueue[i]
+        if tostring(entry and entry.key or "") ~= normalizedKey then
+            keptAchievementQueue[#keptAchievementQueue + 1] = entry
+        end
+    end
+    addon.achievementQueue = keptAchievementQueue
+    addon.achievementQueuedKeys[normalizedKey] = nil
+    if addon.achievementCurrent and addon.achievementCurrent.key == normalizedKey then
+        addon.achievementCurrent = nil
+        ClearAchievementComparisonUnitSafe()
+    end
+
+    local snapshot = RaidInspectorDB.state.lastSnapshot
+    if type(snapshot) == "table" and type(snapshot.members) == "table" then
+        snapshot.members[normalizedKey] = nil
+    end
+    addon:RefreshActiveRaidHistoryEntry()
+
+    if addon:GetSelectedKey() == normalizedKey then
+        addon:SetSelectedKey("")
+    end
+
+    addon:RefreshMainWindow()
+
+    if removedRequests > 0 or hadResult then
+        Print("removed from list: " .. normalizedKey)
+        return true
+    end
+
+    Print("remove: player not found in live list")
+    return false
+end
+
 function addon:GetSnapshotProgress()
     local snapshot = RaidInspectorDB.state.lastSnapshot
     if type(snapshot) ~= "table" or type(snapshot.members) ~= "table" then
@@ -3570,6 +4175,9 @@ function addon:BuildOverviewRows(container, rowCount)
     container.rows = container.rows or {}
     local i
     local rowWidth = tonumber(container:GetWidth()) or 432
+    local actionWidth = 62
+    local actionGap = 4
+    local actionArea = (actionWidth * 2) + actionGap + 6
     local containerHeight = tonumber(container:GetHeight()) or 0
     local maxVisibleRows = math.max(1, math.min(OVERVIEW_VISIBLE_ROWS, math.floor(containerHeight / OVERVIEW_ROW_HEIGHT)))
     local parentLevel = (container.GetParent and container:GetParent() and container:GetParent():GetFrameLevel()) or 0
@@ -3592,14 +4200,50 @@ function addon:BuildOverviewRows(container, rowCount)
 
         local text = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         text:SetPoint("LEFT", row, "LEFT", 2, 0)
-        text:SetWidth(rowWidth - 4)
+        text:SetWidth(rowWidth - actionArea)
         text:SetHeight(OVERVIEW_ROW_HEIGHT)
         text:SetJustifyH("LEFT")
         text:SetJustifyV("MIDDLE")
         text:SetText("")
         text:Show()
 
+        local refreshButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        refreshButton:SetWidth(actionWidth)
+        refreshButton:SetHeight(18)
+        refreshButton:SetPoint("RIGHT", row, "RIGHT", -(actionWidth + actionGap + 2), 0)
+        refreshButton:SetFrameStrata("DIALOG")
+        refreshButton:SetFrameLevel(parentLevel + 12)
+        refreshButton:SetText("Refresh")
+        refreshButton:Hide()
+        refreshButton:SetScript("OnClick", function(self)
+            SafeInvoke("row-refresh", function()
+                local targetKey = self.key or row.key
+                if targetKey and targetKey ~= "" then
+                    addon:RefreshOverviewEntryByKey(targetKey)
+                end
+            end)
+        end)
+
+        local removeButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        removeButton:SetWidth(actionWidth)
+        removeButton:SetHeight(18)
+        removeButton:SetPoint("RIGHT", row, "RIGHT", -2, 0)
+        removeButton:SetFrameStrata("DIALOG")
+        removeButton:SetFrameLevel(parentLevel + 12)
+        removeButton:SetText("Remove")
+        removeButton:Hide()
+        removeButton:SetScript("OnClick", function(self)
+            SafeInvoke("row-remove", function()
+                local targetKey = self.key or row.key
+                if targetKey and targetKey ~= "" then
+                    addon:RemoveOverviewEntryByKey(targetKey)
+                end
+            end)
+        end)
+
         row.text = text
+        row.refreshButton = refreshButton
+        row.removeButton = removeButton
         row.key = nil
         row:SetScript("OnClick", function(self)
             if self.key then
@@ -3915,11 +4559,35 @@ function addon:CreateMainWindow()
     subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
     subtitle:SetText("Raid overview + selected player details")
 
+    local inspectorTabButton = CreateFrame("Button", "RaidInspectorInspectorTabButton", f, "UIPanelButtonTemplate")
+    inspectorTabButton:SetWidth(86)
+    inspectorTabButton:SetHeight(20)
+    inspectorTabButton:SetPoint("TOPLEFT", subtitle, "BOTTOMLEFT", 0, -6)
+    inspectorTabButton:SetText("|cff66ff66Inspector|r")
+    inspectorTabButton:SetScript("OnClick", function()
+        SafeInvoke("tab-inspector", function()
+            addon:SetActiveTab("inspector")
+            addon:RefreshMainWindow()
+        end)
+    end)
+
+    local lfmTabButton = CreateFrame("Button", "RaidInspectorLFMTabButton", f, "UIPanelButtonTemplate")
+    lfmTabButton:SetWidth(86)
+    lfmTabButton:SetHeight(20)
+    lfmTabButton:SetPoint("LEFT", inspectorTabButton, "RIGHT", 6, 0)
+    lfmTabButton:SetText("|cffbbbbbbLFM|r")
+    lfmTabButton:SetScript("OnClick", function()
+        SafeInvoke("tab-lfm", function()
+            addon:SetActiveTab("lfm")
+            addon:RefreshMainWindow()
+        end)
+    end)
+
     local closeButton = CreateFrame("Button", "RaidInspectorCloseButton", f, "UIPanelCloseButton")
     closeButton:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6, -6)
 
     local statusText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    statusText:SetPoint("TOPLEFT", subtitle, "BOTTOMLEFT", 0, -10)
+    statusText:SetPoint("TOPLEFT", inspectorTabButton, "BOTTOMLEFT", 0, -8)
     statusText:SetJustifyH("LEFT")
     statusText:SetWidth(WINDOW_WIDTH - (PANEL_SIDE_MARGIN * 2))
     statusText:SetText("")
@@ -4195,6 +4863,18 @@ function addon:CreateMainWindow()
 
     local rightPanelWidth = WINDOW_WIDTH - RIGHT_PANEL_X - PANEL_SIDE_MARGIN
 
+    local compositionHeader = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    compositionHeader:SetPoint("TOPLEFT", f, "TOPLEFT", RIGHT_PANEL_X, -86)
+    compositionHeader:SetWidth(rightPanelWidth)
+    compositionHeader:SetJustifyH("LEFT")
+    compositionHeader:SetText("Raid Composition (Talent):")
+
+    local compositionSummary = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    compositionSummary:SetPoint("TOPLEFT", compositionHeader, "BOTTOMLEFT", 0, -6)
+    compositionSummary:SetWidth(rightPanelWidth)
+    compositionSummary:SetJustifyH("LEFT")
+    compositionSummary:SetText("Tanks: 0  |  Heals: 0  |  RDPS: 0  |  MDPS: 0  |  Total: 0")
+
     local detailHeader = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     detailHeader:SetPoint("TOPLEFT", f, "TOPLEFT", RIGHT_PANEL_X, -136)
     detailHeader:SetWidth(rightPanelWidth)
@@ -4293,13 +4973,134 @@ function addon:CreateMainWindow()
         end
     end)
 
+    local lfmPanel = CreateFrame("Frame", nil, f)
+    lfmPanel:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
+    lfmPanel:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -PANEL_SIDE_MARGIN, OVERVIEW_BOTTOM_INSET)
+
+    local lfmMessageLabel = lfmPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    lfmMessageLabel:SetPoint("TOPLEFT", lfmPanel, "TOPLEFT", 0, -2)
+    lfmMessageLabel:SetText("LFM Message:")
+
+    local lfmMessageBox = CreateFrame("EditBox", "RaidInspectorLFMMessageBox", lfmPanel, "InputBoxTemplate")
+    lfmMessageBox:SetAutoFocus(false)
+    lfmMessageBox:SetWidth(720)
+    lfmMessageBox:SetHeight(26)
+    lfmMessageBox:SetPoint("TOPLEFT", lfmMessageLabel, "BOTTOMLEFT", 0, -6)
+    if lfmMessageBox.SetTextInsets then
+        lfmMessageBox:SetTextInsets(6, 6, 0, 0)
+    end
+    lfmMessageBox:SetMaxLetters(255)
+    lfmMessageBox:SetScript("OnTextChanged", function(self)
+        addon:SetLFMMessage(self:GetText() or "")
+    end)
+    lfmMessageBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+    end)
+    lfmMessageBox:SetScript("OnEnterPressed", function(self)
+        SafeInvoke("lfm-post-enter", function()
+            addon:SetLFMMessage(self:GetText() or "")
+            addon:PostLFMMessage()
+        end)
+    end)
+
+    local lfmHint = lfmPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    lfmHint:SetPoint("TOPLEFT", lfmMessageBox, "BOTTOMLEFT", 2, -6)
+    lfmHint:SetWidth(820)
+    lfmHint:SetJustifyH("LEFT")
+    lfmHint:SetText("Write your post, link an achievement in any chat window, copy that link here, select channels + delay, then use POST.")
+
+    local lfmChannelsLabel = lfmPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    lfmChannelsLabel:SetPoint("TOPLEFT", lfmHint, "BOTTOMLEFT", -2, -10)
+    lfmChannelsLabel:SetText("Post To:")
+
+    local lfmYellCheck = CreateFrame("CheckButton", "RaidInspectorLFMYellCheck", lfmPanel, "UICheckButtonTemplate")
+    lfmYellCheck:SetPoint("TOPLEFT", lfmChannelsLabel, "BOTTOMLEFT", 4, -2)
+    lfmYellCheck:SetHitRectInsets(0, -24, 0, 0)
+    _G[lfmYellCheck:GetName() .. "Text"]:SetText("Yell")
+    lfmYellCheck:SetScript("OnClick", function(self)
+        addon:SetLFMChannel("yell", self:GetChecked() and true or false)
+    end)
+
+    local lfmGeneralCheck = CreateFrame("CheckButton", "RaidInspectorLFMGeneralCheck", lfmPanel, "UICheckButtonTemplate")
+    lfmGeneralCheck:SetPoint("LEFT", lfmYellCheck, "RIGHT", 34, 0)
+    lfmGeneralCheck:SetHitRectInsets(0, -24, 0, 0)
+    _G[lfmGeneralCheck:GetName() .. "Text"]:SetText("/general")
+    lfmGeneralCheck:SetScript("OnClick", function(self)
+        addon:SetLFMChannel("general", self:GetChecked() and true or false)
+    end)
+
+    local lfmGlobalCheck = CreateFrame("CheckButton", "RaidInspectorLFMGlobalCheck", lfmPanel, "UICheckButtonTemplate")
+    lfmGlobalCheck:SetPoint("LEFT", lfmGeneralCheck, "RIGHT", 44, 0)
+    lfmGlobalCheck:SetHitRectInsets(0, -24, 0, 0)
+    _G[lfmGlobalCheck:GetName() .. "Text"]:SetText("/global")
+    lfmGlobalCheck:SetScript("OnClick", function(self)
+        addon:SetLFMChannel("global", self:GetChecked() and true or false)
+    end)
+
+    local lfmDelayLabel = lfmPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    lfmDelayLabel:SetPoint("TOPLEFT", lfmYellCheck, "BOTTOMLEFT", 0, -10)
+    lfmDelayLabel:SetText("Delay:")
+
+    local lfmDelayDropDown = CreateFrame("Frame", "RaidInspectorLFMDelayDropDown", lfmPanel, "UIDropDownMenuTemplate")
+    lfmDelayDropDown:SetPoint("LEFT", lfmDelayLabel, "RIGHT", -2, 2)
+    UIDropDownMenu_SetWidth(lfmDelayDropDown, 74)
+    UIDropDownMenu_JustifyText(lfmDelayDropDown, "LEFT")
+    UIDropDownMenu_Initialize(lfmDelayDropDown, function(_, level)
+        if level ~= 1 then
+            return
+        end
+
+        local i
+        for i = 1, #LFM_POST_DELAY_OPTIONS do
+            local seconds = LFM_POST_DELAY_OPTIONS[i]
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = tostring(seconds) .. "s"
+            info.value = seconds
+            info.checked = (addon:GetLFMPostDelaySeconds() == seconds)
+            info.func = function(btn)
+                local selected = tonumber(btn.value) or DEFAULT_LFM_POST_DELAY_SECONDS
+                addon:SetLFMPostDelaySeconds(selected)
+                UIDropDownMenu_SetSelectedValue(lfmDelayDropDown, selected)
+                UIDropDownMenu_SetText(lfmDelayDropDown, tostring(selected) .. "s")
+                addon:RefreshMainWindow()
+            end
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end)
+    local selectedDelay = addon:GetLFMPostDelaySeconds()
+    UIDropDownMenu_SetSelectedValue(lfmDelayDropDown, selectedDelay)
+    UIDropDownMenu_SetText(lfmDelayDropDown, tostring(selectedDelay) .. "s")
+
+    local lfmPostButton = CreateFrame("Button", "RaidInspectorLFMPostButton", lfmPanel, "UIPanelButtonTemplate")
+    lfmPostButton:SetWidth(120)
+    lfmPostButton:SetHeight(24)
+    lfmPostButton:SetPoint("LEFT", lfmDelayDropDown, "RIGHT", -6, -1)
+    lfmPostButton:SetText("|cff66ff66POST|r")
+    lfmPostButton:SetScript("OnClick", function()
+        SafeInvoke("lfm-post", function()
+            addon:PostLFMMessage()
+        end)
+    end)
+
+    local lfmChannelStatus = lfmPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    lfmChannelStatus:SetPoint("TOPLEFT", lfmDelayLabel, "BOTTOMLEFT", 0, -14)
+    lfmChannelStatus:SetWidth(760)
+    lfmChannelStatus:SetJustifyH("LEFT")
+    lfmChannelStatus:SetText("")
+
     addon.ui.frame = f
+    addon.ui.subtitle = subtitle
+    addon.ui.inspectorTabButton = inspectorTabButton
+    addon.ui.lfmTabButton = lfmTabButton
     addon.ui.modeDropDown = modeDropDown
     addon.ui.statusText = statusText
+    addon.ui.shareChannelsRow = shareChannelsRow
     addon.ui.shareChannelsLabel = shareChannelsLabel
     addon.ui.raidShareCheck = raidShareCheck
     addon.ui.sayShareCheck = sayShareCheck
     addon.ui.whisperShareCheck = whisperShareCheck
+    addon.ui.savedReportsRow = savedReportsRow
+    addon.ui.savedReportsLabel = savedReportsLabel
     addon.ui.actionPanel = actionPanel
     addon.ui.sortButton = sortButton
     addon.ui.filterButton = filterButton
@@ -4312,21 +5113,39 @@ function addon:CreateMainWindow()
     addon.ui.statusButton = statusButton
     addon.ui.clearButton = clearButton
     addon.ui.savedReportDropDown = savedReportDropDown
+    addon.ui.rowsViewport = rowsViewport
     addon.ui.overviewRows = rowsContainer.rows
     addon.ui.overviewScroll = overviewScroll
     addon.ui.overviewEntryCount = 0
+    addon.ui.compositionHeader = compositionHeader
+    addon.ui.compositionSummary = compositionSummary
     addon.ui.detailHeader = detailHeader
     addon.ui.detailScore = detailScore
     addon.ui.detailMeta = detailMeta
     addon.ui.detailAudit = detailAudit
+    addon.ui.itemFilterLabel = itemFilterLabel
     addon.ui.itemFilterDropDown = itemFilterDropDown
+    addon.ui.detailContainer = detailContainer
     addon.ui.detailRows = detailContainer.rows
     addon.ui.detailScroll = detailScroll
     addon.ui.detailLineCount = 0
     addon.ui.lastDetailKey = ""
     addon.ui.lastDetailEntry = nil
+    addon.ui.lfmPanel = lfmPanel
+    addon.ui.lfmMessageLabel = lfmMessageLabel
+    addon.ui.lfmMessageBox = lfmMessageBox
+    addon.ui.lfmHint = lfmHint
+    addon.ui.lfmChannelsLabel = lfmChannelsLabel
+    addon.ui.lfmYellCheck = lfmYellCheck
+    addon.ui.lfmGeneralCheck = lfmGeneralCheck
+    addon.ui.lfmGlobalCheck = lfmGlobalCheck
+    addon.ui.lfmDelayLabel = lfmDelayLabel
+    addon.ui.lfmDelayDropDown = lfmDelayDropDown
+    addon.ui.lfmPostButton = lfmPostButton
+    addon.ui.lfmChannelStatus = lfmChannelStatus
 
     addon:ApplyButtonModeLayout()
+    addon:SetActiveTab(addon:GetActiveTab())
 
     f:Hide()
 end
@@ -4384,6 +5203,141 @@ function addon:BuildOverviewRowText(entry)
         .. auditText
         .. reasonText
         .. ageText
+end
+
+local function SpecContains(specLower, needle)
+    return specLower ~= "" and string.find(specLower, needle, 1, true) ~= nil
+end
+
+local function ClassifyTalentRole(classValue, specValue)
+    local classToken = ResolveClassToken(classValue)
+    local specLower = string.lower(Trim(specValue or ""))
+
+    if classToken == "WARRIOR" then
+        if SpecContains(specLower, "protection") then
+            return "tank"
+        end
+        if specLower ~= "" then
+            return "mdps"
+        end
+        return nil
+    end
+
+    if classToken == "PALADIN" then
+        if SpecContains(specLower, "protection tank") then
+            return "tank"
+        end
+        if SpecContains(specLower, "protection dps") then
+            return "mdps"
+        end
+        if SpecContains(specLower, "holy healer") then
+            return "heal"
+        end
+        if SpecContains(specLower, "holy dps") then
+            return "rdps"
+        end
+        if SpecContains(specLower, "holy") then
+            return "heal"
+        end
+        if SpecContains(specLower, "protection") then
+            return "tank"
+        end
+        if SpecContains(specLower, "retribution") then
+            return "mdps"
+        end
+        return nil
+    end
+
+    if classToken == "DEATHKNIGHT" then
+        if SpecContains(specLower, "blood tank") then
+            return "tank"
+        end
+        if SpecContains(specLower, "blood dps") then
+            return "mdps"
+        end
+        if SpecContains(specLower, "blood") then
+            return "tank"
+        end
+        if specLower ~= "" then
+            return "mdps"
+        end
+        return nil
+    end
+
+    if classToken == "DRUID" then
+        if SpecContains(specLower, "feral tank") then
+            return "tank"
+        end
+        if SpecContains(specLower, "feral dps") then
+            return "mdps"
+        end
+        if SpecContains(specLower, "restoration") then
+            return "heal"
+        end
+        if SpecContains(specLower, "balance") then
+            return "rdps"
+        end
+        if SpecContains(specLower, "feral") then
+            return "mdps"
+        end
+        return nil
+    end
+
+    if classToken == "PRIEST" then
+        if SpecContains(specLower, "discipline") or SpecContains(specLower, "holy") then
+            return "heal"
+        end
+        if SpecContains(specLower, "shadow") then
+            return "rdps"
+        end
+        return nil
+    end
+
+    if classToken == "SHAMAN" then
+        if SpecContains(specLower, "restoration") then
+            return "heal"
+        end
+        if SpecContains(specLower, "elemental") then
+            return "rdps"
+        end
+        if SpecContains(specLower, "enhancement") then
+            return "mdps"
+        end
+        return nil
+    end
+
+    if classToken == "HUNTER" or classToken == "MAGE" or classToken == "WARLOCK" then
+        return "rdps"
+    end
+
+    if classToken == "ROGUE" then
+        return "mdps"
+    end
+
+    return nil
+end
+
+local function BuildRaidCompositionCounts(entries)
+    local counts = {
+        tank = 0,
+        heal = 0,
+        rdps = 0,
+        mdps = 0,
+        total = #(entries or {}),
+    }
+
+    local i
+    for i = 1, #(entries or {}) do
+        local result = entries[i] and entries[i].result
+        if type(result) == "table" and not result.error then
+            local role = ClassifyTalentRole(result.class, result.spec)
+            if role and counts[role] ~= nil then
+                counts[role] = counts[role] + 1
+            end
+        end
+    end
+
+    return counts
 end
 
 local function EntryHasMissingAuditIssues(entry)
@@ -4704,7 +5658,11 @@ function addon:RefreshMainWindow()
         return
     end
 
-    addon:ApplyButtonModeLayout()
+    local activeTab = addon:GetActiveTab()
+    addon:RefreshTabVisibility()
+    if activeTab == "inspector" then
+        addon:ApplyButtonModeLayout()
+    end
 
     local activeSavedReport = addon:GetActiveSavedReport()
 
@@ -4712,7 +5670,21 @@ function addon:RefreshMainWindow()
     local fresh, stale = addon:GetFreshnessCounts(FRESHNESS_TTL_SECONDS)
     local playersWithIssues, totalIssues = addon:GetIssueTotals()
 
-    if activeSavedReport then
+    if activeTab == "lfm" then
+        local postDelaySeconds = addon:GetLFMPostDelaySeconds()
+        local queueCount = addon.lfmPostQueue and #addon.lfmPostQueue or 0
+        local queueText = ""
+        if queueCount > 0 then
+            local secondsUntilNext = math.max(0, (tonumber(addon.lfmPostNextAt) or 0) - GetNow())
+            queueText = " | Queue: " .. tostring(queueCount) .. " pending, next in " .. tostring(secondsUntilNext) .. "s"
+        end
+
+        addon.ui.statusText:SetText(
+            "LFM Composer: write your post, link achievement in chat, paste it here, select channels, press POST."
+                .. " (" .. tostring(postDelaySeconds) .. "s spacing between channels)"
+                .. queueText
+        )
+    elseif activeSavedReport then
         addon.ui.statusText:SetText(
             "Saved Report: " .. addon:BuildSavedReportMenuLabel(activeSavedReport)
                 .. "  |  Source: saved variables"
@@ -4770,6 +5742,76 @@ function addon:RefreshMainWindow()
         addon.ui.whisperShareCheck:SetChecked(channels.whisper == true)
     end
 
+    local lfmChannels = addon:GetLFMChannels()
+    if addon.ui.lfmYellCheck then
+        addon.ui.lfmYellCheck:SetChecked(lfmChannels.yell == true)
+    end
+    if addon.ui.lfmGeneralCheck then
+        addon.ui.lfmGeneralCheck:SetChecked(lfmChannels.general == true)
+    end
+    if addon.ui.lfmGlobalCheck then
+        addon.ui.lfmGlobalCheck:SetChecked(lfmChannels.global == true)
+    end
+    if addon.ui.lfmDelayDropDown then
+        local selectedDelay = addon:GetLFMPostDelaySeconds()
+        UIDropDownMenu_SetSelectedValue(addon.ui.lfmDelayDropDown, selectedDelay)
+        UIDropDownMenu_SetText(addon.ui.lfmDelayDropDown, tostring(selectedDelay) .. "s")
+    end
+
+    if addon.ui.lfmChannelStatus then
+        local availability = addon:GetLFMChannelAvailability()
+
+        local function BuildChannelStatusLabel(channelKey, label, isAvailable, joinedName)
+            local selected = lfmChannels[channelKey] == true
+            local prefix = selected and "[x] " or "[ ] "
+
+            local stateText = "ready"
+            if channelKey ~= "yell" then
+                if isAvailable then
+                    stateText = "joined"
+                else
+                    stateText = "missing"
+                end
+            end
+
+            local detail = ""
+            if channelKey ~= "yell" and isAvailable and joinedName and joinedName ~= "" then
+                detail = " (" .. tostring(joinedName) .. ")"
+            end
+
+            local color = "b8b8b8"
+            if isAvailable then
+                if selected then
+                    color = "66ff66"
+                end
+            else
+                if selected then
+                    color = "ffaa33"
+                else
+                    color = "ff6666"
+                end
+            end
+
+            return ColorText(prefix .. label .. ": " .. stateText .. detail, color)
+        end
+
+        local statusText = "Channel status: "
+            .. BuildChannelStatusLabel("yell", "Yell", availability.yell, nil)
+            .. "  |  "
+            .. BuildChannelStatusLabel("general", "/general", availability.general, availability.generalName)
+            .. "  |  "
+            .. BuildChannelStatusLabel("global", "/global", availability.global, availability.globalName)
+
+        addon.ui.lfmChannelStatus:SetText(statusText)
+    end
+
+    if addon.ui.lfmMessageBox and not addon.ui.lfmMessageBox:HasFocus() then
+        local desiredText = addon:GetLFMMessage()
+        if (addon.ui.lfmMessageBox:GetText() or "") ~= desiredText then
+            addon.ui.lfmMessageBox:SetText(desiredText)
+        end
+    end
+
     local entries = addon:GetOverviewEntries()
     if #entries == 0 and not activeSavedReport then
         local latestByKey = addon:GetLatestRequestMap()
@@ -4792,6 +5834,19 @@ function addon:RefreshMainWindow()
             return string.lower(tostring(a.key or "")) < string.lower(tostring(b.key or ""))
         end)
     end
+
+    if addon.ui.compositionSummary then
+        local compositionEntries = addon:GetCompositionEntries()
+        local counts = BuildRaidCompositionCounts(compositionEntries)
+        addon.ui.compositionSummary:SetText(
+            "Tanks: " .. tostring(counts.tank)
+                .. "  |  Heals: " .. tostring(counts.heal)
+                .. "  |  RDPS: " .. tostring(counts.rdps)
+                .. "  |  MDPS: " .. tostring(counts.mdps)
+                .. "  |  Total: " .. tostring(counts.total)
+        )
+    end
+
     addon.ui.overviewEntryCount = #entries
     local overviewOffset = 0
     if addon.ui.overviewScroll then
@@ -4855,6 +5910,19 @@ function addon:RefreshMainWindow()
             else
                 row:UnlockHighlight()
             end
+
+            if row.refreshButton and row.removeButton then
+                row.refreshButton.key = entry.key
+                row.removeButton.key = entry.key
+                if isSelected and addon:GetSelectedSavedReportFile() == "" then
+                    row.refreshButton:Show()
+                    row.removeButton:Show()
+                else
+                    row.refreshButton:Hide()
+                    row.removeButton:Hide()
+                end
+            end
+
             row:Show()
         else
             row.key = nil
@@ -4862,6 +5930,12 @@ function addon:RefreshMainWindow()
             row.text:SetTextColor(1.0, 1.0, 1.0)
             SetFontStringBold(row.text, false)
             row:UnlockHighlight()
+            if row.refreshButton and row.removeButton then
+                row.refreshButton.key = nil
+                row.removeButton.key = nil
+                row.refreshButton:Hide()
+                row.removeButton:Hide()
+            end
             row:Hide()
         end
     end
@@ -4986,6 +6060,109 @@ function addon:BuildExportSummary(entry)
 
     local payload = addon:BuildStoredSummaryPayload(entry.key, entry.req, entry.result, entry.state, entry.statusReason)
     return addon:BuildExportSummaryFromPayload(payload)
+end
+
+function addon:InitLFMMessageLinkHook()
+    if addon.lfmLinkHooked then
+        return
+    end
+
+    if type(ChatEdit_InsertLink) ~= "function" then
+        return
+    end
+
+    local originalInsert = ChatEdit_InsertLink
+    ChatEdit_InsertLink = function(link, ...)
+        local editBox = addon.ui and addon.ui.lfmMessageBox
+        if editBox and editBox:IsShown() and editBox:HasFocus() and type(link) == "string" and link ~= "" then
+            editBox:Insert(link)
+            addon:SetLFMMessage(editBox:GetText() or "")
+            return true
+        end
+        return originalInsert(link, ...)
+    end
+
+    addon.lfmLinkHooked = true
+end
+
+function addon:PostLFMMessage()
+    local message = Trim(addon:GetLFMMessage())
+    if message == "" then
+        Print("lfm: message is empty")
+        return 0, 0
+    end
+
+    local channels = addon:GetLFMChannels()
+    local selectedCount = 0
+    local targets = {}
+
+    if channels.yell then
+        selectedCount = selectedCount + 1
+        table.insert(targets, {
+            message = message,
+            chatType = "YELL",
+            label = "Yell",
+        })
+    end
+
+    if channels.general then
+        selectedCount = selectedCount + 1
+        local channelId, channelName = FindJoinedChannelByAlias({ "general" })
+        if channelId and channelId > 0 then
+            table.insert(targets, {
+                message = message,
+                chatType = "CHANNEL",
+                channelId = channelId,
+                label = channelName or "general",
+            })
+        else
+            Print("lfm: /general channel is not joined")
+        end
+    end
+
+    if channels.global then
+        selectedCount = selectedCount + 1
+        local channelId, channelName = FindJoinedChannelByAlias({ "global" })
+        if channelId and channelId > 0 then
+            table.insert(targets, {
+                message = message,
+                chatType = "CHANNEL",
+                channelId = channelId,
+                label = channelName or "global",
+            })
+        else
+            Print("lfm: /global channel is not joined")
+        end
+    end
+
+    if selectedCount == 0 then
+        Print("lfm: no channels selected (Yell/General/Global)")
+        return 0, 0
+    end
+
+    if #targets == 0 then
+        Print("lfm: no selected channels are available right now")
+        return selectedCount, 0
+    end
+
+    if addon.lfmPostQueue and #addon.lfmPostQueue > 0 then
+        Print("lfm: replaced previous pending queue with latest message")
+    end
+
+    addon.lfmPostQueue = targets
+    addon.lfmPostSentCount = 0
+    addon.lfmPostSelectedCount = selectedCount
+    addon.lfmPostNextAt = GetNow()
+    local postDelaySeconds = addon:GetLFMPostDelaySeconds()
+
+    if #targets > 1 then
+        Print("lfm: queued " .. tostring(#targets) .. " channel posts with " .. tostring(postDelaySeconds) .. "s spacing")
+    else
+        Print("lfm: queued 1 channel post")
+    end
+
+    addon:ProcessLFMPostQueue(true)
+    return selectedCount, #targets
 end
 
 function addon:SendSummaryMessage(message, whisperTarget)
@@ -5172,10 +6349,12 @@ function addon:OnAddonLoaded(loadedName)
     addon:InitDatabase()
     addon:InitInspectRuntime()
     addon:CreateMainWindow()
+    addon:InitLFMMessageLinkHook()
 end
 
 function addon:OnPlayerLogin()
     addon:InitInspectRuntime()
+    addon:InitLFMMessageLinkHook()
     Print("loaded (" .. addon.version .. ")")
     Print("type /ri help for commands")
     addon:RefreshMainWindow()
@@ -5204,6 +6383,9 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri report - save a detailed roster report into SavedVariables")
             Print("/ri loadreport [latest|report-id] - load a saved report into the overview")
             Print("/ri share [name-realm] - short summary to selected chat channels")
+            Print("/ri lfm - switch to the LFM tab")
+            Print("/ri inspector - switch to the Inspector tab")
+            Print("/ri post [message] - post LFM message to selected channels (uses selected delay)")
             Print("/ri savereport [name-realm] - save current or selected report snapshot")
             Print("/ri sharesaved [latest|id|name-realm] - share saved snapshot to chat")
             Print("/ri status - show queue summary")
@@ -5284,6 +6466,27 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
 
         if command == "share" then
             addon:ExportSummary(args)
+            return
+        end
+
+        if command == "lfm" then
+            addon:SetActiveTab("lfm")
+            addon:ToggleWindow(true)
+            return
+        end
+
+        if command == "inspector" then
+            addon:SetActiveTab("inspector")
+            addon:ToggleWindow(true)
+            return
+        end
+
+        if command == "post" then
+            if Trim(args or "") ~= "" then
+                addon:SetLFMMessage(args)
+            end
+            addon:PostLFMMessage()
+            addon:RefreshMainWindow()
             return
         end
 

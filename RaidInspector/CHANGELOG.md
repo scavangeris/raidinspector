@@ -2,6 +2,27 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.12.1-alpha - 2026-03-12
+- Added initial `LFM` tab in the main window:
+  - message input field for manual LFM post composition
+  - channel checkboxes for `Yell`, `/general`, and `/global`
+  - delay dropdown (`10s`, `20s`, `30s`, `60s`) for staggered posting control
+  - `POST` button to broadcast the typed message to all selected channels
+  - selected channels post in sequence using the selected delay to reduce mute penalty risk
+  - live channel status indicator for `Yell`, `/general`, and `/global` availability
+- Improved composition role interpretation for druid feral:
+  - `Thick Hide` fully ranked => `Feral Tank`
+  - otherwise => `Feral DPS` (counted as MDPS)
+- Added more specific interpretation for other ambiguous specs:
+  - DK `Blood` uses key talents to label `Blood Tank` vs `Blood DPS`
+  - Paladin `Protection` uses key talents to label `Protection Tank` vs `Protection DPS`
+  - Paladin `Holy` healer markers label `Holy Healer` vs `Holy DPS`
+- Added slash helpers for tab/post flow:
+  - `/ri lfm`
+  - `/ri inspector`
+  - `/ri post [message]`
+- Added Shift-click link insertion support for the focused LFM message box (achievement links can be inserted directly).
+
 ## 0.12.0-alpha - 2026-03-10
 - Added bridgeless branch behavior for fully in-game use:
   - removed bridge import from login/runtime flow

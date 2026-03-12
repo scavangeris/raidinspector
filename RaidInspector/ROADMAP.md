@@ -17,12 +17,25 @@
       - overall result source (`local-inspect` vs `saved-report`)
       - gear score source
       - achievement/raid-achievement source
+   - add chat post composer for achievement sharing:
+      - text input line where the user can type a custom message
+      - allow linking an achievement directly inside that message
+      - add channel checkboxes for `/1` (General), `/y` (Yell), `/6`, and `/7` (Global channels)
+      - add a `POST` button that broadcasts to all selected channels
+   - add raid composition planning support:
+      - new tab to configure desired counts for tanks, healers, melee DPS, and ranged DPS
+      - count the total number of characters in the current roster
+      - classify players by detected spec/role into tank, healer, melee DPS, or ranged DPS
+      - track and display those composition stats directly in the addon
    - optimize loading when character info was gathered recently:
       - prefer fresh cached/local result reuse before re-inspecting
       - avoid unnecessary inspect requests for recently scanned players
    - add selected-player actions in the overview:
+      - target the selected player in-game when selecting their row in the addon list
       - refresh the selected player directly without having to retarget them
       - remove the selected player from the current scan/queue
+   - refine `Share` message formatting for missing audit output:
+      - replace `MissingEnchants/Missing gems` style text with `Missing Gems (x), Missing Enchants (x)`
 
 ## Phase 1 - Foundation
 1. Define data contract between addon and bridge.
@@ -68,6 +81,7 @@
    - missing gem
 3. Add sort/filter controls for raid overview.
 4. Add quick export to chat (short summary format).
+   - standardize missing-audit segment as `Missing Gems (x), Missing Enchants (x)`.
 5. Keep display mode presets:
    - `advanced`
    - `easy`
@@ -83,6 +97,7 @@
 3. Show progress bar for pending fetches.
 4. Mark stale data and allow refresh per player.
 5. Add selected-entry actions from the overview:
+   - target selected player directly from list selection
    - refresh one player directly from selection
    - remove one player from the active scan/queue
 
@@ -109,6 +124,34 @@
 3. Add confirmation dialog for clear actions:
    - prompt before `Clear` / `clearqueue`
    - include explicit confirm/cancel actions
+
+## Phase 10 - Raid Composition Planner
+1. Add a dedicated composition tab to the main window.
+2. Let the user configure desired roster targets for:
+   - tanks
+   - healers
+   - melee DPS
+   - ranged DPS
+3. Count the total number of characters in the active roster/report.
+4. Categorize each player by detected spec into:
+   - tank
+   - healer
+   - melee DPS
+   - ranged DPS
+5. Store and track composition totals so the addon can compare actual counts against configured targets.
+6. Surface those tracked stats in the addon UI for quick raid-balance checks.
+
+## Phase 11 - Chat Post Composer
+1. Add a one-line message input field in the main addon UI.
+2. Support message composition with clickable achievement links.
+3. Add channel target checkboxes for:
+   - `/1` General
+   - `/y` Yell
+   - `/6` Global channel
+   - `/7` Global channel
+4. Add a `POST` action button to broadcast the composed message.
+5. Broadcast to all checked channels in one action while skipping unchecked channels.
+6. Validate empty message/channel selections and show a user-facing error hint instead of posting.
 
 ## Suggested First Build Milestone
 1. `/ri inspect <name>` creates queue entry.

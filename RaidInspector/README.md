@@ -41,6 +41,9 @@ Name-only remote lookups are intentionally not supported here.
 - `/ri report`
 - `/ri loadreport [latest|report-id]`
 - `/ri share [name-realm]`
+- `/ri lfm`
+- `/ri inspector`
+- `/ri post [message]`
 - `/ri savereport [name-realm]`
 - `/ri sharesaved [latest|id|name-realm]`
 - `/ri export` remains as a compatibility alias for `/ri report`
@@ -58,6 +61,17 @@ Name-only remote lookups are intentionally not supported here.
 - `Refresh`: attempt live refresh for stale entries that are currently present in target/party/raid.
 - `Status`: print runtime status into chat.
 - `Clear`: clear queued requests and cached live-inspect results.
+- Selected row actions: `Refresh` re-queues a live inspect for that player, `Remove` deletes that player from the live list/cache.
+
+## LFM Tab (Initial)
+- Use the `LFM` tab to compose your recruitment message.
+- Write your post, link an achievement in any chat window, and paste that achievement link into the LFM message box.
+- Supported channel checkboxes: `Yell`, `/general`, `/global`.
+- Delay dropdown options: `10s`, `20s`, `30s`, `60s`.
+- Click `POST` to broadcast the message.
+- If multiple channels are selected, posts are sent one-by-one using the selected delay to reduce mute penalty risk.
+- A channel status line shows joined/missing state for `/general` and `/global`.
+- While the message box is focused, Shift-clicking an achievement link inserts it into your message.
 
 ## Saved Data
 Detailed reports now stay inside `RaidInspectorDB.savedReportFiles.items` instead of being written to addon-folder JSON files.
@@ -128,3 +142,8 @@ Optional arguments:
 
 Bridge operator guide:
 - `bridge/BRIDGE_SETUP.md`
+
+## Roadmap
+Planned work is tracked in `ROADMAP.md`.
+
+Upcoming planning includes a raid composition tab where you can configure target counts for tanks, healers, melee DPS, and ranged DPS, then compare those targets against spec-based roster totals tracked inside the addon. It also includes a chat post composer with a one-line message input, achievement-link support, channel checkboxes (`/1`, `/y`, `/6`, `/7`), and a `POST` button to broadcast to selected channels. Share-summary formatting is also planned to use `Missing Gems (x), Missing Enchants (x)`.
