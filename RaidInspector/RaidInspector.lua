@@ -19,6 +19,52 @@ local ACHIEVEMENT_COMPARE_THROTTLE_SECONDS = 2
 local ACHIEVEMENT_COMPARE_TIMEOUT_SECONDS = 8
 local LFM_POST_DELAY_OPTIONS = { 10, 20, 30, 60 }
 local DEFAULT_LFM_POST_DELAY_SECONDS = 10
+local LFM_NEED_GROUPS = {
+    {
+        key = "tank",
+        label = "Tank",
+        output = "tank",
+        items = {
+            { key = "bdk", label = "BDK" },
+            { key = "bear", label = "Bear" },
+            { key = "protpal", label = "ProtPal" },
+            { key = "protwar", label = "ProtWar" },
+        },
+    },
+    {
+        key = "heal",
+        label = "Heal",
+        output = "heal",
+        items = {
+            { key = "hpal", label = "HPal" },
+            { key = "dp", label = "DP" },
+            { key = "rsham", label = "RSham" },
+            { key = "rdruid", label = "RDruid" },
+        },
+    },
+    {
+        key = "mdps",
+        label = "Mdps",
+        output = "mdps",
+        items = {
+            { key = "rogue", label = "Rogue" },
+            { key = "ret", label = "Ret" },
+            { key = "feral", label = "Feral" },
+            { key = "enh", label = "Enh" },
+        },
+    },
+    {
+        key = "rdps",
+        label = "Rdps",
+        output = "rdps",
+        items = {
+            { key = "sp", label = "SP" },
+            { key = "mage", label = "Mage" },
+            { key = "lock", label = "Lock" },
+            { key = "hunter", label = "Hunter" },
+        },
+    },
+}
 local REPORT_SNAPSHOT_LIMIT = 200
 local REPORT_FILE_QUEUE_LIMIT = 25
 local OVERVIEW_ROW_HEIGHT = 18
@@ -1013,6 +1059,24 @@ end
 local function EnsureTable(tbl, key, defaultValue)
     if tbl[key] == nil then
         tbl[key] = defaultValue
+    end
+end
+
+local function EnsureLFMNeedDefaults(lfmState)
+    EnsureTable(lfmState, "needs", {})
+    EnsureTable(lfmState.needs, "groups", {})
+    EnsureTable(lfmState.needs, "items", {})
+
+    local i
+    for i = 1, #LFM_NEED_GROUPS do
+        local group = LFM_NEED_GROUPS[i]
+        EnsureTable(lfmState.needs.groups, group.key, false)
+
+        local j
+        for j = 1, #group.items do
+            local item = group.items[j]
+            EnsureTable(lfmState.needs.items, item.key, false)
+        end
     end
 end
 
@@ -2250,6 +2314,7 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "general", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "global", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm, "postDelaySeconds", DEFAULT_LFM_POST_DELAY_SECONDS)
+    EnsureLFMNeedDefaults(RaidInspectorDB.state.ui.lfm)
 
     EnsureTable(RaidInspectorDB, "requests", {})
     EnsureTable(RaidInspectorDB, "results", {})
@@ -2325,6 +2390,7 @@ function addon:GetLFMState()
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "general", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "global", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm, "postDelaySeconds", DEFAULT_LFM_POST_DELAY_SECONDS)
+    EnsureLFMNeedDefaults(RaidInspectorDB.state.ui.lfm)
     return RaidInspectorDB.state.ui.lfm
 end
 
@@ -2379,6 +2445,64 @@ function addon:SetLFMPostDelaySeconds(seconds)
         end
     end
     return false
+end
+
+function addon:GetLFMNeedState()
+    local state = addon:GetLFMState()
+    EnsureLFMNeedDefaults(state)
+    return state.needs
+end
+
+function addon:SetLFMNeedGroup(groupKey, enabled)
+    local i
+    for i = 1, #LFM_NEED_GROUPS do
+        if LFM_NEED_GROUPS[i].key == groupKey then
+            local needs = addon:GetLFMNeedState()
+            needs.groups[groupKey] = enabled and true or false
+            return true
+        end
+    end
+    return false
+end
+
+function addon:SetLFMNeedItem(itemKey, enabled)
+    local i
+    for i = 1, #LFM_NEED_GROUPS do
+        local group = LFM_NEED_GROUPS[i]
+        local j
+        for j = 1, #group.items do
+            local item = group.items[j]
+            if item.key == itemKey then
+                local needs = addon:GetLFMNeedState()
+                needs.items[itemKey] = enabled and true or false
+                return true
+            end
+        end
+    end
+    return false
+end
+
+function addon:BuildLFMNeedSuffix()
+    local needs = addon:GetLFMNeedState()
+    local out = {}
+
+    local i
+    for i = 1, #LFM_NEED_GROUPS do
+        local group = LFM_NEED_GROUPS[i]
+        if needs.groups[group.key] == true then
+            table.insert(out, tostring(group.output or group.label))
+        end
+
+        local j
+        for j = 1, #group.items do
+            local item = group.items[j]
+            if needs.items[item.key] == true then
+                table.insert(out, tostring(item.label))
+            end
+        end
+    end
+
+    return table.concat(out, ",")
 end
 
 function addon:GetLFMChannelAvailability()
@@ -3578,6 +3702,13 @@ function addon:RefreshOverviewEntryByKey(key)
     end
 
     local foundUnit = addon:FindUnitByName(name)
+    if not foundUnit then
+        local targeted = addon:TryTargetNearbyPlayer(name, realm)
+        if targeted then
+            foundUnit = "target"
+        end
+    end
+
     if foundUnit then
         addon:QueueInspect(name, realm, { allowDuplicate = true, silent = true, reason = "queued-refresh" })
         local okLive, liveReason = addon:QueueLiveInspectUnit(foundUnit, false)
@@ -3597,7 +3728,7 @@ function addon:RefreshOverviewEntryByKey(key)
 
     addon:SetLatestRequestState(normalizedKey, "queued", "local-only")
     addon:RefreshMainWindow()
-    Print("refresh unavailable: " .. tostring(name) .. "-" .. tostring(realm) .. " is not in target/party/raid")
+    Print("refresh unavailable: " .. tostring(name) .. "-" .. tostring(realm) .. " is not in target/focus/mouseover/party/raid or nearby")
     return false
 end
 
@@ -5088,6 +5219,65 @@ function addon:CreateMainWindow()
     lfmChannelStatus:SetJustifyH("LEFT")
     lfmChannelStatus:SetText("")
 
+    local lfmNeedPanel = CreateFrame("Frame", nil, lfmPanel)
+    lfmNeedPanel:SetPoint("TOPLEFT", lfmChannelStatus, "BOTTOMLEFT", 0, -10)
+    lfmNeedPanel:SetPoint("BOTTOMRIGHT", lfmPanel, "BOTTOMRIGHT", -4, 6)
+
+    local lfmNeedLabel = lfmNeedPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    lfmNeedLabel:SetPoint("TOPLEFT", lfmNeedPanel, "TOPLEFT", 0, -2)
+    lfmNeedLabel:SetText("Need (roles/specs):")
+
+    local lfmNeedGroupChecks = {}
+    local lfmNeedItemChecks = {}
+    local needColumnWidth = 186
+
+    local i
+    for i = 1, #LFM_NEED_GROUPS do
+        local group = LFM_NEED_GROUPS[i]
+        local xOffset = ((i - 1) * needColumnWidth) + 2
+
+        local groupCheck = CreateFrame("CheckButton", "RaidInspectorLFMNeedGroupCheck" .. tostring(i), lfmNeedPanel, "UICheckButtonTemplate")
+        groupCheck:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", xOffset, -6)
+        groupCheck:SetHitRectInsets(0, -24, 0, 0)
+        groupCheck.groupKey = group.key
+        groupCheck:SetScript("OnClick", function(self)
+            addon:SetLFMNeedGroup(self.groupKey, self:GetChecked() and true or false)
+        end)
+
+        local groupText = _G[groupCheck:GetName() .. "Text"]
+        if groupText then
+            groupText:SetText(ColorText(group.label, "ffaa33"))
+            SetFontStringBold(groupText, true)
+        end
+
+        table.insert(lfmNeedGroupChecks, {
+            key = group.key,
+            check = groupCheck,
+        })
+
+        local j
+        for j = 1, #group.items do
+            local item = group.items[j]
+            local itemCheck = CreateFrame("CheckButton", "RaidInspectorLFMNeedItemCheck" .. tostring(i) .. "_" .. tostring(j), lfmNeedPanel, "UICheckButtonTemplate")
+            itemCheck:SetPoint("TOPLEFT", groupCheck, "BOTTOMLEFT", 14, -2 - ((j - 1) * 18))
+            itemCheck:SetHitRectInsets(0, -20, 0, 0)
+            itemCheck.itemKey = item.key
+            itemCheck:SetScript("OnClick", function(self)
+                addon:SetLFMNeedItem(self.itemKey, self:GetChecked() and true or false)
+            end)
+
+            local itemText = _G[itemCheck:GetName() .. "Text"]
+            if itemText then
+                itemText:SetText(item.label)
+            end
+
+            table.insert(lfmNeedItemChecks, {
+                key = item.key,
+                check = itemCheck,
+            })
+        end
+    end
+
     addon.ui.frame = f
     addon.ui.subtitle = subtitle
     addon.ui.inspectorTabButton = inspectorTabButton
@@ -5143,6 +5333,10 @@ function addon:CreateMainWindow()
     addon.ui.lfmDelayDropDown = lfmDelayDropDown
     addon.ui.lfmPostButton = lfmPostButton
     addon.ui.lfmChannelStatus = lfmChannelStatus
+    addon.ui.lfmNeedPanel = lfmNeedPanel
+    addon.ui.lfmNeedLabel = lfmNeedLabel
+    addon.ui.lfmNeedGroupChecks = lfmNeedGroupChecks
+    addon.ui.lfmNeedItemChecks = lfmNeedItemChecks
 
     addon:ApplyButtonModeLayout()
     addon:SetActiveTab(addon:GetActiveTab())
@@ -5752,6 +5946,27 @@ function addon:RefreshMainWindow()
     if addon.ui.lfmGlobalCheck then
         addon.ui.lfmGlobalCheck:SetChecked(lfmChannels.global == true)
     end
+
+    local lfmNeeds = addon:GetLFMNeedState()
+    if addon.ui.lfmNeedGroupChecks then
+        local i
+        for i = 1, #addon.ui.lfmNeedGroupChecks do
+            local entry = addon.ui.lfmNeedGroupChecks[i]
+            if entry and entry.check then
+                entry.check:SetChecked(lfmNeeds.groups[entry.key] == true)
+            end
+        end
+    end
+    if addon.ui.lfmNeedItemChecks then
+        local i
+        for i = 1, #addon.ui.lfmNeedItemChecks do
+            local entry = addon.ui.lfmNeedItemChecks[i]
+            if entry and entry.check then
+                entry.check:SetChecked(lfmNeeds.items[entry.key] == true)
+            end
+        end
+    end
+
     if addon.ui.lfmDelayDropDown then
         local selectedDelay = addon:GetLFMPostDelaySeconds()
         UIDropDownMenu_SetSelectedValue(addon.ui.lfmDelayDropDown, selectedDelay)
@@ -5979,6 +6194,14 @@ function addon:FindUnitByName(name)
         return "target"
     end
 
+    if MatchUnit("focus") then
+        return "focus"
+    end
+
+    if MatchUnit("mouseover") then
+        return "mouseover"
+    end
+
     if GetNumRaidMembers and GetNumRaidMembers() > 0 then
         local i
         for i = 1, GetNumRaidMembers() do
@@ -6000,6 +6223,53 @@ function addon:FindUnitByName(name)
     end
 
     return nil
+end
+
+function addon:TryTargetNearbyPlayer(name, realm)
+    if type(TargetByName) ~= "function" then
+        return false, "target-by-name-unsupported"
+    end
+
+    local wantedName = string.lower(Trim(name or ""))
+    if wantedName == "" then
+        return false, "bad-unit-name"
+    end
+
+    local expectedRealm = string.lower(string.gsub(Trim(realm or ""), "%s+", ""))
+    local hadTarget = UnitExists("target")
+
+    local okTarget = pcall(TargetByName, name, true)
+    if not okTarget or not UnitExists("target") then
+        return false, "unit-not-found"
+    end
+
+    local targetName, targetRealm = UnitName("target")
+    if not targetName or string.lower(targetName) ~= wantedName then
+        if hadTarget and type(TargetLastTarget) == "function" then
+            pcall(TargetLastTarget)
+        elseif not hadTarget and type(ClearTarget) == "function" then
+            pcall(ClearTarget)
+        end
+        return false, "unit-not-found"
+    end
+
+    if expectedRealm ~= "" then
+        local actualRealm = targetRealm
+        if not actualRealm or actualRealm == "" then
+            actualRealm = GetRealmName() or ""
+        end
+        actualRealm = string.lower(string.gsub(actualRealm, "%s+", ""))
+        if actualRealm ~= "" and actualRealm ~= expectedRealm then
+            if hadTarget and type(TargetLastTarget) == "function" then
+                pcall(TargetLastTarget)
+            elseif not hadTarget and type(ClearTarget) == "function" then
+                pcall(ClearTarget)
+            end
+            return false, "unit-not-found"
+        end
+    end
+
+    return true, "nearby-target"
 end
 
 function addon:HandleInspectCommand(args)
@@ -6041,16 +6311,17 @@ function addon:BuildExportSummaryFromPayload(payload)
     end
 
     local score = payload.gearScore and tostring(payload.gearScore) or "N/A"
-    local talent = Trim(payload.spec or "")
+    local spec = Trim(payload.spec or "")
     local summary = payload.issueSummary or {}
     local missingEnchant = tonumber(summary.missingEnchant or 0) or 0
     local missingGems = tonumber(summary.missingGems or 0) or 0
+    local name = tostring(payload.name or "Unknown") .. "-" .. tostring(payload.realm or "Unknown")
 
-    return "RI " .. tostring(payload.name or "Unknown")
-        .. "-" .. tostring(payload.realm or "Unknown")
-        .. " | GS:" .. score
-        .. " | Talent:" .. (talent ~= "" and talent or "?")
-        .. " | MissingGems/Enchants:" .. tostring(missingGems) .. "/" .. tostring(missingEnchant)
+    return "Name: " .. name
+        .. ", GearScore: " .. score
+        .. ", Spec: " .. (spec ~= "" and spec or "?")
+        .. ", Missing Enchants: " .. tostring(missingEnchant)
+        .. ", Missing Gems: " .. tostring(missingGems)
 end
 
 function addon:BuildExportSummary(entry)
@@ -6090,6 +6361,11 @@ function addon:PostLFMMessage()
     if message == "" then
         Print("lfm: message is empty")
         return 0, 0
+    end
+
+    local needSuffix = addon:BuildLFMNeedSuffix()
+    if needSuffix ~= "" then
+        message = message .. ", NEED: " .. needSuffix
     end
 
     local channels = addon:GetLFMChannels()
