@@ -13,7 +13,7 @@ Raid Inspector is a WoW 3.3.5a addon for raid gear analysis on the bridgeless br
 - Gear score estimation from inspected items.
 - Enchant and gem auditing.
 - Talent/spec detection from in-game talent inspection.
-- Achievement comparison for inspectable targets when the client supports it.
+- Achievement comparison is currently disabled in this bridgeless build.
 - Saved detailed reports loaded directly from the in-game dropdown.
 - Saved single-player share snapshots for chat export.
 

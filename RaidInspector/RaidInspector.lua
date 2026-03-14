@@ -6,7 +6,7 @@ RaidInspectorBridgeInbox = RaidInspectorBridgeInbox or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.12.0-alpha"
+addon.version = "0.12.1-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
@@ -15,10 +15,10 @@ local INSPECT_THROTTLE_SECONDS = 2
 local INSPECT_TIMEOUT_SECONDS = 8
 local INSPECT_TALENT_MIN_WAIT_SECONDS = 1
 local INSPECT_TALENT_GRACE_SECONDS = 3
-local ACHIEVEMENT_COMPARE_THROTTLE_SECONDS = 2
-local ACHIEVEMENT_COMPARE_TIMEOUT_SECONDS = 8
 local LFM_POST_DELAY_OPTIONS = { 10, 20, 30, 60 }
 local DEFAULT_LFM_POST_DELAY_SECONDS = 10
+local LFM_GENERAL_ALIASES = { "general" }
+local LFM_GLOBAL_ALIASES = { "global", "globalchat", "world", "worldchat" }
 local LFM_NEED_GROUPS = {
     {
         key = "tank",
@@ -77,14 +77,6 @@ local PANEL_SIDE_MARGIN = 24
 local RIGHT_PANEL_X = 474
 
 local RAID_ACHIEVEMENT_KEYS = { "icc10", "icc25", "toc10", "toc25", "rs10", "rs25" }
-local RAID_CATEGORY_MATCHERS = {
-    icc10 = { raid = "icecrown citadel", size = "10" },
-    icc25 = { raid = "icecrown citadel", size = "25" },
-    toc10 = { raid = "trial of the crusader", altRaid = "trial of the grand crusader", size = "10" },
-    toc25 = { raid = "trial of the crusader", altRaid = "trial of the grand crusader", size = "25" },
-    rs10 = { raid = "ruby sanctum", size = "10" },
-    rs25 = { raid = "ruby sanctum", size = "25" },
-}
 
 local SORT_MODES = { "recent", "gs", "issues", "name" }
 local FILTER_MODES = { "all", "snapshot", "ready", "queued", "issues" }
@@ -415,22 +407,82 @@ local function EscapeChatMessage(text)
     return string.gsub(value, "|", "||")
 end
 
+local function NormalizeChannelAliasToken(value)
+    local token = string.lower(tostring(value or ""))
+    token = string.gsub(token, "|c%x%x%x%x%x%x%x%x", "")
+    token = string.gsub(token, "|r", "")
+    token = string.gsub(token, "[^a-z0-9]+", "")
+    return token
+end
+
 local function FindJoinedChannelByAlias(aliasList)
-    if type(GetChannelList) ~= "function" or type(aliasList) ~= "table" then
+    if type(aliasList) ~= "table" then
+        return nil, nil
+    end
+
+    local exactAliases = {}
+    local normalizedAliases = {}
+    local i
+    for i = 1, #aliasList do
+        local alias = tostring(aliasList[i] or "")
+        if alias ~= "" then
+            local lowered = string.lower(alias)
+            table.insert(exactAliases, lowered)
+            local normalizedAlias = NormalizeChannelAliasToken(lowered)
+            if normalizedAlias ~= "" then
+                normalizedAliases[normalizedAlias] = true
+            end
+        end
+    end
+
+    if #exactAliases == 0 then
+        return nil, nil
+    end
+
+    if type(GetChannelName) == "function" then
+        for i = 1, #exactAliases do
+            local alias = exactAliases[i]
+            local ok, id = pcall(GetChannelName, alias)
+            local channelId = ok and tonumber(id) or nil
+            if channelId and channelId > 0 then
+                local channelsByName = { GetChannelList() }
+                local j
+                for j = 1, #channelsByName, 3 do
+                    if tonumber(channelsByName[j]) == channelId then
+                        return channelId, tostring(channelsByName[j + 1] or alias)
+                    end
+                end
+                return channelId, alias
+            end
+        end
+    end
+
+    if type(GetChannelList) ~= "function" then
         return nil, nil
     end
 
     local channels = { GetChannelList() }
-    local i
     for i = 1, #channels, 3 do
         local channelId = tonumber(channels[i])
         local channelName = tostring(channels[i + 1] or "")
         if channelId and channelId > 0 and channelName ~= "" then
             local normalizedName = string.lower(channelName)
             local idx
-            for idx = 1, #aliasList do
-                local alias = string.lower(tostring(aliasList[idx] or ""))
-                if alias ~= "" and string.find(normalizedName, alias, 1, true) then
+            for idx = 1, #exactAliases do
+                local alias = exactAliases[idx]
+                if string.find(normalizedName, alias, 1, true) then
+                    return channelId, channelName
+                end
+            end
+
+            local normalizedToken = NormalizeChannelAliasToken(channelName)
+            if normalizedAliases[normalizedToken] then
+                return channelId, channelName
+            end
+
+            local normalizedAlias
+            for normalizedAlias in pairs(normalizedAliases) do
+                if string.find(normalizedToken, normalizedAlias, 1, true) then
                     return channelId, channelName
                 end
             end
@@ -576,154 +628,6 @@ local function CanInspectUnit(unit)
     end
 
     return false
-end
-
-local function SetAchievementComparisonUnitSafe(unit)
-    if type(SetAchievementComparisonUnit) ~= "function" then
-        return false
-    end
-
-    local ok, result = pcall(SetAchievementComparisonUnit, unit)
-    if not ok then
-        return false
-    end
-
-    if result == nil then
-        return true
-    end
-
-    return result and true or false
-end
-
-local function ClearAchievementComparisonUnitSafe()
-    if type(ClearAchievementComparisonUnit) ~= "function" then
-        return
-    end
-    pcall(ClearAchievementComparisonUnit)
-end
-
-local function GetComparisonAchievementPointsSafe()
-    if type(GetComparisonAchievementPoints) ~= "function" then
-        return nil
-    end
-
-    local ok, points = pcall(GetComparisonAchievementPoints)
-    if not ok then
-        return nil
-    end
-
-    local numeric = tonumber(points)
-    if not numeric or numeric < 0 then
-        return nil
-    end
-
-    return math.floor(numeric + 0.5)
-end
-
-local function GetCategoryListSafe()
-    if type(GetCategoryList) ~= "function" then
-        return {}
-    end
-
-    local out = {}
-    local ok = pcall(GetCategoryList, out)
-    if ok and #out > 0 then
-        return out
-    end
-
-    local okRet, a1, a2, a3, a4, a5 = pcall(GetCategoryList)
-    if okRet then
-        if tonumber(a1) then table.insert(out, tonumber(a1)) end
-        if tonumber(a2) then table.insert(out, tonumber(a2)) end
-        if tonumber(a3) then table.insert(out, tonumber(a3)) end
-        if tonumber(a4) then table.insert(out, tonumber(a4)) end
-        if tonumber(a5) then table.insert(out, tonumber(a5)) end
-    end
-
-    return out
-end
-
-local function GetCategoryNameSafe(categoryId)
-    if type(GetCategoryInfo) ~= "function" then
-        return nil
-    end
-
-    local ok, name = pcall(GetCategoryInfo, categoryId)
-    if ok and type(name) == "string" and name ~= "" then
-        return name
-    end
-
-    return nil
-end
-
-local function CategoryMatchesRaidFlag(categoryName, raidKey)
-    local matcher = RAID_CATEGORY_MATCHERS[raidKey]
-    if not matcher or type(categoryName) ~= "string" then
-        return false
-    end
-
-    local lowered = string.lower(categoryName)
-    if not string.find(lowered, matcher.raid, 1, true)
-        and (not matcher.altRaid or not string.find(lowered, matcher.altRaid, 1, true)) then
-        return false
-    end
-
-    if not string.find(lowered, matcher.size, 1, true) then
-        return false
-    end
-
-    return true
-end
-
-local function GetCategoryAchievementIds(categoryId)
-    if type(GetCategoryNumAchievements) ~= "function" or type(GetAchievementInfo) ~= "function" then
-        return {}
-    end
-
-    local okCount, num = pcall(GetCategoryNumAchievements, categoryId, true)
-    if (not okCount) or (not tonumber(num)) then
-        okCount, num = pcall(GetCategoryNumAchievements, categoryId)
-    end
-
-    local count = tonumber(num) or 0
-    if count <= 0 then
-        return {}
-    end
-
-    local out = {}
-    local index
-    for index = 1, count do
-        local okInfo, achievementId = pcall(GetAchievementInfo, categoryId, index)
-        if not okInfo or not tonumber(achievementId) then
-            okInfo, achievementId = pcall(GetAchievementInfo, categoryId, index, true)
-        end
-        if okInfo and tonumber(achievementId) then
-            table.insert(out, tonumber(achievementId))
-        end
-    end
-
-    return out
-end
-
-local function GetComparisonAchievementCompletedSafe(achievementId)
-    if type(GetComparisonAchievementInfo) ~= "function" then
-        return nil
-    end
-
-    local ok, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 = pcall(GetComparisonAchievementInfo, achievementId)
-    if not ok then
-        return nil
-    end
-
-    local values = { a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 }
-    local i
-    for i = 1, #values do
-        if type(values[i]) == "boolean" then
-            return values[i]
-        end
-    end
-
-    return nil
 end
 
 local function GetInspectTalentGroup(unit)
@@ -1206,6 +1110,20 @@ local function HasAnyKnownRaidAchievementFlags(raid)
     return false
 end
 
+local function HasKnownSpecificAchievementFlags(flags)
+    if type(flags) ~= "table" then
+        return false
+    end
+
+    local frozenThrone10 = flags.icc10FrozenThrone
+    if frozenThrone10 == true or frozenThrone10 == false then
+        return true
+    end
+
+    local kingslayer = flags.icc10Kingslayer
+    return kingslayer == true or kingslayer == false
+end
+
 local function ResolveAchievementPointsSource(result)
     if type(result) ~= "table" then
         return "-"
@@ -1603,11 +1521,6 @@ function addon:InitInspectRuntime()
     addon.inspectLastRequestAt = addon.inspectLastRequestAt or 0
     addon.inspectTickAccum = 0
 
-    addon.achievementQueue = addon.achievementQueue or {}
-    addon.achievementQueuedKeys = addon.achievementQueuedKeys or {}
-    addon.achievementCurrent = nil
-    addon.achievementLastRequestAt = addon.achievementLastRequestAt or 0
-
     addon.lfmPostQueue = addon.lfmPostQueue or {}
     addon.lfmPostSentCount = addon.lfmPostSentCount or 0
     addon.lfmPostSelectedCount = addon.lfmPostSelectedCount or 0
@@ -1698,6 +1611,18 @@ function addon:FinalizeInspectCurrent(success, failureReason)
                     and type(previous.raidAchievements) == "table" then
                     resultOrErr.raidAchievements = CopyTable(previous.raidAchievements)
                 end
+                if (type(resultOrErr.specificAchievements) ~= "table"
+                    or (resultOrErr.specificAchievements.icc10FrozenThrone == nil
+                        and resultOrErr.specificAchievements.icc10Kingslayer == nil))
+                    and type(previous.specificAchievements) == "table"
+                    and (
+                        previous.specificAchievements.icc10FrozenThrone == true
+                        or previous.specificAchievements.icc10FrozenThrone == false
+                        or previous.specificAchievements.icc10Kingslayer == true
+                        or previous.specificAchievements.icc10Kingslayer == false
+                    ) then
+                    resultOrErr.specificAchievements = CopyTable(previous.specificAchievements)
+                end
             end
             RaidInspectorDB.results[current.key] = resultOrErr
             if req then
@@ -1707,8 +1632,6 @@ function addon:FinalizeInspectCurrent(success, failureReason)
             end
 
             addon:RefreshActiveRaidHistoryEntry()
-
-            addon:QueueAchievementCompareUnit(current.unit, current.key, current.name, current.realm, current.guid)
         else
             Print("inspect build failed: " .. tostring(resultOrErr))
             if req then
@@ -1735,228 +1658,6 @@ function addon:FinalizeInspectCurrent(success, failureReason)
     end
 
     addon:RefreshMainWindow()
-end
-
-function addon:QueueAchievementCompareUnit(unit, key, name, realm, guid)
-    if type(SetAchievementComparisonUnit) ~= "function" or type(GetComparisonAchievementPoints) ~= "function" then
-        return false, "unsupported"
-    end
-
-    if not UnitExists(unit) then
-        return false, "unit-not-found"
-    end
-
-    if not CanInspectUnit(unit) then
-        return false, "cannot-inspect"
-    end
-
-    if addon.achievementQueuedKeys[key] then
-        return false, "already-queued"
-    end
-
-    if addon.achievementCurrent and addon.achievementCurrent.key == key then
-        return false, "already-active"
-    end
-
-    table.insert(addon.achievementQueue, {
-        unit = unit,
-        guid = guid or UnitGUID(unit),
-        key = key,
-        name = name,
-        realm = realm,
-        queuedAt = GetNow(),
-    })
-    addon.achievementQueuedKeys[key] = true
-
-    return true
-end
-
-function addon:ProcessAchievementCompareQueue(force)
-    if addon.achievementCurrent then
-        return
-    end
-
-    if not addon.achievementQueue or #addon.achievementQueue == 0 then
-        return
-    end
-
-    local now = GetNow()
-    if not force and (now - (addon.achievementLastRequestAt or 0)) < ACHIEVEMENT_COMPARE_THROTTLE_SECONDS then
-        return
-    end
-
-    local entry = table.remove(addon.achievementQueue, 1)
-    if not entry then
-        return
-    end
-
-    addon.achievementQueuedKeys[entry.key] = nil
-
-    if not UnitExists(entry.unit) then
-        return
-    end
-
-    if entry.guid and UnitGUID(entry.unit) ~= entry.guid then
-        return
-    end
-
-    if not CanInspectUnit(entry.unit) then
-        return
-    end
-
-    ClearAchievementComparisonUnitSafe()
-    if not SetAchievementComparisonUnitSafe(entry.unit) then
-        return
-    end
-
-    addon.achievementCurrent = {
-        unit = entry.unit,
-        guid = entry.guid,
-        key = entry.key,
-        name = entry.name,
-        realm = entry.realm,
-        startedAt = now,
-        lastPollAt = 0,
-    }
-    addon.achievementLastRequestAt = now
-end
-
-function addon:BuildRaidAchievementFlagsFromComparison()
-    if type(GetCategoryList) ~= "function"
-        or type(GetCategoryInfo) ~= "function"
-        or type(GetCategoryNumAchievements) ~= "function"
-        or type(GetAchievementInfo) ~= "function"
-        or type(GetComparisonAchievementInfo) ~= "function" then
-        return nil
-    end
-
-    local categories = GetCategoryListSafe()
-    if #categories == 0 then
-        return nil
-    end
-
-    local categoryBuckets = {}
-    local raidKey
-    for _, raidKey in ipairs(RAID_ACHIEVEMENT_KEYS) do
-        categoryBuckets[raidKey] = {}
-    end
-
-    local i
-    for i = 1, #categories do
-        local categoryId = tonumber(categories[i])
-        if categoryId then
-            local categoryName = GetCategoryNameSafe(categoryId)
-            if categoryName then
-                for _, raidKey in ipairs(RAID_ACHIEVEMENT_KEYS) do
-                    if CategoryMatchesRaidFlag(categoryName, raidKey) then
-                        table.insert(categoryBuckets[raidKey], categoryId)
-                    end
-                end
-            end
-        end
-    end
-
-    local flags = {
-        icc10 = nil,
-        icc25 = nil,
-        toc10 = nil,
-        toc25 = nil,
-        rs10 = nil,
-        rs25 = nil,
-        source = "inspect-achievement-compare",
-    }
-
-    local knownCount = 0
-    local achievementCache = {}
-    for _, raidKey in ipairs(RAID_ACHIEVEMENT_KEYS) do
-        local anyKnown = false
-        local anyCompleted = false
-        local bucket = categoryBuckets[raidKey]
-        local bi
-
-        for bi = 1, #bucket do
-            local categoryId = bucket[bi]
-            local ids = GetCategoryAchievementIds(categoryId)
-            local ai
-            for ai = 1, #ids do
-                local achievementId = ids[ai]
-                local completed = achievementCache[achievementId]
-                if completed == nil then
-                    completed = GetComparisonAchievementCompletedSafe(achievementId)
-                    achievementCache[achievementId] = completed
-                end
-
-                if completed ~= nil then
-                    anyKnown = true
-                    if completed == true then
-                        anyCompleted = true
-                        break
-                    end
-                end
-            end
-
-            if anyCompleted then
-                break
-            end
-        end
-
-        if anyCompleted then
-            flags[raidKey] = true
-            knownCount = knownCount + 1
-        elseif anyKnown then
-            flags[raidKey] = false
-            knownCount = knownCount + 1
-        end
-    end
-
-    if knownCount <= 0 then
-        return nil
-    end
-
-    return flags
-end
-
-function addon:FinalizeAchievementCompareCurrent(success, points, raidFlags)
-    if not addon.achievementCurrent then
-        return
-    end
-
-    local current = addon.achievementCurrent
-    addon.achievementCurrent = nil
-    ClearAchievementComparisonUnitSafe()
-
-    if not success or points == nil then
-        return
-    end
-
-    local result = RaidInspectorDB.results[current.key]
-    if type(result) ~= "table" then
-        return
-    end
-
-    result.achievementPoints = tonumber(points) or points
-    result.achievementPointsSource = "inspect-achievement-compare"
-
-    if type(raidFlags) == "table" then
-        if type(result.raidAchievements) ~= "table" then
-            result.raidAchievements = {}
-        end
-
-        local rk
-        for _, rk in ipairs(RAID_ACHIEVEMENT_KEYS) do
-            local value = raidFlags[rk]
-            if value == true or value == false then
-                result.raidAchievements[rk] = value
-            end
-        end
-
-        if raidFlags.source then
-            result.raidAchievements.source = raidFlags.source
-        end
-    end
-
-    result.updatedAt = GetNow()
-    addon:RefreshActiveRaidHistoryEntry()
 end
 
 function addon:QueueLiveInspectUnit(unit, queueRequest)
@@ -2084,6 +1785,7 @@ function addon:BuildLocalInspectResult(unit, key, name, realm, inspectTalentsRea
         achievementPoints = nil,
         achievementPointsSource = nil,
         raidAchievements = {},
+        specificAchievements = {},
         issuesCount = issueSummary.missingEnchant + issueSummary.missingGems,
         issueSummary = issueSummary,
         source = "local-inspect",
@@ -2254,26 +1956,6 @@ function addon:OnUpdate(elapsed)
 
     addon:ProcessInspectQueue(false)
 
-    if addon.achievementCurrent then
-        local now = GetNow()
-        if UnitExists(addon.achievementCurrent.unit) and (now - (addon.achievementCurrent.lastPollAt or 0)) >= 1 then
-            addon.achievementCurrent.lastPollAt = now
-            local points = GetComparisonAchievementPointsSafe()
-            if points ~= nil then
-                local raidFlags = addon:BuildRaidAchievementFlagsFromComparison()
-                addon:FinalizeAchievementCompareCurrent(true, points, raidFlags)
-                addon:ProcessAchievementCompareQueue(false)
-                addon:ProcessLFMPostQueue(false)
-                return
-            end
-        end
-
-        if (now - addon.achievementCurrent.startedAt) > ACHIEVEMENT_COMPARE_TIMEOUT_SECONDS then
-            addon:FinalizeAchievementCompareCurrent(false, nil)
-        end
-    end
-
-    addon:ProcessAchievementCompareQueue(false)
     addon:ProcessLFMPostQueue(false)
 end
 
@@ -2506,8 +2188,8 @@ function addon:BuildLFMNeedSuffix()
 end
 
 function addon:GetLFMChannelAvailability()
-    local generalId, generalName = FindJoinedChannelByAlias({ "general" })
-    local globalId, globalName = FindJoinedChannelByAlias({ "global" })
+    local generalId, generalName = FindJoinedChannelByAlias(LFM_GENERAL_ALIASES)
+    local globalId, globalName = FindJoinedChannelByAlias(LFM_GLOBAL_ALIASES)
 
     return {
         yell = true,
@@ -2834,6 +2516,7 @@ function addon:BuildStoredSummaryPayload(key, req, result, state, statusReason)
         payload.achievementPoints = result.achievementPoints
         payload.achievementPointsSource = result.achievementPointsSource
         payload.raidAchievements = CopyTable(result.raidAchievements or {})
+        payload.specificAchievements = CopyTable(result.specificAchievements or {})
         payload.raw = CopyTable(result.raw)
         payload.updatedAt = tonumber(result.updatedAt) or tonumber(result.fetchedAt) or payload.updatedAt or 0
     end
@@ -2884,6 +2567,7 @@ function addon:BuildReportEntryFromPayload(payload, index)
         achievementPoints = payload.achievementPoints,
         achievementPointsSource = payload.achievementPointsSource,
         raidAchievements = CopyTable(payload.raidAchievements or {}),
+        specificAchievements = CopyTable(payload.specificAchievements or {}),
         raw = CopyTable(payload.raw),
         fetchedAt = updatedAt,
         updatedAt = updatedAt,
@@ -3776,20 +3460,6 @@ function addon:RemoveOverviewEntryByKey(key)
         end
     end
 
-    local keptAchievementQueue = {}
-    for i = 1, #(addon.achievementQueue or {}) do
-        local entry = addon.achievementQueue[i]
-        if tostring(entry and entry.key or "") ~= normalizedKey then
-            keptAchievementQueue[#keptAchievementQueue + 1] = entry
-        end
-    end
-    addon.achievementQueue = keptAchievementQueue
-    addon.achievementQueuedKeys[normalizedKey] = nil
-    if addon.achievementCurrent and addon.achievementCurrent.key == normalizedKey then
-        addon.achievementCurrent = nil
-        ClearAchievementComparisonUnitSafe()
-    end
-
     local snapshot = RaidInspectorDB.state.lastSnapshot
     if type(snapshot) == "table" and type(snapshot.members) == "table" then
         snapshot.members[normalizedKey] = nil
@@ -3920,6 +3590,7 @@ function addon:ApplyBridgeResult(key, payload)
     result.achievementPoints = payload.achievementPoints
     result.achievementPointsSource = payload.achievementPointsSource or ((payload.achievementPoints ~= nil) and (payload.source or "bridge") or nil)
     result.raidAchievements = CopyTable(payload.raidAchievements or {})
+    result.specificAchievements = CopyTable(payload.specificAchievements or {})
     result.issuesCount = tonumber(payload.issuesCount) or 0
     result.issueSummary = CopyTable(payload.issueSummary or {})
     result.error = payload.error
@@ -3943,6 +3614,10 @@ function addon:ApplyBridgeResult(key, payload)
 
         if type(result.raidAchievements) ~= "table" then
             result.raidAchievements = {}
+        end
+
+        if type(result.specificAchievements) ~= "table" then
+            result.specificAchievements = {}
         end
 
         local hasKnownNew = false
@@ -3972,6 +3647,10 @@ function addon:ApplyBridgeResult(key, payload)
                     result.raidAchievements.source = previous.raidAchievements.source
                 end
             end
+        end
+
+        if type(previous.specificAchievements) == "table" and not HasKnownSpecificAchievementFlags(result.specificAchievements) then
+            result.specificAchievements = CopyTable(previous.specificAchievements)
         end
     end
 
@@ -4005,13 +3684,15 @@ function addon:ApplyBridgeAchievementEnrichment(key, payload)
 
     local payloadHasAP = payload.achievementPoints ~= nil
     local payloadHasRaid = HasCompleteRaidAchievementFlags(payload.raidAchievements)
-    if not payloadHasAP and not payloadHasRaid then
+    local payloadHasSpecific = HasKnownSpecificAchievementFlags(payload.specificAchievements)
+    if not payloadHasAP and not payloadHasRaid and not payloadHasSpecific then
         return false
     end
 
     local existingHasAP = existing.achievementPoints ~= nil
     local existingHasRaid = HasCompleteRaidAchievementFlags(existing.raidAchievements)
-    if existingHasAP and existingHasRaid then
+    local existingHasSpecific = HasKnownSpecificAchievementFlags(existing.specificAchievements)
+    if existingHasAP and existingHasRaid and existingHasSpecific then
         return false
     end
 
@@ -4043,6 +3724,32 @@ function addon:ApplyBridgeAchievementEnrichment(key, payload)
         if (not existing.raidAchievements.source or existing.raidAchievements.source == "")
             and payload.raidAchievements.source then
             existing.raidAchievements.source = payload.raidAchievements.source
+            changed = true
+        end
+    end
+
+    if payloadHasSpecific and not existingHasSpecific then
+        if type(existing.specificAchievements) ~= "table" then
+            existing.specificAchievements = {}
+        end
+
+        local frozenThrone10 = payload.specificAchievements.icc10FrozenThrone
+        if frozenThrone10 ~= true and frozenThrone10 ~= false then
+            frozenThrone10 = payload.specificAchievements.icc10Kingslayer
+        end
+        if frozenThrone10 == true or frozenThrone10 == false then
+            existing.specificAchievements.icc10FrozenThrone = frozenThrone10
+            existing.specificAchievements.icc10Kingslayer = frozenThrone10
+            local matchedId = tonumber(payload.specificAchievements.frozenThrone10AchievementId)
+            if matchedId and matchedId > 0 then
+                existing.specificAchievements.frozenThrone10AchievementId = matchedId
+            end
+            changed = true
+        end
+
+        if (not existing.specificAchievements.source or existing.specificAchievements.source == "")
+            and payload.specificAchievements.source then
+            existing.specificAchievements.source = payload.specificAchievements.source
             changed = true
         end
     end
@@ -5031,7 +4738,7 @@ function addon:CreateMainWindow()
     end
 
     local detailAudit = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    detailAudit:SetPoint("TOPLEFT", detailMeta, "BOTTOMLEFT", 0, -4)
+    detailAudit:SetPoint("TOPLEFT", detailMeta, "BOTTOMLEFT", 0, -7)
     detailAudit:SetWidth(rightPanelWidth)
     detailAudit:SetJustifyH("LEFT")
     detailAudit:SetText("")
@@ -5322,19 +5029,12 @@ function addon:CreateMainWindow()
     addon.ui.lastDetailKey = ""
     addon.ui.lastDetailEntry = nil
     addon.ui.lfmPanel = lfmPanel
-    addon.ui.lfmMessageLabel = lfmMessageLabel
     addon.ui.lfmMessageBox = lfmMessageBox
-    addon.ui.lfmHint = lfmHint
-    addon.ui.lfmChannelsLabel = lfmChannelsLabel
     addon.ui.lfmYellCheck = lfmYellCheck
     addon.ui.lfmGeneralCheck = lfmGeneralCheck
     addon.ui.lfmGlobalCheck = lfmGlobalCheck
-    addon.ui.lfmDelayLabel = lfmDelayLabel
     addon.ui.lfmDelayDropDown = lfmDelayDropDown
-    addon.ui.lfmPostButton = lfmPostButton
     addon.ui.lfmChannelStatus = lfmChannelStatus
-    addon.ui.lfmNeedPanel = lfmNeedPanel
-    addon.ui.lfmNeedLabel = lfmNeedLabel
     addon.ui.lfmNeedGroupChecks = lfmNeedGroupChecks
     addon.ui.lfmNeedItemChecks = lfmNeedItemChecks
 
@@ -6383,7 +6083,7 @@ function addon:PostLFMMessage()
 
     if channels.general then
         selectedCount = selectedCount + 1
-        local channelId, channelName = FindJoinedChannelByAlias({ "general" })
+        local channelId, channelName = FindJoinedChannelByAlias(LFM_GENERAL_ALIASES)
         if channelId and channelId > 0 then
             table.insert(targets, {
                 message = message,
@@ -6398,7 +6098,7 @@ function addon:PostLFMMessage()
 
     if channels.global then
         selectedCount = selectedCount + 1
-        local channelId, channelName = FindJoinedChannelByAlias({ "global" })
+        local channelId, channelName = FindJoinedChannelByAlias(LFM_GLOBAL_ALIASES)
         if channelId and channelId > 0 then
             table.insert(targets, {
                 message = message,
@@ -6546,9 +6246,6 @@ function addon:PrintStatus()
     local history = addon:GetRaidScanHistory()
     local livePending = addon.inspectQueue and #addon.inspectQueue or 0
     local liveActive = addon.inspectCurrent and (addon.inspectCurrent.name .. "-" .. addon.inspectCurrent.realm) or "-"
-    local achievementPending = addon.achievementQueue and #addon.achievementQueue or 0
-    local achievementActive = addon.achievementCurrent and (addon.achievementCurrent.name .. "-" .. addon.achievementCurrent.realm) or "-"
-    local achievementSupported = (type(SetAchievementComparisonUnit) == "function" and type(GetComparisonAchievementPoints) == "function") and "yes" or "no"
 
     Print("schema v" .. tostring(RaidInspectorDB.meta.schemaVersion))
     Print("requests: " .. tostring(#RaidInspectorDB.requests))
@@ -6556,7 +6253,7 @@ function addon:PrintStatus()
     Print("issues: total=" .. totalIssues .. ", playersWithIssues=" .. playersWithIssues)
     Print("overview mode: sort=" .. addon:GetSortMode() .. ", filter=" .. addon:GetFilterMode())
     Print("live inspect: pending=" .. tostring(livePending) .. ", active=" .. tostring(liveActive))
-    Print("achievement compare: supported=" .. achievementSupported .. ", pending=" .. tostring(achievementPending) .. ", active=" .. tostring(achievementActive))
+    Print("achievement compare: disabled")
     Print("saved reports=" .. tostring(#reports.items) .. ", raid scan history=" .. tostring(#history.scans))
     Print("detailed reports=" .. tostring(#savedReportFiles.items) .. ", activeSaved=" .. tostring(addon:GetSelectedSavedReportFile() ~= ""))
 
@@ -6579,14 +6276,9 @@ function addon:ClearQueue()
     addon.inspectQueuedKeys = {}
     addon.inspectCurrent = nil
     addon.inspectTickAccum = 0
-    addon.achievementQueue = {}
-    addon.achievementQueuedKeys = {}
-    addon.achievementCurrent = nil
-    addon.achievementLastRequestAt = 0
     if ClearInspectPlayer then
         ClearInspectPlayer()
     end
-    ClearAchievementComparisonUnitSafe()
     addon:SetSelectedKey("")
     Print("queue + results cleared")
     addon:RefreshMainWindow()
