@@ -21,47 +21,113 @@ local LFM_GENERAL_ALIASES = { "general" }
 local LFM_GLOBAL_ALIASES = { "global", "globalchat", "world", "worldchat" }
 local LFM_NEED_GROUPS = {
     {
-        key = "tank",
-        label = "Tank",
-        output = "tank",
+        key = "warrior",
+        label = "Warrior",
+        output = "Warrior",
+        classToken = "WARRIOR",
         items = {
-            { key = "bdk", label = "BDK" },
-            { key = "bear", label = "Bear" },
-            { key = "protpal", label = "ProtPal" },
-            { key = "protwar", label = "ProtWar" },
+            { key = "warrior_prot", label = "Prot", output = "prot" },
+            { key = "warrior_fury", label = "Fury", output = "fury" },
+            { key = "warrior_arms", label = "Arms", output = "arms" },
         },
     },
     {
-        key = "heal",
-        label = "Heal",
-        output = "heal",
+        key = "paladin",
+        label = "Paladin",
+        output = "Paladin",
+        classToken = "PALADIN",
         items = {
-            { key = "hpal", label = "HPal" },
-            { key = "dp", label = "DP" },
-            { key = "rsham", label = "RSham" },
-            { key = "rdruid", label = "RDruid" },
+            { key = "paladin_holy", label = "Holy", output = "holy" },
+            { key = "paladin_prot", label = "Prot", output = "prot" },
+            { key = "paladin_ret", label = "Ret", output = "ret" },
         },
     },
     {
-        key = "mdps",
-        label = "Mdps",
-        output = "mdps",
+        key = "deathknight",
+        label = "Death Knight",
+        output = "Death Knight",
+        classToken = "DEATHKNIGHT",
         items = {
-            { key = "rogue", label = "Rogue" },
-            { key = "ret", label = "Ret" },
-            { key = "feral", label = "Feral" },
-            { key = "enh", label = "Enh" },
+            { key = "dk_blood", label = "Blood", output = "blood" },
+            { key = "dk_frost", label = "Frost", output = "frost" },
+            { key = "dk_unholy", label = "Unholy", output = "unholy" },
         },
     },
     {
-        key = "rdps",
-        label = "Rdps",
-        output = "rdps",
+        key = "druid",
+        label = "Druid",
+        output = "Druid",
+        classToken = "DRUID",
         items = {
-            { key = "sp", label = "SP" },
-            { key = "mage", label = "Mage" },
-            { key = "lock", label = "Lock" },
-            { key = "hunter", label = "Hunter" },
+            { key = "druid_balance", label = "Balance", output = "balance" },
+            { key = "druid_feral", label = "Feral", output = "feral" },
+            { key = "druid_resto", label = "Resto", output = "resto" },
+        },
+    },
+    {
+        key = "priest",
+        label = "Priest",
+        output = "Priest",
+        classToken = "PRIEST",
+        items = {
+            { key = "priest_disc", label = "Disc", output = "disc" },
+            { key = "priest_holy", label = "Holy", output = "holy" },
+            { key = "priest_shadow", label = "Shadow", output = "shadow" },
+        },
+    },
+    {
+        key = "shaman",
+        label = "Shaman",
+        output = "Shaman",
+        classToken = "SHAMAN",
+        items = {
+            { key = "shaman_elemental", label = "Elemental", output = "elemental" },
+            { key = "shaman_enh", label = "Enh", output = "enh" },
+            { key = "shaman_resto", label = "Resto", output = "resto" },
+        },
+    },
+    {
+        key = "hunter",
+        label = "Hunter",
+        output = "Hunter",
+        classToken = "HUNTER",
+        items = {
+            { key = "hunter_bm", label = "BM", output = "bm" },
+            { key = "hunter_mm", label = "MM", output = "mm" },
+            { key = "hunter_surv", label = "Surv", output = "surv" },
+        },
+    },
+    {
+        key = "rogue",
+        label = "Rogue",
+        output = "Rogue",
+        classToken = "ROGUE",
+        items = {
+            { key = "rogue_assa", label = "Assa", output = "assa" },
+            { key = "rogue_combat", label = "Combat", output = "combat" },
+            { key = "rogue_sub", label = "Sub", output = "sub" },
+        },
+    },
+    {
+        key = "mage",
+        label = "Mage",
+        output = "Mage",
+        classToken = "MAGE",
+        items = {
+            { key = "mage_arcane", label = "Arcane", output = "arcane" },
+            { key = "mage_fire", label = "Fire", output = "fire" },
+            { key = "mage_frost", label = "Frost", output = "frost" },
+        },
+    },
+    {
+        key = "warlock",
+        label = "Warlock",
+        output = "Warlock",
+        classToken = "WARLOCK",
+        items = {
+            { key = "warlock_aff", label = "Affli", output = "affli" },
+            { key = "warlock_demo", label = "Demo", output = "demo" },
+            { key = "warlock_destro", label = "Destro", output = "destro" },
         },
     },
 }
@@ -2171,20 +2237,26 @@ function addon:BuildLFMNeedSuffix()
     local i
     for i = 1, #LFM_NEED_GROUPS do
         local group = LFM_NEED_GROUPS[i]
-        if needs.groups[group.key] == true then
-            table.insert(out, tostring(group.output or group.label))
-        end
+        local selectedSpecs = {}
 
         local j
         for j = 1, #group.items do
             local item = group.items[j]
             if needs.items[item.key] == true then
-                table.insert(out, tostring(item.label))
+                selectedSpecs[#selectedSpecs + 1] = tostring(item.output or item.label)
             end
+        end
+
+        if #selectedSpecs > 0 then
+            for j = 1, #selectedSpecs do
+                out[#out + 1] = selectedSpecs[j]
+            end
+        elseif needs.groups[group.key] == true then
+            out[#out + 1] = tostring(group.output or group.label)
         end
     end
 
-    return table.concat(out, ",")
+    return table.concat(out, ", ")
 end
 
 function addon:GetLFMChannelAvailability()
@@ -4932,19 +5004,24 @@ function addon:CreateMainWindow()
 
     local lfmNeedLabel = lfmNeedPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     lfmNeedLabel:SetPoint("TOPLEFT", lfmNeedPanel, "TOPLEFT", 0, -2)
-    lfmNeedLabel:SetText("Need (roles/specs):")
+    lfmNeedLabel:SetText("Need (classes/specs):")
 
     local lfmNeedGroupChecks = {}
     local lfmNeedItemChecks = {}
-    local needColumnWidth = 186
+    local needColumns = 5
+    local needColumnWidth = 150
+    local needRowHeight = 90
 
     local i
     for i = 1, #LFM_NEED_GROUPS do
         local group = LFM_NEED_GROUPS[i]
-        local xOffset = ((i - 1) * needColumnWidth) + 2
+        local columnIndex = (i - 1) - (math.floor((i - 1) / needColumns) * needColumns)
+        local rowIndex = math.floor((i - 1) / needColumns)
+        local xOffset = (columnIndex * needColumnWidth) + 2
+        local yOffset = -6 - (rowIndex * needRowHeight)
 
         local groupCheck = CreateFrame("CheckButton", "RaidInspectorLFMNeedGroupCheck" .. tostring(i), lfmNeedPanel, "UICheckButtonTemplate")
-        groupCheck:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", xOffset, -6)
+        groupCheck:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", xOffset, yOffset)
         groupCheck:SetHitRectInsets(0, -24, 0, 0)
         groupCheck.groupKey = group.key
         groupCheck:SetScript("OnClick", function(self)
@@ -4953,7 +5030,7 @@ function addon:CreateMainWindow()
 
         local groupText = _G[groupCheck:GetName() .. "Text"]
         if groupText then
-            groupText:SetText(ColorText(group.label, "ffaa33"))
+            groupText:SetText(ColorClassText(group.label, group.classToken))
             SetFontStringBold(groupText, true)
         end
 
@@ -4975,7 +5052,7 @@ function addon:CreateMainWindow()
 
             local itemText = _G[itemCheck:GetName() .. "Text"]
             if itemText then
-                itemText:SetText(item.label)
+                itemText:SetText(ColorText(item.label, "c8c8c8"))
             end
 
             table.insert(lfmNeedItemChecks, {
@@ -5860,7 +5937,11 @@ end
 
 function addon:ToggleWindow(forceShow)
     if not addon.ui or not addon.ui.frame then
-        return
+        addon:CreateMainWindow()
+        if not addon.ui or not addon.ui.frame then
+            Print("unable to open window: UI failed to initialize")
+            return
+        end
     end
 
     if forceShow == true then
