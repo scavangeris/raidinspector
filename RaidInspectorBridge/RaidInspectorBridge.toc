@@ -1,8 +1,0 @@
-## Interface: 30300
-## Title: Raid Inspector Bridge Storage
-## Notes: Storage addon for RaidInspector bridge inbox data.
-## Author: Local Dev
-## Version: 0.1.0
-## SavedVariables: RaidInspectorBridgeInbox
-
-RaidInspectorBridge.lua

@@ -2,6 +2,14 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.12.2-alpha - 2026-03-17
+- Removed unused bridge import code from `RaidInspector.lua` in bridgeless mode.
+- Removed legacy bridge assets from the repository:
+  - deleted `RaidInspector/bridge/*`
+  - deleted `RaidInspectorBridge/*`
+- Updated release packaging script to build a zip containing only `RaidInspector/`.
+- Updated release docs for a single-addon install path (drop `RaidInspector` into `Interface/AddOns`).
+
 ## 0.12.1-alpha - 2026-03-12
 - Added initial `LFM` tab in the main window:
   - message input field for manual LFM post composition

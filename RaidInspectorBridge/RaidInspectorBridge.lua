@@ -1,2 +1,0 @@
--- Storage-only addon.
--- Saved variable RaidInspectorBridgeInbox is consumed by RaidInspector.

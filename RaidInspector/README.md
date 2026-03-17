@@ -117,15 +117,13 @@ RaidInspectorDB = {
 }
 ```
 
-## Legacy Bridge Assets
-The `bridge/` folder and bridge-related docs are kept in the repository as historical implementation assets from `main`, but they are not part of the bridgeless runtime flow.
-- Request pacing: outbound requests are rate-limited with `--request-delay`.
-- Atomic writes: bridge and item-ilvl cache files are written via temp-file + replace to reduce corruption risk.
-- Cache TTL guard: `--cache-ttl-minutes` skips network calls for recently updated keys from addon SavedVariables cache.
-- Schema guard: non-dict API payloads are wrapped for resilient parsing instead of hard-failing.
+## Bridge Status
+Bridge assets were removed from this repository to keep the release branch fully in-game and self-contained.
+
+The addon no longer depends on `RaidInspectorBridge` or bridge-generated SavedVariables files.
 
 ## Release Packaging (Phase 8)
-Build a release zip that contains both addons (`RaidInspector` + `RaidInspectorBridge`).
+Build a release zip that contains only the runtime addon folder (`RaidInspector`).
 
 ```bash
 cd "Interface/AddOns/RaidInspector"
@@ -138,10 +136,7 @@ Default output:
 Optional arguments:
 - `--addons-root ".../Interface/AddOns"`
 - `--output-dir ".../output/folder"`
-- `--version "0.6.0-alpha"`
-
-Bridge operator guide:
-- `bridge/BRIDGE_SETUP.md`
+- `--version "0.12.2-alpha"`
 
 ## Roadmap
 Planned work is tracked in `ROADMAP.md`.

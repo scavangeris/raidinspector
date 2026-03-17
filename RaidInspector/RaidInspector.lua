@@ -2,11 +2,10 @@ local addonName = ...
 
 RaidInspector = RaidInspector or {}
 RaidInspectorDB = RaidInspectorDB or {}
-RaidInspectorBridgeInbox = RaidInspectorBridgeInbox or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.12.1-alpha"
+addon.version = "0.12.2-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
@@ -1144,22 +1143,6 @@ local function FlagText(value)
     return "?"
 end
 
-local function HasCompleteRaidAchievementFlags(raid)
-    if type(raid) ~= "table" then
-        return false
-    end
-
-    local rk
-    for _, rk in ipairs(RAID_ACHIEVEMENT_KEYS) do
-        local v = raid[rk]
-        if v ~= true and v ~= false then
-            return false
-        end
-    end
-
-    return true
-end
-
 local function HasAnyKnownRaidAchievementFlags(raid)
     if type(raid) ~= "table" then
         return false
@@ -1174,20 +1157,6 @@ local function HasAnyKnownRaidAchievementFlags(raid)
     end
 
     return false
-end
-
-local function HasKnownSpecificAchievementFlags(flags)
-    if type(flags) ~= "table" then
-        return false
-    end
-
-    local frozenThrone10 = flags.icc10FrozenThrone
-    if frozenThrone10 == true or frozenThrone10 == false then
-        return true
-    end
-
-    local kingslayer = flags.icc10Kingslayer
-    return kingslayer == true or kingslayer == false
 end
 
 local function ResolveAchievementPointsSource(result)
@@ -3178,15 +3147,6 @@ function addon:SetLatestRequestState(key, status, reason)
     return req
 end
 
-function addon:InitBridgeInbox()
-    EnsureTable(RaidInspectorBridgeInbox, "schemaVersion", 1)
-    EnsureTable(RaidInspectorBridgeInbox, "generatedAt", 0)
-    EnsureTable(RaidInspectorBridgeInbox, "lastConsumedAt", 0)
-    EnsureTable(RaidInspectorBridgeInbox, "results", {})
-    EnsureTable(RaidInspectorBridgeInbox, "reportFiles", {})
-    EnsureTable(RaidInspectorBridgeInbox, "processedReportQueueIds", {})
-end
-
 function addon:GetCounts()
     local queued, ready, errorCount = 0, 0, 0
     local latestByKey = addon:GetLatestRequestMap()
@@ -3244,28 +3204,6 @@ function addon:GetFreshnessCounts(ttlSeconds)
     end
 
     return fresh, stale
-end
-
-function addon:GetBridgeInboxStats()
-    addon:InitBridgeInbox()
-    local count = 0
-    local _
-    for _ in pairs(RaidInspectorBridgeInbox.results) do
-        count = count + 1
-    end
-
-    local reportCount = 0
-    if type(RaidInspectorBridgeInbox.reportFiles) == "table" then
-        reportCount = #RaidInspectorBridgeInbox.reportFiles
-    end
-
-    return {
-        generatedAt = tonumber(RaidInspectorBridgeInbox.generatedAt) or 0,
-        lastConsumedAt = tonumber(RaidInspectorBridgeInbox.lastConsumedAt) or 0,
-        resultCount = count,
-        reportFileCount = reportCount,
-        lastImportedBridgeGeneratedAt = tonumber(RaidInspectorDB.meta.lastImportedBridgeGeneratedAt) or 0,
-    }
 end
 
 function addon:QueueInspect(name, realm, opts)
@@ -3635,290 +3573,6 @@ function addon:QueueTarget()
     else
         Print("target queued: " .. name .. "-" .. realm)
     end
-end
-
-function addon:ApplyBridgeResult(key, payload)
-    if type(payload) ~= "table" then
-        return false
-    end
-
-    local nameFromKey, realmFromKey = ParseKey(key)
-    local normalizedKey = string.lower(key)
-    local previous = RaidInspectorDB.results[normalizedKey]
-
-    local result = {}
-    result.name = payload.name or nameFromKey or "Unknown"
-    result.realm = payload.realm or realmFromKey or "Unknown"
-    result.class = payload.class
-    result.spec = payload.spec
-    result.guild = payload.guild
-    result.level = payload.level
-    result.items = CopyTable(payload.items or {})
-    result.enchants = CopyTable(payload.enchants or {})
-    result.gems = CopyTable(payload.gems or {})
-    result.gearScore = payload.gearScore
-    result.gearScoreSource = payload.gearScoreSource
-    result.estimatedGearScore = payload.estimatedGearScore
-    result.achievementPoints = payload.achievementPoints
-    result.achievementPointsSource = payload.achievementPointsSource or ((payload.achievementPoints ~= nil) and (payload.source or "bridge") or nil)
-    result.raidAchievements = CopyTable(payload.raidAchievements or {})
-    result.specificAchievements = CopyTable(payload.specificAchievements or {})
-    result.issuesCount = tonumber(payload.issuesCount) or 0
-    result.issueSummary = CopyTable(payload.issueSummary or {})
-    result.error = payload.error
-    result.source = payload.source or "bridge"
-    result.raw = CopyTable(payload.raw)
-    result.fetchedAt = tonumber(payload.fetchedAt) or GetNow()
-    result.updatedAt = tonumber(payload.updatedAt) or GetNow()
-
-    if type(previous) == "table" then
-        if (not result.spec or result.spec == "") and previous.spec and previous.spec ~= "" then
-            result.spec = previous.spec
-        end
-
-        if result.achievementPoints == nil and previous.achievementPoints ~= nil then
-            result.achievementPoints = previous.achievementPoints
-            result.achievementPointsSource = previous.achievementPointsSource
-        elseif (not result.achievementPointsSource or result.achievementPointsSource == "")
-            and previous.achievementPoints ~= nil and previous.achievementPointsSource then
-            result.achievementPointsSource = previous.achievementPointsSource
-        end
-
-        if type(result.raidAchievements) ~= "table" then
-            result.raidAchievements = {}
-        end
-
-        if type(result.specificAchievements) ~= "table" then
-            result.specificAchievements = {}
-        end
-
-        local hasKnownNew = false
-        local rk
-        for _, rk in ipairs(RAID_ACHIEVEMENT_KEYS) do
-            local v = result.raidAchievements[rk]
-            if v == true or v == false then
-                hasKnownNew = true
-                break
-            end
-        end
-
-        if type(previous.raidAchievements) == "table" then
-            if not hasKnownNew then
-                result.raidAchievements = CopyTable(previous.raidAchievements)
-            else
-                for _, rk in ipairs(RAID_ACHIEVEMENT_KEYS) do
-                    if result.raidAchievements[rk] == nil then
-                        local pv = previous.raidAchievements[rk]
-                        if pv == true or pv == false then
-                            result.raidAchievements[rk] = pv
-                        end
-                    end
-                end
-                if (not result.raidAchievements.source or result.raidAchievements.source == "")
-                    and previous.raidAchievements.source then
-                    result.raidAchievements.source = previous.raidAchievements.source
-                end
-            end
-        end
-
-        if type(previous.specificAchievements) == "table" and not HasKnownSpecificAchievementFlags(result.specificAchievements) then
-            result.specificAchievements = CopyTable(previous.specificAchievements)
-        end
-    end
-
-    RaidInspectorDB.results[normalizedKey] = result
-
-    local i
-    for i = 1, #RaidInspectorDB.requests do
-        local req = RaidInspectorDB.requests[i]
-        if req.key == normalizedKey then
-            req.status = result.error and "error" or "ready"
-            req.statusReason = result.error and (result.error or "bridge-error") or nil
-            req.updatedAt = GetNow()
-        end
-    end
-
-    addon:RefreshActiveRaidHistoryEntry()
-
-    return true
-end
-
-function addon:ApplyBridgeAchievementEnrichment(key, payload)
-    if type(payload) ~= "table" then
-        return false
-    end
-
-    local normalizedKey = string.lower(key or "")
-    local existing = RaidInspectorDB.results[normalizedKey]
-    if type(existing) ~= "table" then
-        return false
-    end
-
-    local payloadHasAP = payload.achievementPoints ~= nil
-    local payloadHasRaid = HasCompleteRaidAchievementFlags(payload.raidAchievements)
-    local payloadHasSpecific = HasKnownSpecificAchievementFlags(payload.specificAchievements)
-    if not payloadHasAP and not payloadHasRaid and not payloadHasSpecific then
-        return false
-    end
-
-    local existingHasAP = existing.achievementPoints ~= nil
-    local existingHasRaid = HasCompleteRaidAchievementFlags(existing.raidAchievements)
-    local existingHasSpecific = HasKnownSpecificAchievementFlags(existing.specificAchievements)
-    if existingHasAP and existingHasRaid and existingHasSpecific then
-        return false
-    end
-
-    local changed = false
-
-    if not existingHasAP and payload.achievementPoints ~= nil then
-        local apValue = tonumber(payload.achievementPoints)
-        existing.achievementPoints = apValue or payload.achievementPoints
-        existing.achievementPointsSource = payload.achievementPointsSource or payload.source or "bridge"
-        changed = true
-    end
-
-    if type(payload.raidAchievements) == "table" then
-        if type(existing.raidAchievements) ~= "table" then
-            existing.raidAchievements = {}
-        end
-
-        local rk
-        for _, rk in ipairs(RAID_ACHIEVEMENT_KEYS) do
-            if existing.raidAchievements[rk] == nil then
-                local v = payload.raidAchievements[rk]
-                if v == true or v == false then
-                    existing.raidAchievements[rk] = v
-                    changed = true
-                end
-            end
-        end
-
-        if (not existing.raidAchievements.source or existing.raidAchievements.source == "")
-            and payload.raidAchievements.source then
-            existing.raidAchievements.source = payload.raidAchievements.source
-            changed = true
-        end
-    end
-
-    if payloadHasSpecific and not existingHasSpecific then
-        if type(existing.specificAchievements) ~= "table" then
-            existing.specificAchievements = {}
-        end
-
-        local frozenThrone10 = payload.specificAchievements.icc10FrozenThrone
-        if frozenThrone10 ~= true and frozenThrone10 ~= false then
-            frozenThrone10 = payload.specificAchievements.icc10Kingslayer
-        end
-        if frozenThrone10 == true or frozenThrone10 == false then
-            existing.specificAchievements.icc10FrozenThrone = frozenThrone10
-            existing.specificAchievements.icc10Kingslayer = frozenThrone10
-            local matchedId = tonumber(payload.specificAchievements.frozenThrone10AchievementId)
-            if matchedId and matchedId > 0 then
-                existing.specificAchievements.frozenThrone10AchievementId = matchedId
-            end
-            changed = true
-        end
-
-        if (not existing.specificAchievements.source or existing.specificAchievements.source == "")
-            and payload.specificAchievements.source then
-            existing.specificAchievements.source = payload.specificAchievements.source
-            changed = true
-        end
-    end
-
-    if not changed then
-        return false
-    end
-
-    existing.updatedAt = GetNow()
-
-    local req = addon:GetLatestRequestForKey(normalizedKey)
-    if req then
-        req.status = "ready"
-        req.statusReason = nil
-        req.updatedAt = GetNow()
-    end
-
-    addon:RefreshActiveRaidHistoryEntry()
-
-    return true
-end
-
-function addon:ConsumeBridgeInbox(silent, force)
-    addon:InitBridgeInbox()
-
-    local hasResults = type(RaidInspectorBridgeInbox.results) == "table" and next(RaidInspectorBridgeInbox.results) ~= nil
-    local hasReportFiles = type(RaidInspectorBridgeInbox.reportFiles) == "table" and #RaidInspectorBridgeInbox.reportFiles > 0
-    local hasProcessedIds = type(RaidInspectorBridgeInbox.processedReportQueueIds) == "table" and #RaidInspectorBridgeInbox.processedReportQueueIds > 0
-    if not hasResults and not hasReportFiles and not hasProcessedIds then
-        return 0
-    end
-
-    local generatedAt = tonumber(RaidInspectorBridgeInbox.generatedAt) or 0
-    local lastImported = tonumber(RaidInspectorDB.meta.lastImportedBridgeGeneratedAt) or 0
-    local staleEnrichmentOnly = (not force and generatedAt > 0 and generatedAt <= lastImported)
-
-    local imported = 0
-    if hasResults then
-        local key
-        for key in pairs(RaidInspectorBridgeInbox.results) do
-            local payload = RaidInspectorBridgeInbox.results[key]
-            local normalizedKey = string.lower(key)
-            local applied = false
-
-            if staleEnrichmentOnly then
-                if type(RaidInspectorDB.results[normalizedKey]) == "table" then
-                    applied = addon:ApplyBridgeAchievementEnrichment(normalizedKey, payload)
-                else
-                    applied = addon:ApplyBridgeResult(normalizedKey, payload)
-                end
-            else
-                applied = addon:ApplyBridgeResult(normalizedKey, payload)
-            end
-
-            if applied then
-                imported = imported + 1
-            end
-        end
-    end
-
-    if staleEnrichmentOnly and imported == 0 and not hasReportFiles and not hasProcessedIds then
-        return 0
-    end
-
-    local reportFileCount = 0
-    if type(RaidInspectorBridgeInbox.reportFiles) == "table" then
-        reportFileCount = addon:ImportSavedReportFiles(RaidInspectorBridgeInbox.reportFiles, generatedAt)
-    end
-
-    local clearedQueueItems = addon:ClearProcessedReportQueueItems(RaidInspectorBridgeInbox.processedReportQueueIds)
-
-    RaidInspectorBridgeInbox.lastConsumedAt = GetNow()
-    if generatedAt > 0 then
-        RaidInspectorDB.meta.lastImportedBridgeGeneratedAt = generatedAt
-    else
-        RaidInspectorDB.meta.lastImportedBridgeGeneratedAt = GetNow()
-    end
-
-    if not silent then
-        local messageParts = {}
-        if imported > 0 then
-            messageParts[#messageParts + 1] = "results=" .. tostring(imported)
-        end
-        if reportFileCount > 0 then
-            messageParts[#messageParts + 1] = "savedReports=" .. tostring(reportFileCount)
-        end
-        if clearedQueueItems > 0 then
-            messageParts[#messageParts + 1] = "writtenReports=" .. tostring(clearedQueueItems)
-        end
-
-        if #messageParts > 0 then
-            Print("sync complete: " .. table.concat(messageParts, ", "))
-        end
-    end
-
-    addon:RefreshMainWindow()
-    return imported + reportFileCount + clearedQueueItems
 end
 
 function addon:GetOverviewEntries()

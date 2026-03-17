@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a release zip that contains RaidInspector and RaidInspectorBridge addons."""
+"""Build a release zip that contains the RaidInspector addon."""
 
 from __future__ import annotations
 
@@ -74,10 +74,9 @@ def main() -> int:
 
     addons_root = pathlib.Path(args.addons_root).resolve()
     raidinspector_dir = addons_root / "RaidInspector"
-    bridge_dir = addons_root / "RaidInspectorBridge"
 
-    if not raidinspector_dir.exists() or not bridge_dir.exists():
-        raise FileNotFoundError("Expected RaidInspector and RaidInspectorBridge under addons root")
+    if not raidinspector_dir.exists():
+        raise FileNotFoundError("Expected RaidInspector under addons root")
 
     version = args.version or read_version_from_toc(raidinspector_dir / "RaidInspector.toc")
     output_dir = pathlib.Path(args.output_dir).resolve() if args.output_dir else (addons_root / "RaidInspectorRelease")
@@ -88,7 +87,6 @@ def main() -> int:
     file_count = 0
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
         file_count += add_tree(zipf, raidinspector_dir, "RaidInspector")
-        file_count += add_tree(zipf, bridge_dir, "RaidInspectorBridge")
 
     print(f"Created: {archive_path}")
     print(f"Files packed: {file_count}")
