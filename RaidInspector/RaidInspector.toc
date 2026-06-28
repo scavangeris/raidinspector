@@ -2,7 +2,8 @@
 ## Title: Raid Inspector
 ## Notes: Raid gear and enchant inspector using in-game live inspect only.
 ## Author: Local Dev
-## Version: 0.12.2-alpha
+## Version: 0.12.9-alpha
+## OptionalDeps: AtlasLoot
 ## SavedVariables: RaidInspectorDB
 
 RaidInspector.lua

@@ -14,7 +14,6 @@ local INSPECT_THROTTLE_SECONDS = 2
 local INSPECT_TIMEOUT_SECONDS = 8
 local INSPECT_TALENT_MIN_WAIT_SECONDS = 1
 local INSPECT_TALENT_GRACE_SECONDS = 3
-local LFM_POST_DELAY_OPTIONS = { 10, 20, 30, 60 }
 local DEFAULT_LFM_POST_DELAY_SECONDS = 10
 local LFM_GENERAL_ALIASES = { "general" }
 local LFM_GLOBAL_ALIASES = { "global", "globalchat", "world", "worldchat" }
@@ -130,14 +129,25 @@ local LFM_NEED_GROUPS = {
         },
     },
 }
+local LFM_ROLE_ROWS = {
+    { key = "tank", label = "Tank" },
+    { key = "healer", label = "Healer" },
+    { key = "melee", label = "Melee" },
+    { key = "ranged", label = "Ranged" },
+}
+local DEFAULT_LFM_REPEAT_COUNT = 1
+local MIN_LFM_POST_DELAY_SECONDS = 1
+local MAX_LFM_POST_DELAY_SECONDS = 3600
+local MAX_LFM_REPEAT_COUNT = 99
+local MAX_LFM_ROLE_CLASSES_LENGTH = 60
 local REPORT_SNAPSHOT_LIMIT = 200
 local REPORT_FILE_QUEUE_LIMIT = 25
-local OVERVIEW_ROW_HEIGHT = 18
-local OVERVIEW_VISIBLE_ROWS = 12
+local OVERVIEW_ROW_HEIGHT = 20
+local OVERVIEW_VISIBLE_ROWS = 14
 local OVERVIEW_BOTTOM_INSET = 28
-local DETAIL_ROW_HEIGHT = 18
-local WINDOW_WIDTH = 1000
-local WINDOW_HEIGHT = 500
+local DETAIL_ROW_HEIGHT = 21
+local WINDOW_WIDTH = 1180
+local WINDOW_HEIGHT = 610
 local PANEL_SIDE_MARGIN = 24
 local RIGHT_PANEL_X = 474
 
@@ -146,12 +156,6 @@ local RAID_ACHIEVEMENT_KEYS = { "icc10", "icc25", "toc10", "toc25", "rs10", "rs2
 local SORT_MODES = { "recent", "gs", "issues", "name" }
 local FILTER_MODES = { "all", "snapshot", "ready", "queued", "issues" }
 local ITEM_LIST_FILTER_MODES = { "all", "issues", "missing-enchant", "missing-gems" }
-local BUTTON_MODES = { "advanced", "easy" }
-
-local BUTTON_MODE_LABELS = {
-    advanced = "Advanced",
-    easy = "Easy",
-}
 
 local MAIN_TAB_LABELS = {
     inspector = "Inspector",
@@ -1049,6 +1053,18 @@ local function EnsureLFMNeedDefaults(lfmState)
     end
 end
 
+local function EnsureLFMRoleDefaults(lfmState)
+    EnsureTable(lfmState, "roles", {})
+
+    local i
+    for i = 1, #LFM_ROLE_ROWS do
+        local roleKey = LFM_ROLE_ROWS[i].key
+        EnsureTable(lfmState.roles, roleKey, {})
+        EnsureTable(lfmState.roles[roleKey], "count", "")
+        EnsureTable(lfmState.roles[roleKey], "classes", "")
+    end
+end
+
 local function CopyTable(src)
     if type(src) ~= "table" then
         return src
@@ -1277,6 +1293,51 @@ local function GetSocketCountFromItemLink(link)
         end
     end
     return total
+end
+
+local resilienceScanTooltip
+
+-- PvP gear is identified by carrying a resilience rating. We try GetItemStats
+-- first (pattern-matching any RESILIENCE stat key, since the exact key can vary),
+-- then fall back to scanning a hidden tooltip for a resilience line.
+local function ItemLinkHasResilience(link)
+    if type(link) ~= "string" or link == "" then
+        return false
+    end
+
+    if GetItemStats then
+        local stats = GetItemStats(link)
+        if type(stats) == "table" then
+            local key, value
+            for key, value in pairs(stats) do
+                if type(key) == "string" and string.find(key, "RESILIENCE") and (tonumber(value) or 0) > 0 then
+                    return true
+                end
+            end
+        end
+    end
+
+    if not resilienceScanTooltip then
+        resilienceScanTooltip = CreateFrame("GameTooltip", "RaidInspectorResilienceScanTooltip", UIParent, "GameTooltipTemplate")
+    end
+
+    resilienceScanTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+    resilienceScanTooltip:ClearLines()
+    resilienceScanTooltip:SetHyperlink(link)
+
+    local lineCount = resilienceScanTooltip:NumLines() or 0
+    local i
+    for i = 1, lineCount do
+        local fontString = _G["RaidInspectorResilienceScanTooltipTextLeft" .. tostring(i)]
+        local text = fontString and fontString:GetText()
+        if text and string.find(string.lower(text), "resilience", 1, true) then
+            resilienceScanTooltip:Hide()
+            return true
+        end
+    end
+
+    resilienceScanTooltip:Hide()
+    return false
 end
 
 local function EstimateGearScoreLiteItem(item)
@@ -1514,6 +1575,7 @@ local function AnalyzeItemIssues(items)
     local itemsWithSockets = 0
     local totalSockets = 0
     local filledSockets = 0
+    local pvpItems = 0
     local i
 
     for i = 1, #items do
@@ -1536,6 +1598,10 @@ local function AnalyzeItemIssues(items)
                 missingGems = missingGems + (socketCount - gemCount)
             end
         end
+
+        if item.isPvp then
+            pvpItems = pvpItems + 1
+        end
     end
 
     return {
@@ -1546,6 +1612,7 @@ local function AnalyzeItemIssues(items)
         itemsWithSockets = itemsWithSockets,
         totalSockets = totalSockets,
         filledSockets = filledSockets,
+        pvpItems = pvpItems,
     }
 end
 
@@ -1590,15 +1657,30 @@ function addon:ProcessLFMPostQueue(force)
 
     if #addon.lfmPostQueue > 0 then
         addon.lfmPostNextAt = now + postDelaySeconds
-        Print("lfm: next channel post in " .. tostring(postDelaySeconds) .. "s (" .. tostring(#addon.lfmPostQueue) .. " remaining)")
+        Print("lfm: next post in " .. tostring(postDelaySeconds) .. "s (" .. tostring(#addon.lfmPostQueue) .. " remaining)")
     else
         addon.lfmPostNextAt = 0
         local selectedCount = tonumber(addon.lfmPostSelectedCount) or addon.lfmPostSentCount
-        Print("lfm: posted to " .. tostring(addon.lfmPostSentCount) .. "/" .. tostring(selectedCount) .. " selected channel(s)")
+        Print("lfm: posted " .. tostring(addon.lfmPostSentCount) .. "/" .. tostring(selectedCount) .. " queued post(s)")
     end
 
     addon:RefreshMainWindow()
     return true
+end
+
+function addon:CancelLFMPostQueue()
+    local pending = addon.lfmPostQueue and #addon.lfmPostQueue or 0
+    addon.lfmPostQueue = {}
+    addon.lfmPostNextAt = 0
+
+    if pending > 0 then
+        Print("lfm: cancelled " .. tostring(pending) .. " pending post(s)")
+    else
+        Print("lfm: no pending posts to cancel")
+    end
+
+    addon:RefreshMainWindow()
+    return pending
 end
 
 function addon:GetInspectLinkCount(unit)
@@ -1767,6 +1849,9 @@ function addon:BuildLocalInspectResult(unit, key, name, realm, inspectTalentsRea
                 slot = slotMap.slot,
                 name = itemName,
             }
+            if ItemLinkHasResilience(itemLink) then
+                item.isPvp = true
+            end
             if itemId then
                 item.itemId = itemId
             end
@@ -2028,10 +2113,13 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state.ui.lfm, "message", "")
     EnsureTable(RaidInspectorDB.state.ui.lfm, "channels", {})
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "yell", false)
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "guild", false)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "general", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "global", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm, "postDelaySeconds", DEFAULT_LFM_POST_DELAY_SECONDS)
+    EnsureTable(RaidInspectorDB.state.ui.lfm, "repeatCount", DEFAULT_LFM_REPEAT_COUNT)
     EnsureLFMNeedDefaults(RaidInspectorDB.state.ui.lfm)
+    EnsureLFMRoleDefaults(RaidInspectorDB.state.ui.lfm)
 
     EnsureTable(RaidInspectorDB, "requests", {})
     EnsureTable(RaidInspectorDB, "results", {})
@@ -2082,12 +2170,9 @@ function addon:GetItemListFilterMode()
 end
 
 function addon:GetButtonMode()
-    local mode = RaidInspectorDB.state.ui.buttonMode
-    if BUTTON_MODE_LABELS[mode] then
-        return mode
-    end
-    RaidInspectorDB.state.ui.buttonMode = "advanced"
-    return "advanced"
+    -- The Advanced/Easy selector was removed; the addon always uses the easy layout.
+    RaidInspectorDB.state.ui.buttonMode = "easy"
+    return "easy"
 end
 
 function addon:GetActiveTab()
@@ -2104,10 +2189,13 @@ function addon:GetLFMState()
     EnsureTable(RaidInspectorDB.state.ui.lfm, "message", "")
     EnsureTable(RaidInspectorDB.state.ui.lfm, "channels", {})
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "yell", false)
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "guild", false)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "general", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "global", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm, "postDelaySeconds", DEFAULT_LFM_POST_DELAY_SECONDS)
+    EnsureTable(RaidInspectorDB.state.ui.lfm, "repeatCount", DEFAULT_LFM_REPEAT_COUNT)
     EnsureLFMNeedDefaults(RaidInspectorDB.state.ui.lfm)
+    EnsureLFMRoleDefaults(RaidInspectorDB.state.ui.lfm)
     return RaidInspectorDB.state.ui.lfm
 end
 
@@ -2117,7 +2205,7 @@ function addon:GetLFMChannels()
 end
 
 function addon:SetLFMChannel(channel, enabled)
-    if channel ~= "yell" and channel ~= "general" and channel ~= "global" then
+    if channel ~= "yell" and channel ~= "guild" and channel ~= "general" and channel ~= "global" then
         return false
     end
 
@@ -2140,28 +2228,103 @@ end
 function addon:GetLFMPostDelaySeconds()
     local state = addon:GetLFMState()
     local value = tonumber(state.postDelaySeconds)
-    local i
-    for i = 1, #LFM_POST_DELAY_OPTIONS do
-        if value == LFM_POST_DELAY_OPTIONS[i] then
-            return value
-        end
+    if not value then
+        state.postDelaySeconds = DEFAULT_LFM_POST_DELAY_SECONDS
+        return DEFAULT_LFM_POST_DELAY_SECONDS
     end
 
-    state.postDelaySeconds = DEFAULT_LFM_POST_DELAY_SECONDS
-    return DEFAULT_LFM_POST_DELAY_SECONDS
+    value = math.floor(value)
+    if value < MIN_LFM_POST_DELAY_SECONDS then
+        value = MIN_LFM_POST_DELAY_SECONDS
+    elseif value > MAX_LFM_POST_DELAY_SECONDS then
+        value = MAX_LFM_POST_DELAY_SECONDS
+    end
+    return value
 end
 
 function addon:SetLFMPostDelaySeconds(seconds)
     local value = tonumber(seconds)
-    local i
-    for i = 1, #LFM_POST_DELAY_OPTIONS do
-        if value == LFM_POST_DELAY_OPTIONS[i] then
-            local state = addon:GetLFMState()
-            state.postDelaySeconds = value
-            return true
-        end
+    if not value then
+        return false
     end
-    return false
+
+    value = math.floor(value)
+    if value < MIN_LFM_POST_DELAY_SECONDS then
+        value = MIN_LFM_POST_DELAY_SECONDS
+    elseif value > MAX_LFM_POST_DELAY_SECONDS then
+        value = MAX_LFM_POST_DELAY_SECONDS
+    end
+
+    local state = addon:GetLFMState()
+    state.postDelaySeconds = value
+    return true
+end
+
+function addon:GetLFMRepeatCount()
+    local state = addon:GetLFMState()
+    local value = tonumber(state.repeatCount)
+    if not value then
+        state.repeatCount = DEFAULT_LFM_REPEAT_COUNT
+        return DEFAULT_LFM_REPEAT_COUNT
+    end
+
+    value = math.floor(value)
+    if value < 1 then
+        value = 1
+    elseif value > MAX_LFM_REPEAT_COUNT then
+        value = MAX_LFM_REPEAT_COUNT
+    end
+    return value
+end
+
+function addon:SetLFMRepeatCount(count)
+    local value = tonumber(count)
+    if not value then
+        return false
+    end
+
+    value = math.floor(value)
+    if value < 1 then
+        value = 1
+    elseif value > MAX_LFM_REPEAT_COUNT then
+        value = MAX_LFM_REPEAT_COUNT
+    end
+
+    local state = addon:GetLFMState()
+    state.repeatCount = value
+    return true
+end
+
+function addon:GetLFMRoleState()
+    local state = addon:GetLFMState()
+    EnsureLFMRoleDefaults(state)
+    return state.roles
+end
+
+function addon:SetLFMRoleCount(roleKey, value)
+    local roles = addon:GetLFMRoleState()
+    if not roles[roleKey] then
+        return false
+    end
+
+    -- Keep only digits so the suffix stays clean (e.g. "1", "10").
+    local digits = string.gsub(tostring(value or ""), "%D", "")
+    roles[roleKey].count = digits
+    return true
+end
+
+function addon:SetLFMRoleClasses(roleKey, value)
+    local roles = addon:GetLFMRoleState()
+    if not roles[roleKey] then
+        return false
+    end
+
+    local text = Trim(tostring(value or ""))
+    if #text > MAX_LFM_ROLE_CLASSES_LENGTH then
+        text = string.sub(text, 1, MAX_LFM_ROLE_CLASSES_LENGTH)
+    end
+    roles[roleKey].classes = text
+    return true
 end
 
 function addon:GetLFMNeedState()
@@ -2200,28 +2363,27 @@ function addon:SetLFMNeedItem(itemKey, enabled)
 end
 
 function addon:BuildLFMNeedSuffix()
-    local needs = addon:GetLFMNeedState()
+    local roles = addon:GetLFMRoleState()
     local out = {}
 
     local i
-    for i = 1, #LFM_NEED_GROUPS do
-        local group = LFM_NEED_GROUPS[i]
-        local selectedSpecs = {}
+    for i = 1, #LFM_ROLE_ROWS do
+        local row = LFM_ROLE_ROWS[i]
+        local data = roles[row.key] or {}
+        local count = Trim(tostring(data.count or ""))
+        local classes = Trim(tostring(data.classes or ""))
 
-        local j
-        for j = 1, #group.items do
-            local item = group.items[j]
-            if needs.items[item.key] == true then
-                selectedSpecs[#selectedSpecs + 1] = tostring(item.output or item.label)
+        if count ~= "" or classes ~= "" then
+            local segment
+            if count ~= "" then
+                segment = count .. " " .. row.label
+            else
+                segment = row.label
             end
-        end
-
-        if #selectedSpecs > 0 then
-            for j = 1, #selectedSpecs do
-                out[#out + 1] = selectedSpecs[j]
+            if classes ~= "" then
+                segment = segment .. " (" .. classes .. ")"
             end
-        elseif needs.groups[group.key] == true then
-            out[#out + 1] = tostring(group.output or group.label)
+            out[#out + 1] = segment
         end
     end
 
@@ -2234,6 +2396,7 @@ function addon:GetLFMChannelAvailability()
 
     return {
         yell = true,
+        guild = IsInGuild() and true or false,
         general = generalId and true or false,
         global = globalId and true or false,
         generalId = generalId,
@@ -2248,11 +2411,12 @@ function addon:GetExportChannels()
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "raid", true)
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "say", false)
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "whisper", false)
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "guild", false)
     return RaidInspectorDB.state.ui.exportChannels
 end
 
 function addon:SetExportChannel(channel, enabled)
-    if channel ~= "raid" and channel ~= "say" and channel ~= "whisper" then
+    if channel ~= "raid" and channel ~= "say" and channel ~= "whisper" and channel ~= "guild" then
         return false
     end
 
@@ -2281,25 +2445,21 @@ function addon:RefreshTabVisibility()
     end
 
     local inspectorWidgets = {
-        addon.ui.modeDropDown,
         addon.ui.shareChannelsRow,
         addon.ui.shareChannelsLabel,
         addon.ui.raidShareCheck,
         addon.ui.sayShareCheck,
         addon.ui.whisperShareCheck,
+        addon.ui.guildShareCheck,
         addon.ui.savedReportsRow,
         addon.ui.savedReportsLabel,
         addon.ui.savedReportDropDown,
         addon.ui.actionPanel,
         addon.ui.sortButton,
-        addon.ui.filterButton,
         addon.ui.targetButton,
         addon.ui.raidButton,
         addon.ui.syncButton,
-        addon.ui.forceSyncButton,
         addon.ui.reportButton,
-        addon.ui.staleButton,
-        addon.ui.statusButton,
         addon.ui.clearButton,
         addon.ui.rowsViewport,
         addon.ui.overviewScroll,
@@ -3064,19 +3224,6 @@ function addon:FindSavedReport(arg)
     return nil, "saved report not found: " .. target
 end
 
-function addon:SetButtonMode(mode)
-    if not BUTTON_MODE_LABELS[mode] then
-        return false
-    end
-
-    RaidInspectorDB.state.ui.buttonMode = mode
-    if addon.ApplyButtonModeLayout then
-        addon:ApplyButtonModeLayout()
-    end
-    addon:RefreshMainWindow()
-    return true
-end
-
 function addon:SetItemListFilterMode(mode)
     if not ITEM_LIST_FILTER_LABELS[mode] then
         return false
@@ -3759,7 +3906,7 @@ function addon:BuildOverviewRows(container, rowCount)
         row:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -(i - 1) * OVERVIEW_ROW_HEIGHT)
         row:SetFrameStrata("DIALOG")
         row:SetFrameLevel(parentLevel + 10)
-        row:RegisterForClicks("LeftButtonUp")
+        row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
         row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight")
 
         local text = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -3768,6 +3915,12 @@ function addon:BuildOverviewRows(container, rowCount)
         text:SetHeight(OVERVIEW_ROW_HEIGHT)
         text:SetJustifyH("LEFT")
         text:SetJustifyV("MIDDLE")
+        if text.GetFont and text.SetFont then
+            local fontName, fontHeight, fontFlags = text:GetFont()
+            if fontName and fontHeight then
+                text:SetFont(fontName, fontHeight + 1, fontFlags)
+            end
+        end
         text:SetText("")
         text:Show()
 
@@ -3809,7 +3962,17 @@ function addon:BuildOverviewRows(container, rowCount)
         row.refreshButton = refreshButton
         row.removeButton = removeButton
         row.key = nil
-        row:SetScript("OnClick", function(self)
+        row.playerName = nil
+        row:SetScript("OnClick", function(self, button)
+            if button == "RightButton" then
+                SafeInvoke("row-copy", function()
+                    local value, label = addon:GetOverviewRowCopyValue(self)
+                    if value then
+                        addon:ShowCopyDialog(value, label)
+                    end
+                end)
+                return
+            end
             if self.key then
                 addon:SetSelectedKey(self.key)
                 addon:RefreshMainWindow()
@@ -3838,10 +4001,18 @@ function addon:BuildDetailRows(container, rowCount)
         text:SetHeight(DETAIL_ROW_HEIGHT)
         text:SetJustifyH("LEFT")
         text:SetJustifyV("MIDDLE")
+        -- Slightly larger font for the gear list so lines read with better spacing.
+        if text.GetFont and text.SetFont then
+            local fontName, fontHeight, fontFlags = text:GetFont()
+            if fontName and fontHeight then
+                text:SetFont(fontName, fontHeight + 1, fontFlags)
+            end
+        end
         text:SetText("")
 
         row.text = text
         row.data = nil
+        row:RegisterForClicks("RightButtonUp")
         row:SetScript("OnEnter", function(self)
             addon:ShowDetailRowTooltip(self)
         end)
@@ -3849,6 +4020,29 @@ function addon:BuildDetailRows(container, rowCount)
             if GameTooltip then
                 GameTooltip:Hide()
             end
+        end)
+        row:SetScript("OnClick", function(self, button)
+            if button ~= "RightButton" then
+                return
+            end
+            -- Shift+right-click copies the value; plain right-click opens AtlasLoot.
+            if IsShiftKeyDown() then
+                SafeInvoke("detail-copy", function()
+                    local value, label = addon:GetDetailRowCopyValue(self)
+                    if value then
+                        addon:ShowCopyDialog(value, label)
+                    end
+                end)
+                return
+            end
+            SafeInvoke("detail-atlasloot", function()
+                if not addon:OpenItemInAtlasLoot(self) then
+                    local value, label = addon:GetDetailRowCopyValue(self)
+                    if value then
+                        addon:ShowCopyDialog(value, label)
+                    end
+                end
+            end)
         end)
 
         container.rows[i] = row
@@ -3866,7 +4060,6 @@ function addon:ApplyButtonModeLayout()
     local ACTION_BUTTON_SPACING_Y = 6
     local ACTION_BUTTON_COLUMNS = 3
 
-    local mode = addon:GetButtonMode()
     local buttons = {
         sort = addon.ui.sortButton,
         filter = addon.ui.filterButton,
@@ -3880,24 +4073,22 @@ function addon:ApplyButtonModeLayout()
         clear = addon.ui.clearButton,
     }
 
+    -- Filter, Status, Stale/Refresh, and Save One were removed from the window;
+    -- their slash commands (/ri filter, /ri status, /ri refreshstale, /ri savereport) still work.
     local visible = {
         sort = true,
-        filter = true,
+        filter = false,
         target = true,
         raid = true,
         sync = true,
-        force = true,
+        force = false,
         report = true,
-        stale = true,
-        status = true,
+        stale = false,
+        status = false,
         clear = true,
     }
 
-    local order = { "sort", "filter", "target", "raid", "sync", "force", "report", "stale", "status", "clear" }
-    if mode == "easy" then
-        visible.stale = false
-        order = { "sort", "filter", "target", "raid", "sync", "force", "report", "status", "clear" }
-    end
+    local order = { "sort", "target", "raid", "sync", "report", "clear" }
 
     local key, button
     for key, button in pairs(buttons) do
@@ -3907,14 +4098,6 @@ function addon:ApplyButtonModeLayout()
             else
                 button:Hide()
             end
-        end
-    end
-
-    if buttons.status then
-        if mode == "easy" then
-            buttons.status:SetText("|cffffaa33Display|r")
-        else
-            buttons.status:SetText("|cffffaa33Status|r")
         end
     end
 
@@ -4038,6 +4221,314 @@ function addon:ShowDetailRowTooltip(row)
     GameTooltip:Show()
 end
 
+-- Pops a small dialog containing a pre-selected, focused EditBox so the player
+-- can press Ctrl+C to copy the value to the OS clipboard (3.3.5a has no direct
+-- clipboard API, so an EditBox is the standard copy mechanism).
+function addon:ShowCopyDialog(text, label)
+    text = SafeText(text)
+    if text == "" or text == "?" then
+        return
+    end
+
+    addon.ui = addon.ui or {}
+    local dialog = addon.ui.copyDialog
+
+    if not dialog then
+        dialog = CreateFrame("Frame", "RaidInspectorCopyDialog", UIParent)
+        dialog:SetWidth(360)
+        dialog:SetHeight(108)
+        dialog:SetPoint("CENTER", UIParent, "CENTER", 0, 140)
+        dialog:SetFrameStrata("FULLSCREEN_DIALOG")
+        dialog:SetToplevel(true)
+        dialog:EnableMouse(true)
+        dialog:SetMovable(true)
+        dialog:RegisterForDrag("LeftButton")
+        dialog:SetScript("OnDragStart", function(self)
+            self:StartMoving()
+        end)
+        dialog:SetScript("OnDragStop", function(self)
+            self:StopMovingOrSizing()
+        end)
+        dialog:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true,
+            tileSize = 16,
+            edgeSize = 16,
+            insets = { left = 5, right = 5, top = 5, bottom = 5 },
+        })
+        if dialog.SetBackdropColor then
+            dialog:SetBackdropColor(0.02, 0.02, 0.02, 0.96)
+        end
+        if dialog.SetBackdropBorderColor then
+            dialog:SetBackdropBorderColor(0.85, 0.72, 0.18, 1)
+        end
+
+        local title = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        title:SetPoint("TOPLEFT", dialog, "TOPLEFT", 16, -14)
+        title:SetPoint("TOPRIGHT", dialog, "TOPRIGHT", -16, -14)
+        title:SetJustifyH("LEFT")
+        dialog.title = title
+
+        local editBox = CreateFrame("EditBox", "RaidInspectorCopyDialogEditBox", dialog, "InputBoxTemplate")
+        editBox:SetPoint("TOPLEFT", dialog, "TOPLEFT", 20, -38)
+        editBox:SetPoint("TOPRIGHT", dialog, "TOPRIGHT", -20, -38)
+        editBox:SetHeight(20)
+        editBox:SetAutoFocus(false)
+        editBox:SetScript("OnEscapePressed", function(self)
+            self:ClearFocus()
+            dialog:Hide()
+        end)
+        editBox:SetScript("OnEnterPressed", function(self)
+            self:HighlightText()
+        end)
+        editBox:SetScript("OnEditFocusGained", function(self)
+            self:HighlightText()
+        end)
+        editBox:SetScript("OnTextChanged", function(self)
+            if self.settingText then
+                return
+            end
+            self.settingText = true
+            self:SetText(self.copyText or "")
+            self.settingText = false
+            self:HighlightText()
+        end)
+        dialog.editBox = editBox
+
+        local hint = dialog:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        hint:SetPoint("TOPLEFT", editBox, "BOTTOMLEFT", 0, -10)
+        hint:SetText("Press Ctrl+C to copy, then Esc to close.")
+        dialog.hint = hint
+
+        local closeButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+        closeButton:SetWidth(72)
+        closeButton:SetHeight(20)
+        closeButton:SetPoint("BOTTOMRIGHT", dialog, "BOTTOMRIGHT", -16, 12)
+        closeButton:SetText("Close")
+        closeButton:SetScript("OnClick", function()
+            dialog.editBox:ClearFocus()
+            dialog:Hide()
+        end)
+        dialog.closeButton = closeButton
+
+        addon.ui.copyDialog = dialog
+    end
+
+    dialog.title:SetText((label and label ~= "" and label) or "Copy value")
+
+    local editBox = dialog.editBox
+    editBox.copyText = text
+    editBox.settingText = true
+    editBox:SetText(text)
+    editBox.settingText = false
+
+    dialog:Show()
+    editBox:SetFocus()
+    editBox:SetCursorPosition(0)
+    editBox:HighlightText()
+end
+
+-- Resolves the copyable value + dialog label for a player overview row.
+function addon:GetOverviewRowCopyValue(row)
+    if not row then
+        return nil
+    end
+
+    local name = row.playerName
+    if name and name ~= "" then
+        return name, "Player name"
+    end
+
+    -- Fall back to the row key ("name-realm"); recover the name portion.
+    local key = row.key
+    if type(key) == "string" and key ~= "" then
+        local dash = string.find(key, "-", 1, true)
+        local fromKey = dash and string.sub(key, 1, dash - 1) or key
+        if fromKey ~= "" then
+            return fromKey, "Player name"
+        end
+    end
+
+    return nil
+end
+
+-- Resolves the best-known item name for a gear detail row (cached scan name
+-- first, falling back to a live GetItemInfo lookup from the rebuilt link).
+local function GetDetailRowItemName(row)
+    if not row or type(row.data) ~= "table" then
+        return nil
+    end
+
+    local item = row.data.item
+    if type(item) ~= "table" then
+        return nil
+    end
+
+    if item.name and item.name ~= "" then
+        return item.name
+    end
+
+    local linkBody = BuildInspectItemHyperlink(item)
+    if linkBody then
+        local itemName = GetItemInfo(linkBody)
+        if itemName and itemName ~= "" then
+            return itemName
+        end
+    end
+
+    return nil
+end
+
+-- Opens the given gear detail row's item inside AtlasLoot (search view).
+-- Returns true on success; false if AtlasLoot or the item name is unavailable
+-- so the caller can fall back to the copy dialog.
+function addon:OpenItemInAtlasLoot(row)
+    local itemName = GetDetailRowItemName(row)
+    if not itemName then
+        return false
+    end
+
+    if type(AtlasLoot) ~= "table"
+        or type(AtlasLoot.Search) ~= "function"
+        or type(AtlasLoot.ShowSearchResult) ~= "function" then
+        Print("atlasloot: AtlasLoot not detected (copying item name instead)")
+        return false
+    end
+
+    if AtlasLootDefaultFrame and AtlasLootDefaultFrame.Show then
+        AtlasLootDefaultFrame:Show()
+    end
+
+    AtlasLoot:Search(itemName)
+    AtlasLoot:ShowSearchResult()
+    Print("atlasloot: searching for '" .. itemName .. "'")
+    return true
+end
+
+-- Resolves the copyable value + dialog label for a gear/item detail row.
+function addon:GetDetailRowCopyValue(row)
+    if not row or type(row.data) ~= "table" then
+        return nil
+    end
+
+    local data = row.data
+    local item = data.item
+
+    if type(item) == "table" then
+        if item.name and item.name ~= "" then
+            return item.name, "Item name"
+        end
+
+        local linkBody = BuildInspectItemHyperlink(item)
+        if linkBody then
+            local itemName = GetItemInfo(linkBody)
+            if itemName and itemName ~= "" then
+                return itemName, "Item name"
+            end
+            return linkBody, "Item link"
+        end
+    end
+
+    return nil
+end
+
+-- Movable help dialog that explains what the buttons / mouse actions do.
+function addon:ShowInfoDialog()
+    addon.ui = addon.ui or {}
+    local dialog = addon.ui.infoDialog
+
+    if not dialog then
+        dialog = CreateFrame("Frame", "RaidInspectorInfoDialog", UIParent)
+        dialog:SetWidth(560)
+        dialog:SetHeight(600)
+        dialog:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+        dialog:SetFrameStrata("FULLSCREEN_DIALOG")
+        dialog:SetToplevel(true)
+        dialog:EnableMouse(true)
+        dialog:SetMovable(true)
+        dialog:RegisterForDrag("LeftButton")
+        dialog:SetScript("OnDragStart", function(self)
+            self:StartMoving()
+        end)
+        dialog:SetScript("OnDragStop", function(self)
+            self:StopMovingOrSizing()
+        end)
+        dialog:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true,
+            tileSize = 16,
+            edgeSize = 16,
+            insets = { left = 5, right = 5, top = 5, bottom = 5 },
+        })
+        if dialog.SetBackdropColor then
+            dialog:SetBackdropColor(0.02, 0.02, 0.02, 0.96)
+        end
+        if dialog.SetBackdropBorderColor then
+            dialog:SetBackdropBorderColor(0.85, 0.72, 0.18, 1)
+        end
+
+        local title = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        title:SetPoint("TOPLEFT", dialog, "TOPLEFT", 16, -14)
+        title:SetText("Raid Inspector - Help")
+
+        local body = dialog:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        body:SetPoint("TOPLEFT", dialog, "TOPLEFT", 18, -44)
+        body:SetPoint("TOPRIGHT", dialog, "TOPRIGHT", -18, -44)
+        body:SetJustifyH("LEFT")
+        body:SetJustifyV("TOP")
+        body:SetText(table.concat({
+            "|cffffd100Tabs|r",
+            "Inspector - raid gear/enchant overview + selected player details.",
+            "LFM - compose and post a \"looking for more\" message.",
+            " ",
+            "|cffffd100Inspector buttons|r",
+            "S:<mode> - click to cycle the list sort (recent / gs / issues / name).",
+            "Target - inspect your current target and add them to the list.",
+            "Raid - inspect everyone in your party/raid.",
+            "Share - send a short summary of the selected player to the ticked Share channels.",
+            "Save All - save a full report of the current overview into the addon.",
+            "Clear - clear the queue and results (asks to confirm).",
+            " ",
+            "|cffffd100Share / Reports|r",
+            "Share checkboxes (Raid / Say / Whisper / Guild) choose where Share sends.",
+            "Reports dropdown - view the live overview or a previously saved report.",
+            "Item List dropdown - filter which gear slots are listed.",
+            " ",
+            "|cffffd100Mouse|r",
+            "Left-click a player row - select that player.",
+            "Right-click a player row - copy their name.",
+            "Right-click a gear row - open the item in AtlasLoot.",
+            "Shift+right-click a gear row - copy the item value.",
+            " ",
+            "|cffffd100LFM tab|r",
+            "Pick channels, set Delay (s) and Repeat, fill the Need table",
+            "(Tank/Healer/Melee/Ranged with a count + classes), then press POST.",
+            "Cancel stops any pending posts.",
+            " ",
+            "|cffffd100Chat commands|r",
+            "/ri - open this window.   /ri help - list every command.",
+        }, "\n"))
+
+        local closeButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+        closeButton:SetWidth(90)
+        closeButton:SetHeight(22)
+        closeButton:SetPoint("BOTTOM", dialog, "BOTTOM", 0, 14)
+        closeButton:SetText("Close")
+        closeButton:SetScript("OnClick", function()
+            dialog:Hide()
+        end)
+
+        addon.ui.infoDialog = dialog
+    end
+
+    dialog:Show()
+    if dialog.Raise then
+        dialog:Raise()
+    end
+end
+
 function addon:CreateMainWindow()
     if addon.ui and addon.ui.frame then
         return
@@ -4090,35 +4581,6 @@ function addon:CreateMainWindow()
     title:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -14)
     title:SetText("Raid Inspector")
 
-    local modeDropDown = CreateFrame("Frame", "RaidInspectorButtonModeDropDown", f, "UIDropDownMenuTemplate")
-    modeDropDown:SetPoint("LEFT", title, "RIGHT", 18, -2)
-    UIDropDownMenu_SetWidth(modeDropDown, 120)
-    UIDropDownMenu_JustifyText(modeDropDown, "LEFT")
-    UIDropDownMenu_Initialize(modeDropDown, function(_, level)
-        if level ~= 1 then
-            return
-        end
-
-        local i
-        for i = 1, #BUTTON_MODES do
-            local mode = BUTTON_MODES[i]
-            local info = UIDropDownMenu_CreateInfo()
-            info.text = BUTTON_MODE_LABELS[mode] or mode
-            info.value = mode
-            info.checked = (addon:GetButtonMode() == mode)
-            info.func = function(btn)
-                local selectedMode = btn.value
-                addon:SetButtonMode(selectedMode)
-                UIDropDownMenu_SetSelectedValue(modeDropDown, selectedMode)
-                UIDropDownMenu_SetText(modeDropDown, BUTTON_MODE_LABELS[selectedMode] or selectedMode)
-            end
-            UIDropDownMenu_AddButton(info, level)
-        end
-    end)
-    local selectedButtonMode = addon:GetButtonMode()
-    UIDropDownMenu_SetSelectedValue(modeDropDown, selectedButtonMode)
-    UIDropDownMenu_SetText(modeDropDown, BUTTON_MODE_LABELS[selectedButtonMode] or selectedButtonMode)
-
     local subtitle = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -4)
     subtitle:SetText("Raid overview + selected player details")
@@ -4147,13 +4609,27 @@ function addon:CreateMainWindow()
         end)
     end)
 
+    local infoButton = CreateFrame("Button", "RaidInspectorInfoButton", f, "UIPanelButtonTemplate")
+    infoButton:SetWidth(80)
+    infoButton:SetHeight(20)
+    infoButton:SetPoint("LEFT", lfmTabButton, "RIGHT", 12, 0)
+    infoButton:SetText("|cffffd100? Info|r")
+    infoButton:SetScript("OnClick", function()
+        SafeInvoke("info", function()
+            addon:ShowInfoDialog()
+        end)
+    end)
+
     local closeButton = CreateFrame("Button", "RaidInspectorCloseButton", f, "UIPanelCloseButton")
     closeButton:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6, -6)
 
     local statusText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    statusText:SetPoint("TOPLEFT", inspectorTabButton, "BOTTOMLEFT", 0, -8)
+    statusText:SetPoint("TOPLEFT", inspectorTabButton, "BOTTOMLEFT", 0, -4)
     statusText:SetJustifyH("LEFT")
     statusText:SetWidth(WINDOW_WIDTH - (PANEL_SIDE_MARGIN * 2))
+    -- Fixed (small) height keeps the rows below stable whether this line is blank
+    -- (live overview) or shows saved-report / LFM text, while keeping the gap tight.
+    statusText:SetHeight(14)
     statusText:SetText("")
 
     local function SetActionButtonLabel(button, colorCode, plainText)
@@ -4170,7 +4646,7 @@ function addon:CreateMainWindow()
     end
 
     local shareChannelsRow = CreateFrame("Frame", nil, f)
-    shareChannelsRow:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -8)
+    shareChannelsRow:SetPoint("TOPLEFT", statusText, "BOTTOMLEFT", 0, -4)
     shareChannelsRow:SetWidth(420)
     shareChannelsRow:SetHeight(20)
 
@@ -4200,6 +4676,14 @@ function addon:CreateMainWindow()
     _G[whisperShareCheck:GetName() .. "Text"]:SetText("Whisper")
     whisperShareCheck:SetScript("OnClick", function(self)
         addon:SetExportChannel("whisper", self:GetChecked() and true or false)
+    end)
+
+    local guildShareCheck = CreateFrame("CheckButton", "RaidInspectorShareGuildCheck", f, "UICheckButtonTemplate")
+    guildShareCheck:SetPoint("LEFT", whisperShareCheck, "RIGHT", 58, 0)
+    guildShareCheck:SetHitRectInsets(0, -30, 0, 0)
+    _G[guildShareCheck:GetName() .. "Text"]:SetText("Guild")
+    guildShareCheck:SetScript("OnClick", function(self)
+        addon:SetExportChannel("guild", self:GetChecked() and true or false)
     end)
 
     local savedReportsRow = CreateFrame("Frame", nil, f)
@@ -4330,7 +4814,7 @@ function addon:CreateMainWindow()
     forceSyncButton:SetWidth(100)
     forceSyncButton:SetHeight(20)
     forceSyncButton:SetPoint("LEFT", syncButton, "RIGHT", 6, 0)
-    SetActionButtonLabel(forceSyncButton, "ff66ff66", "Save")
+    SetActionButtonLabel(forceSyncButton, "ff66ff66", "Save One")
     forceSyncButton:SetScript("OnClick", function()
         SafeInvoke("savereport", function()
             addon:SaveReportSnapshot("")
@@ -4342,7 +4826,7 @@ function addon:CreateMainWindow()
     reportButton:SetWidth(100)
     reportButton:SetHeight(20)
     reportButton:SetPoint("TOPLEFT", syncButton, "BOTTOMLEFT", 0, -6)
-    SetActionButtonLabel(reportButton, "ff66ff66", "Report")
+    SetActionButtonLabel(reportButton, "ff66ff66", "Save All")
     reportButton:SetScript("OnClick", function()
         SafeInvoke("report", function()
             addon:QueueDetailedReport()
@@ -4507,11 +4991,11 @@ function addon:CreateMainWindow()
     local detailContainer = CreateFrame("Frame", nil, f)
     detailContainer:SetPoint("TOPLEFT", itemFilterLabel, "BOTTOMLEFT", 0, -10)
     detailContainer:SetWidth(rightPanelWidth)
-    detailContainer:SetHeight(250)
+    detailContainer:SetHeight(340)
     if detailContainer.SetClipsChildren then
         detailContainer:SetClipsChildren(true)
     end
-    addon:BuildDetailRows(detailContainer, 13)
+    addon:BuildDetailRows(detailContainer, 16)
 
     local detailScroll = CreateFrame("ScrollFrame", "RaidInspectorDetailScroll", detailContainer, "FauxScrollFrameTemplate")
     detailScroll:SetPoint("TOPLEFT", detailContainer, "TOPRIGHT", 0, -1)
@@ -4563,7 +5047,20 @@ function addon:CreateMainWindow()
     lfmMessageBox:SetScript("OnEnterPressed", function(self)
         SafeInvoke("lfm-post-enter", function()
             addon:SetLFMMessage(self:GetText() or "")
+            addon:CommitLFMInputsFromUI()
             addon:PostLFMMessage()
+        end)
+    end)
+
+    local lfmMessageClearButton = CreateFrame("Button", "RaidInspectorLFMMessageClearButton", lfmPanel, "UIPanelButtonTemplate")
+    lfmMessageClearButton:SetWidth(24)
+    lfmMessageClearButton:SetHeight(22)
+    lfmMessageClearButton:SetPoint("LEFT", lfmMessageBox, "RIGHT", 10, 0)
+    lfmMessageClearButton:SetText("X")
+    lfmMessageClearButton:SetScript("OnClick", function()
+        SafeInvoke("lfm-message-clear", function()
+            lfmMessageBox:SetText("")
+            addon:SetLFMMessage("")
         end)
     end)
 
@@ -4571,7 +5068,7 @@ function addon:CreateMainWindow()
     lfmHint:SetPoint("TOPLEFT", lfmMessageBox, "BOTTOMLEFT", 2, -6)
     lfmHint:SetWidth(820)
     lfmHint:SetJustifyH("LEFT")
-    lfmHint:SetText("Write your post, link an achievement in any chat window, copy that link here, select channels + delay, then use POST.")
+    lfmHint:SetText("Write your post (paste an achievement link if you want), pick channels, set delay/repeat, fill the Need table, then press POST. Use Cancel to stop pending posts.")
 
     local lfmChannelsLabel = lfmPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     lfmChannelsLabel:SetPoint("TOPLEFT", lfmHint, "BOTTOMLEFT", -2, -10)
@@ -4585,8 +5082,16 @@ function addon:CreateMainWindow()
         addon:SetLFMChannel("yell", self:GetChecked() and true or false)
     end)
 
+    local lfmGuildCheck = CreateFrame("CheckButton", "RaidInspectorLFMGuildCheck", lfmPanel, "UICheckButtonTemplate")
+    lfmGuildCheck:SetPoint("LEFT", lfmYellCheck, "RIGHT", 40, 0)
+    lfmGuildCheck:SetHitRectInsets(0, -24, 0, 0)
+    _G[lfmGuildCheck:GetName() .. "Text"]:SetText("/guild")
+    lfmGuildCheck:SetScript("OnClick", function(self)
+        addon:SetLFMChannel("guild", self:GetChecked() and true or false)
+    end)
+
     local lfmGeneralCheck = CreateFrame("CheckButton", "RaidInspectorLFMGeneralCheck", lfmPanel, "UICheckButtonTemplate")
-    lfmGeneralCheck:SetPoint("LEFT", lfmYellCheck, "RIGHT", 34, 0)
+    lfmGeneralCheck:SetPoint("LEFT", lfmGuildCheck, "RIGHT", 54, 0)
     lfmGeneralCheck:SetHitRectInsets(0, -24, 0, 0)
     _G[lfmGeneralCheck:GetName() .. "Text"]:SetText("/general")
     lfmGeneralCheck:SetScript("OnClick", function(self)
@@ -4594,7 +5099,7 @@ function addon:CreateMainWindow()
     end)
 
     local lfmGlobalCheck = CreateFrame("CheckButton", "RaidInspectorLFMGlobalCheck", lfmPanel, "UICheckButtonTemplate")
-    lfmGlobalCheck:SetPoint("LEFT", lfmGeneralCheck, "RIGHT", 44, 0)
+    lfmGlobalCheck:SetPoint("LEFT", lfmGeneralCheck, "RIGHT", 64, 0)
     lfmGlobalCheck:SetHitRectInsets(0, -24, 0, 0)
     _G[lfmGlobalCheck:GetName() .. "Text"]:SetText("/global")
     lfmGlobalCheck:SetScript("OnClick", function(self)
@@ -4602,47 +5107,75 @@ function addon:CreateMainWindow()
     end)
 
     local lfmDelayLabel = lfmPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    lfmDelayLabel:SetPoint("TOPLEFT", lfmYellCheck, "BOTTOMLEFT", 0, -10)
-    lfmDelayLabel:SetText("Delay:")
+    lfmDelayLabel:SetPoint("TOPLEFT", lfmYellCheck, "BOTTOMLEFT", 0, -12)
+    lfmDelayLabel:SetText("Delay (s):")
 
-    local lfmDelayDropDown = CreateFrame("Frame", "RaidInspectorLFMDelayDropDown", lfmPanel, "UIDropDownMenuTemplate")
-    lfmDelayDropDown:SetPoint("LEFT", lfmDelayLabel, "RIGHT", -2, 2)
-    UIDropDownMenu_SetWidth(lfmDelayDropDown, 74)
-    UIDropDownMenu_JustifyText(lfmDelayDropDown, "LEFT")
-    UIDropDownMenu_Initialize(lfmDelayDropDown, function(_, level)
-        if level ~= 1 then
-            return
-        end
-
-        local i
-        for i = 1, #LFM_POST_DELAY_OPTIONS do
-            local seconds = LFM_POST_DELAY_OPTIONS[i]
-            local info = UIDropDownMenu_CreateInfo()
-            info.text = tostring(seconds) .. "s"
-            info.value = seconds
-            info.checked = (addon:GetLFMPostDelaySeconds() == seconds)
-            info.func = function(btn)
-                local selected = tonumber(btn.value) or DEFAULT_LFM_POST_DELAY_SECONDS
-                addon:SetLFMPostDelaySeconds(selected)
-                UIDropDownMenu_SetSelectedValue(lfmDelayDropDown, selected)
-                UIDropDownMenu_SetText(lfmDelayDropDown, tostring(selected) .. "s")
-                addon:RefreshMainWindow()
-            end
-            UIDropDownMenu_AddButton(info, level)
-        end
+    local lfmDelayBox = CreateFrame("EditBox", "RaidInspectorLFMDelayBox", lfmPanel, "InputBoxTemplate")
+    lfmDelayBox:SetPoint("LEFT", lfmDelayLabel, "RIGHT", 10, 0)
+    lfmDelayBox:SetWidth(46)
+    lfmDelayBox:SetHeight(20)
+    lfmDelayBox:SetAutoFocus(false)
+    lfmDelayBox:SetNumeric(true)
+    lfmDelayBox:SetMaxLetters(4)
+    lfmDelayBox:SetJustifyH("CENTER")
+    lfmDelayBox:SetScript("OnTextChanged", function(self)
+        addon:SetLFMPostDelaySeconds(self:GetText())
     end)
-    local selectedDelay = addon:GetLFMPostDelaySeconds()
-    UIDropDownMenu_SetSelectedValue(lfmDelayDropDown, selectedDelay)
-    UIDropDownMenu_SetText(lfmDelayDropDown, tostring(selectedDelay) .. "s")
+    lfmDelayBox:SetScript("OnEnterPressed", function(self)
+        self:ClearFocus()
+    end)
+    lfmDelayBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+    end)
+    lfmDelayBox:SetScript("OnEditFocusLost", function(self)
+        self:SetText(tostring(addon:GetLFMPostDelaySeconds()))
+    end)
+
+    local lfmRepeatLabel = lfmPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    lfmRepeatLabel:SetPoint("LEFT", lfmDelayBox, "RIGHT", 14, 0)
+    lfmRepeatLabel:SetText("Repeat:")
+
+    local lfmRepeatBox = CreateFrame("EditBox", "RaidInspectorLFMRepeatBox", lfmPanel, "InputBoxTemplate")
+    lfmRepeatBox:SetPoint("LEFT", lfmRepeatLabel, "RIGHT", 10, 0)
+    lfmRepeatBox:SetWidth(40)
+    lfmRepeatBox:SetHeight(20)
+    lfmRepeatBox:SetAutoFocus(false)
+    lfmRepeatBox:SetNumeric(true)
+    lfmRepeatBox:SetMaxLetters(2)
+    lfmRepeatBox:SetJustifyH("CENTER")
+    lfmRepeatBox:SetScript("OnTextChanged", function(self)
+        addon:SetLFMRepeatCount(self:GetText())
+    end)
+    lfmRepeatBox:SetScript("OnEnterPressed", function(self)
+        self:ClearFocus()
+    end)
+    lfmRepeatBox:SetScript("OnEscapePressed", function(self)
+        self:ClearFocus()
+    end)
+    lfmRepeatBox:SetScript("OnEditFocusLost", function(self)
+        self:SetText(tostring(addon:GetLFMRepeatCount()))
+    end)
 
     local lfmPostButton = CreateFrame("Button", "RaidInspectorLFMPostButton", lfmPanel, "UIPanelButtonTemplate")
-    lfmPostButton:SetWidth(120)
+    lfmPostButton:SetWidth(90)
     lfmPostButton:SetHeight(24)
-    lfmPostButton:SetPoint("LEFT", lfmDelayDropDown, "RIGHT", -6, -1)
+    lfmPostButton:SetPoint("LEFT", lfmRepeatBox, "RIGHT", 18, -1)
     lfmPostButton:SetText("|cff66ff66POST|r")
     lfmPostButton:SetScript("OnClick", function()
         SafeInvoke("lfm-post", function()
+            addon:CommitLFMInputsFromUI()
             addon:PostLFMMessage()
+        end)
+    end)
+
+    local lfmCancelButton = CreateFrame("Button", "RaidInspectorLFMCancelButton", lfmPanel, "UIPanelButtonTemplate")
+    lfmCancelButton:SetWidth(80)
+    lfmCancelButton:SetHeight(24)
+    lfmCancelButton:SetPoint("LEFT", lfmPostButton, "RIGHT", 6, 0)
+    lfmCancelButton:SetText("|cffff7777Cancel|r")
+    lfmCancelButton:SetScript("OnClick", function()
+        SafeInvoke("lfm-cancel", function()
+            addon:CancelLFMPostQueue()
         end)
     end)
 
@@ -4658,75 +5191,101 @@ function addon:CreateMainWindow()
 
     local lfmNeedLabel = lfmNeedPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     lfmNeedLabel:SetPoint("TOPLEFT", lfmNeedPanel, "TOPLEFT", 0, -2)
-    lfmNeedLabel:SetText("Need (classes/specs):")
+    lfmNeedLabel:SetText("Need:")
 
-    local lfmNeedGroupChecks = {}
-    local lfmNeedItemChecks = {}
-    local needColumns = 5
-    local needColumnWidth = 150
-    local needRowHeight = 90
+    local lfmNeedHeaderNeed = lfmNeedPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    lfmNeedHeaderNeed:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", 78, -6)
+    lfmNeedHeaderNeed:SetText("Need")
+
+    local lfmNeedHeaderClass = lfmNeedPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+    lfmNeedHeaderClass:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", 150, -6)
+    lfmNeedHeaderClass:SetText("Class (free text, e.g. mage, boomy)")
+
+    local lfmRoleRows = {}
 
     local i
-    for i = 1, #LFM_NEED_GROUPS do
-        local group = LFM_NEED_GROUPS[i]
-        local columnIndex = (i - 1) - (math.floor((i - 1) / needColumns) * needColumns)
-        local rowIndex = math.floor((i - 1) / needColumns)
-        local xOffset = (columnIndex * needColumnWidth) + 2
-        local yOffset = -6 - (rowIndex * needRowHeight)
+    for i = 1, #LFM_ROLE_ROWS do
+        local roleRow = LFM_ROLE_ROWS[i]
+        local rowY = -24 - ((i - 1) * 26)
 
-        local groupCheck = CreateFrame("CheckButton", "RaidInspectorLFMNeedGroupCheck" .. tostring(i), lfmNeedPanel, "UICheckButtonTemplate")
-        groupCheck:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", xOffset, yOffset)
-        groupCheck:SetHitRectInsets(0, -24, 0, 0)
-        groupCheck.groupKey = group.key
-        groupCheck:SetScript("OnClick", function(self)
-            addon:SetLFMNeedGroup(self.groupKey, self:GetChecked() and true or false)
+        local roleLabel = lfmNeedPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        roleLabel:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", 4, rowY)
+        roleLabel:SetWidth(64)
+        roleLabel:SetJustifyH("LEFT")
+        roleLabel:SetText(roleRow.label)
+
+        local countBox = CreateFrame("EditBox", "RaidInspectorLFMRoleCount" .. tostring(i), lfmNeedPanel, "InputBoxTemplate")
+        countBox:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", 80, rowY + 3)
+        countBox:SetWidth(40)
+        countBox:SetHeight(20)
+        countBox:SetAutoFocus(false)
+        countBox:SetNumeric(true)
+        countBox:SetMaxLetters(3)
+        countBox:SetJustifyH("CENTER")
+        countBox.roleKey = roleRow.key
+        countBox:SetScript("OnTextChanged", function(self)
+            addon:SetLFMRoleCount(self.roleKey, self:GetText())
+        end)
+        countBox:SetScript("OnEnterPressed", function(self)
+            self:ClearFocus()
+        end)
+        countBox:SetScript("OnEscapePressed", function(self)
+            self:ClearFocus()
         end)
 
-        local groupText = _G[groupCheck:GetName() .. "Text"]
-        if groupText then
-            groupText:SetText(ColorClassText(group.label, group.classToken))
-            SetFontStringBold(groupText, true)
+        local classBox = CreateFrame("EditBox", "RaidInspectorLFMRoleClass" .. tostring(i), lfmNeedPanel, "InputBoxTemplate")
+        classBox:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", 152, rowY + 3)
+        classBox:SetWidth(300)
+        classBox:SetHeight(20)
+        classBox:SetAutoFocus(false)
+        classBox:SetMaxLetters(MAX_LFM_ROLE_CLASSES_LENGTH)
+        if classBox.SetTextInsets then
+            classBox:SetTextInsets(6, 6, 0, 0)
         end
+        classBox.roleKey = roleRow.key
+        classBox:SetScript("OnTextChanged", function(self)
+            addon:SetLFMRoleClasses(self.roleKey, self:GetText())
+        end)
+        classBox:SetScript("OnEnterPressed", function(self)
+            self:ClearFocus()
+        end)
+        classBox:SetScript("OnEscapePressed", function(self)
+            self:ClearFocus()
+        end)
 
-        table.insert(lfmNeedGroupChecks, {
-            key = group.key,
-            check = groupCheck,
-        })
-
-        local j
-        for j = 1, #group.items do
-            local item = group.items[j]
-            local itemCheck = CreateFrame("CheckButton", "RaidInspectorLFMNeedItemCheck" .. tostring(i) .. "_" .. tostring(j), lfmNeedPanel, "UICheckButtonTemplate")
-            itemCheck:SetPoint("TOPLEFT", groupCheck, "BOTTOMLEFT", 14, -2 - ((j - 1) * 18))
-            itemCheck:SetHitRectInsets(0, -20, 0, 0)
-            itemCheck.itemKey = item.key
-            itemCheck:SetScript("OnClick", function(self)
-                addon:SetLFMNeedItem(self.itemKey, self:GetChecked() and true or false)
+        -- Per-row clear button: wipes just this role's count + class.
+        local clearRowButton = CreateFrame("Button", "RaidInspectorLFMRoleClear" .. tostring(i), lfmNeedPanel, "UIPanelButtonTemplate")
+        clearRowButton:SetWidth(22)
+        clearRowButton:SetHeight(20)
+        clearRowButton:SetPoint("LEFT", classBox, "RIGHT", 6, 0)
+        clearRowButton:SetText("X")
+        clearRowButton:SetScript("OnClick", function()
+            SafeInvoke("lfm-role-clear", function()
+                countBox:SetText("")
+                classBox:SetText("")
+                addon:SetLFMRoleCount(roleRow.key, "")
+                addon:SetLFMRoleClasses(roleRow.key, "")
             end)
+        end)
 
-            local itemText = _G[itemCheck:GetName() .. "Text"]
-            if itemText then
-                itemText:SetText(ColorText(item.label, "c8c8c8"))
-            end
-
-            table.insert(lfmNeedItemChecks, {
-                key = item.key,
-                check = itemCheck,
-            })
-        end
+        table.insert(lfmRoleRows, {
+            key = roleRow.key,
+            countBox = countBox,
+            classBox = classBox,
+        })
     end
 
     addon.ui.frame = f
     addon.ui.subtitle = subtitle
     addon.ui.inspectorTabButton = inspectorTabButton
     addon.ui.lfmTabButton = lfmTabButton
-    addon.ui.modeDropDown = modeDropDown
     addon.ui.statusText = statusText
     addon.ui.shareChannelsRow = shareChannelsRow
     addon.ui.shareChannelsLabel = shareChannelsLabel
     addon.ui.raidShareCheck = raidShareCheck
     addon.ui.sayShareCheck = sayShareCheck
     addon.ui.whisperShareCheck = whisperShareCheck
+    addon.ui.guildShareCheck = guildShareCheck
     addon.ui.savedReportsRow = savedReportsRow
     addon.ui.savedReportsLabel = savedReportsLabel
     addon.ui.actionPanel = actionPanel
@@ -4762,12 +5321,15 @@ function addon:CreateMainWindow()
     addon.ui.lfmPanel = lfmPanel
     addon.ui.lfmMessageBox = lfmMessageBox
     addon.ui.lfmYellCheck = lfmYellCheck
+    addon.ui.lfmGuildCheck = lfmGuildCheck
     addon.ui.lfmGeneralCheck = lfmGeneralCheck
     addon.ui.lfmGlobalCheck = lfmGlobalCheck
-    addon.ui.lfmDelayDropDown = lfmDelayDropDown
+    addon.ui.lfmDelayBox = lfmDelayBox
+    addon.ui.lfmRepeatBox = lfmRepeatBox
+    addon.ui.lfmPostButton = lfmPostButton
+    addon.ui.lfmCancelButton = lfmCancelButton
     addon.ui.lfmChannelStatus = lfmChannelStatus
-    addon.ui.lfmNeedGroupChecks = lfmNeedGroupChecks
-    addon.ui.lfmNeedItemChecks = lfmNeedItemChecks
+    addon.ui.lfmRoleRows = lfmRoleRows
 
     addon:ApplyButtonModeLayout()
     addon:SetActiveTab(addon:GetActiveTab())
@@ -4817,8 +5379,11 @@ function addon:BuildOverviewRowText(entry)
         reasonText = " | " .. FormatStatusReason(entry.statusReason)
     end
 
-    local nameText = SafeText(reqName) .. "-" .. SafeText(reqRealm)
-    if result and result.class then
+    local nameText = SafeText(reqName)
+    local pvpItems = result and result.issueSummary and tonumber(result.issueSummary.pvpItems or 0) or 0
+    if pvpItems > 0 then
+        nameText = ColorText(nameText, "ff8000")
+    elseif result and result.class then
         nameText = ColorClassText(nameText, result.class)
     end
 
@@ -5050,6 +5615,13 @@ function addon:BuildSlotLine(slotKey, item)
     end
 
     local line = slotLabel .. ": " .. itemName .. ilvlText .. " | " .. enchantText .. " | " .. gemText
+
+    -- PvP gear (has resilience) is flagged and coloured orange, taking priority
+    -- so it stands out even if it is otherwise fully enchanted/gemmed.
+    if item.isPvp then
+        return ColorText(line .. " | PVP", "ff8000")
+    end
+
     if missingEnchant or missingGems then
         return ColorText(line, "ff6666")
     end
@@ -5126,8 +5698,11 @@ function addon:RefreshDetailPanel(selectedEntry)
 
     local req = selectedEntry.req
     local result = selectedEntry.result
-    local selectedNameText = SafeText(req.name) .. "-" .. SafeText(req.realm)
-    if result and result.class then
+    local selectedNameText = SafeText(req.name)
+    local selectedPvpItems = result and result.issueSummary and tonumber(result.issueSummary.pvpItems or 0) or 0
+    if selectedPvpItems > 0 then
+        selectedNameText = ColorText(selectedNameText, "ff8000")
+    elseif result and result.class then
         selectedNameText = ColorClassText(selectedNameText, result.class)
     end
     addon.ui.detailHeader:SetText("Selected: " .. selectedNameText .. " [" .. selectedEntry.state .. "]")
@@ -5179,10 +5754,12 @@ function addon:RefreshDetailPanel(selectedEntry)
     local itemsAnalyzed = tonumber(summary.itemsAnalyzed or 0) or 0
     local socketsFilled = tonumber(summary.filledSockets or 0) or 0
     local socketsTotal = tonumber(summary.totalSockets or 0) or 0
+    local pvpItems = tonumber(summary.pvpItems or 0) or 0
 
     local missingEnchantText = "missingEnchant=" .. tostring(missingEnchant)
     local missingGemsText = "missingGems=" .. tostring(missingGems)
     local socketsText = "sockets=" .. tostring(socketsFilled) .. "/" .. tostring(socketsTotal)
+    local pvpText = "pvp=" .. tostring(pvpItems)
 
     if missingEnchant > 0 then
         missingEnchantText = ColorText(missingEnchantText, "ff6666")
@@ -5196,10 +5773,15 @@ function addon:RefreshDetailPanel(selectedEntry)
         socketsText = ColorText(socketsText, "ff6666")
     end
 
+    if pvpItems > 0 then
+        pvpText = ColorText(pvpText, "ff8000")
+    end
+
     local auditText = "Audit: " .. missingEnchantText
         .. " | " .. missingGemsText
         .. " | " .. socketsText
         .. " | items=" .. tostring(itemsAnalyzed)
+        .. " | " .. pvpText
 
     addon.ui.detailAudit:SetText(auditText)
 
@@ -5304,9 +5886,10 @@ function addon:RefreshMainWindow()
             queueText = " | Queue: " .. tostring(queueCount) .. " pending, next in " .. tostring(secondsUntilNext) .. "s"
         end
 
+        local repeatCount = addon:GetLFMRepeatCount()
         addon.ui.statusText:SetText(
-            "LFM Composer: write your post, link achievement in chat, paste it here, select channels, press POST."
-                .. " (" .. tostring(postDelaySeconds) .. "s spacing between channels)"
+            "LFM Composer: write your post, pick channels, set delay/repeat, fill the Need table, press POST."
+                .. " (" .. tostring(postDelaySeconds) .. "s spacing, x" .. tostring(repeatCount) .. " repeat)"
                 .. queueText
         )
     elseif activeSavedReport then
@@ -5315,14 +5898,8 @@ function addon:RefreshMainWindow()
                 .. "  |  Source: saved variables"
         )
     else
-        addon.ui.statusText:SetText(
-            "Queue: " .. queued
-                .. "  |  Ready: " .. ready
-                .. "  |  Fresh: " .. fresh
-                .. "  |  Stale: " .. stale
-                .. "  |  Issues: " .. totalIssues .. " (" .. playersWithIssues .. ")"
-                .. "  |  Errors: " .. errorCount
-        )
+        -- Live overview: the queue/ready/stale counts line was removed by request.
+        addon.ui.statusText:SetText("")
     end
 
     if addon.ui.sortButton then
@@ -5331,12 +5908,6 @@ function addon:RefreshMainWindow()
 
     if addon.ui.filterButton then
         addon.ui.filterButton:SetText("|cff66ff66F:" .. addon:GetFilterMode() .. "|r")
-    end
-
-    if addon.ui.modeDropDown then
-        local selectedMode = addon:GetButtonMode()
-        UIDropDownMenu_SetSelectedValue(addon.ui.modeDropDown, selectedMode)
-        UIDropDownMenu_SetText(addon.ui.modeDropDown, BUTTON_MODE_LABELS[selectedMode] or selectedMode)
     end
 
     if addon.ui.itemFilterDropDown then
@@ -5366,10 +5937,16 @@ function addon:RefreshMainWindow()
     if addon.ui.whisperShareCheck then
         addon.ui.whisperShareCheck:SetChecked(channels.whisper == true)
     end
+    if addon.ui.guildShareCheck then
+        addon.ui.guildShareCheck:SetChecked(channels.guild == true)
+    end
 
     local lfmChannels = addon:GetLFMChannels()
     if addon.ui.lfmYellCheck then
         addon.ui.lfmYellCheck:SetChecked(lfmChannels.yell == true)
+    end
+    if addon.ui.lfmGuildCheck then
+        addon.ui.lfmGuildCheck:SetChecked(lfmChannels.guild == true)
     end
     if addon.ui.lfmGeneralCheck then
         addon.ui.lfmGeneralCheck:SetChecked(lfmChannels.general == true)
@@ -5378,30 +5955,39 @@ function addon:RefreshMainWindow()
         addon.ui.lfmGlobalCheck:SetChecked(lfmChannels.global == true)
     end
 
-    local lfmNeeds = addon:GetLFMNeedState()
-    if addon.ui.lfmNeedGroupChecks then
+    local lfmRoles = addon:GetLFMRoleState()
+    if addon.ui.lfmRoleRows then
         local i
-        for i = 1, #addon.ui.lfmNeedGroupChecks do
-            local entry = addon.ui.lfmNeedGroupChecks[i]
-            if entry and entry.check then
-                entry.check:SetChecked(lfmNeeds.groups[entry.key] == true)
+        for i = 1, #addon.ui.lfmRoleRows do
+            local entry = addon.ui.lfmRoleRows[i]
+            local data = lfmRoles[entry.key] or {}
+            if entry.countBox and not entry.countBox:HasFocus() then
+                local desired = tostring(data.count or "")
+                if (entry.countBox:GetText() or "") ~= desired then
+                    entry.countBox:SetText(desired)
+                end
             end
-        end
-    end
-    if addon.ui.lfmNeedItemChecks then
-        local i
-        for i = 1, #addon.ui.lfmNeedItemChecks do
-            local entry = addon.ui.lfmNeedItemChecks[i]
-            if entry and entry.check then
-                entry.check:SetChecked(lfmNeeds.items[entry.key] == true)
+            if entry.classBox and not entry.classBox:HasFocus() then
+                local desired = tostring(data.classes or "")
+                if (entry.classBox:GetText() or "") ~= desired then
+                    entry.classBox:SetText(desired)
+                end
             end
         end
     end
 
-    if addon.ui.lfmDelayDropDown then
-        local selectedDelay = addon:GetLFMPostDelaySeconds()
-        UIDropDownMenu_SetSelectedValue(addon.ui.lfmDelayDropDown, selectedDelay)
-        UIDropDownMenu_SetText(addon.ui.lfmDelayDropDown, tostring(selectedDelay) .. "s")
+    if addon.ui.lfmDelayBox and not addon.ui.lfmDelayBox:HasFocus() then
+        local desired = tostring(addon:GetLFMPostDelaySeconds())
+        if (addon.ui.lfmDelayBox:GetText() or "") ~= desired then
+            addon.ui.lfmDelayBox:SetText(desired)
+        end
+    end
+
+    if addon.ui.lfmRepeatBox and not addon.ui.lfmRepeatBox:HasFocus() then
+        local desired = tostring(addon:GetLFMRepeatCount())
+        if (addon.ui.lfmRepeatBox:GetText() or "") ~= desired then
+            addon.ui.lfmRepeatBox:SetText(desired)
+        end
     end
 
     if addon.ui.lfmChannelStatus then
@@ -5412,7 +5998,9 @@ function addon:RefreshMainWindow()
             local prefix = selected and "[x] " or "[ ] "
 
             local stateText = "ready"
-            if channelKey ~= "yell" then
+            if channelKey == "guild" then
+                stateText = isAvailable and "in guild" or "no guild"
+            elseif channelKey ~= "yell" then
                 if isAvailable then
                     stateText = "joined"
                 else
@@ -5443,6 +6031,8 @@ function addon:RefreshMainWindow()
 
         local statusText = "Channel status: "
             .. BuildChannelStatusLabel("yell", "Yell", availability.yell, nil)
+            .. "  |  "
+            .. BuildChannelStatusLabel("guild", "/guild", availability.guild, nil)
             .. "  |  "
             .. BuildChannelStatusLabel("general", "/general", availability.general, availability.generalName)
             .. "  |  "
@@ -5539,6 +6129,7 @@ function addon:RefreshMainWindow()
         local entry = entries[rowIndex + overviewOffset]
         if entry then
             row.key = entry.key
+            row.playerName = entry.req and entry.req.name or nil
             row.text:SetText(addon:BuildOverviewRowText(entry))
             local hasAuditIssues = EntryHasMissingAuditIssues(entry)
             local isPendingNotInspectable = EntryIsPendingNotInspectable(entry)
@@ -5572,6 +6163,7 @@ function addon:RefreshMainWindow()
             row:Show()
         else
             row.key = nil
+            row.playerName = nil
             row.text:SetText("")
             row.text:SetTextColor(1.0, 1.0, 1.0)
             SetFontStringBold(row.text, false)
@@ -5750,6 +6342,7 @@ function addon:BuildExportSummaryFromPayload(payload)
     local summary = payload.issueSummary or {}
     local missingEnchant = tonumber(summary.missingEnchant or 0) or 0
     local missingGems = tonumber(summary.missingGems or 0) or 0
+    local pvpItems = tonumber(summary.pvpItems or 0) or 0
     local name = tostring(payload.name or "Unknown") .. "-" .. tostring(payload.realm or "Unknown")
 
     return "Name: " .. name
@@ -5757,6 +6350,7 @@ function addon:BuildExportSummaryFromPayload(payload)
         .. ", Spec: " .. (spec ~= "" and spec or "?")
         .. ", Missing Enchants: " .. tostring(missingEnchant)
         .. ", Missing Gems: " .. tostring(missingGems)
+        .. ", PvP Items: " .. tostring(pvpItems)
 end
 
 function addon:BuildExportSummary(entry)
@@ -5768,27 +6362,76 @@ function addon:BuildExportSummary(entry)
     return addon:BuildExportSummaryFromPayload(payload)
 end
 
+local function RaidInspectorTryInsertLFMLink(link)
+    local editBox = addon.ui and addon.ui.lfmMessageBox
+    if editBox and editBox:IsShown() and editBox:HasFocus()
+        and type(link) == "string" and link ~= "" then
+        editBox:Insert(link)
+        addon:SetLFMMessage(editBox:GetText() or "")
+        return true
+    end
+    return false
+end
+
 function addon:InitLFMMessageLinkHook()
     if addon.lfmLinkHooked then
         return
     end
 
-    if type(ChatEdit_InsertLink) ~= "function" then
-        return
+    -- Path 1: clicking an already-displayed hyperlink (e.g. one linked into chat).
+    if type(ChatEdit_InsertLink) == "function" then
+        local originalInsert = ChatEdit_InsertLink
+        ChatEdit_InsertLink = function(link, ...)
+            if RaidInspectorTryInsertLFMLink(link) then
+                return true
+            end
+            return originalInsert(link, ...)
+        end
     end
 
-    local originalInsert = ChatEdit_InsertLink
-    ChatEdit_InsertLink = function(link, ...)
-        local editBox = addon.ui and addon.ui.lfmMessageBox
-        if editBox and editBox:IsShown() and editBox:HasFocus() and type(link) == "string" and link ~= "" then
-            editBox:Insert(link)
-            addon:SetLFMMessage(editBox:GetText() or "")
-            return true
+    -- Path 2: shift-clicking a link straight from a UI panel (Achievement frame,
+    -- bags, spellbook...). These route through HandleModifiedItemClick, which
+    -- normally only inserts when a chat edit box is active - so without this hook
+    -- an achievement could not be linked directly into the LFM box.
+    if type(HandleModifiedItemClick) == "function" then
+        local originalHandle = HandleModifiedItemClick
+        HandleModifiedItemClick = function(link, ...)
+            if IsModifiedClick("CHATLINK") and RaidInspectorTryInsertLFMLink(link) then
+                return true
+            end
+            return originalHandle(link, ...)
         end
-        return originalInsert(link, ...)
     end
 
     addon.lfmLinkHooked = true
+end
+
+-- On this client, shift-clicking an achievement in the Achievement window routes
+-- to the tracking toggle (you see "This achievement has already been completed")
+-- instead of a chat-link insert. So when the LFM box is focused we intercept the
+-- tracking toggle and insert the achievement link instead. Blizzard_AchievementUI
+-- is load-on-demand, so this is (re)tried whenever that addon loads.
+function addon:InitAchievementLinkHook()
+    if addon.achievementLinkHooked then
+        return
+    end
+
+    if type(AchievementButton_ToggleTracking) ~= "function" then
+        return
+    end
+
+    local originalToggle = AchievementButton_ToggleTracking
+    AchievementButton_ToggleTracking = function(id, ...)
+        if id and type(GetAchievementLink) == "function" then
+            local ok, link = pcall(GetAchievementLink, id)
+            if ok and RaidInspectorTryInsertLFMLink(link) then
+                return
+            end
+        end
+        return originalToggle(id, ...)
+    end
+
+    addon.achievementLinkHooked = true
 end
 
 function addon:PostLFMMessage()
@@ -5805,22 +6448,35 @@ function addon:PostLFMMessage()
 
     local channels = addon:GetLFMChannels()
     local selectedCount = 0
-    local targets = {}
+    local baseTargets = {}
 
     if channels.yell then
         selectedCount = selectedCount + 1
-        table.insert(targets, {
+        table.insert(baseTargets, {
             message = message,
             chatType = "YELL",
             label = "Yell",
         })
     end
 
+    if channels.guild then
+        selectedCount = selectedCount + 1
+        if IsInGuild() then
+            table.insert(baseTargets, {
+                message = message,
+                chatType = "GUILD",
+                label = "Guild",
+            })
+        else
+            Print("lfm: /guild selected, but you are not in a guild")
+        end
+    end
+
     if channels.general then
         selectedCount = selectedCount + 1
         local channelId, channelName = FindJoinedChannelByAlias(LFM_GENERAL_ALIASES)
         if channelId and channelId > 0 then
-            table.insert(targets, {
+            table.insert(baseTargets, {
                 message = message,
                 chatType = "CHANNEL",
                 channelId = channelId,
@@ -5835,7 +6491,7 @@ function addon:PostLFMMessage()
         selectedCount = selectedCount + 1
         local channelId, channelName = FindJoinedChannelByAlias(LFM_GLOBAL_ALIASES)
         if channelId and channelId > 0 then
-            table.insert(targets, {
+            table.insert(baseTargets, {
                 message = message,
                 chatType = "CHANNEL",
                 channelId = channelId,
@@ -5847,13 +6503,31 @@ function addon:PostLFMMessage()
     end
 
     if selectedCount == 0 then
-        Print("lfm: no channels selected (Yell/General/Global)")
+        Print("lfm: no channels selected (Yell/Guild/General/Global)")
         return 0, 0
     end
 
-    if #targets == 0 then
+    if #baseTargets == 0 then
         Print("lfm: no selected channels are available right now")
         return selectedCount, 0
+    end
+
+    -- Replicate the per-channel posts once per requested repeat, so the whole
+    -- broadcast is re-sent repeatCount times, each post spaced by the delay.
+    local repeatCount = addon:GetLFMRepeatCount()
+    local targets = {}
+    local r
+    for r = 1, repeatCount do
+        local t
+        for t = 1, #baseTargets do
+            local src = baseTargets[t]
+            targets[#targets + 1] = {
+                message = src.message,
+                chatType = src.chatType,
+                channelId = src.channelId,
+                label = src.label,
+            }
+        end
     end
 
     if addon.lfmPostQueue and #addon.lfmPostQueue > 0 then
@@ -5862,18 +6536,46 @@ function addon:PostLFMMessage()
 
     addon.lfmPostQueue = targets
     addon.lfmPostSentCount = 0
-    addon.lfmPostSelectedCount = selectedCount
+    addon.lfmPostSelectedCount = #targets
     addon.lfmPostNextAt = GetNow()
     local postDelaySeconds = addon:GetLFMPostDelaySeconds()
 
-    if #targets > 1 then
-        Print("lfm: queued " .. tostring(#targets) .. " channel posts with " .. tostring(postDelaySeconds) .. "s spacing")
-    else
-        Print("lfm: queued 1 channel post")
-    end
+    Print("lfm: queued " .. tostring(#targets) .. " post(s) ("
+        .. tostring(#baseTargets) .. " channel(s) x " .. tostring(repeatCount)
+        .. " repeat) with " .. tostring(postDelaySeconds) .. "s spacing")
 
     addon:ProcessLFMPostQueue(true)
     return selectedCount, #targets
+end
+
+-- Pulls the live editbox values (delay, repeat, role table, message) into
+-- saved state so a POST always uses exactly what is shown in the UI.
+function addon:CommitLFMInputsFromUI()
+    if not addon.ui then
+        return
+    end
+
+    if addon.ui.lfmMessageBox then
+        addon:SetLFMMessage(addon.ui.lfmMessageBox:GetText() or "")
+    end
+    if addon.ui.lfmDelayBox then
+        addon:SetLFMPostDelaySeconds(addon.ui.lfmDelayBox:GetText())
+    end
+    if addon.ui.lfmRepeatBox then
+        addon:SetLFMRepeatCount(addon.ui.lfmRepeatBox:GetText())
+    end
+    if addon.ui.lfmRoleRows then
+        local i
+        for i = 1, #addon.ui.lfmRoleRows do
+            local entry = addon.ui.lfmRoleRows[i]
+            if entry.countBox then
+                addon:SetLFMRoleCount(entry.key, entry.countBox:GetText())
+            end
+            if entry.classBox then
+                addon:SetLFMRoleClasses(entry.key, entry.classBox:GetText())
+            end
+        end
+    end
 end
 
 function addon:SendSummaryMessage(message, whisperTarget)
@@ -5909,8 +6611,18 @@ function addon:SendSummaryMessage(message, whisperTarget)
         end
     end
 
+    if channels.guild then
+        attempted = attempted + 1
+        if IsInGuild() then
+            SendChatMessage(chatMessage, "GUILD")
+            sent = sent + 1
+        else
+            Print("share: GUILD checked, but you are not in a guild")
+        end
+    end
+
     if attempted == 0 then
-        Print("share: no channels selected (Raid/Say/Whisper)")
+        Print("share: no channels selected (Raid/Say/Whisper/Guild)")
         return 0, 0, chatMessage
     end
 
@@ -6045,6 +6757,12 @@ if type(StaticPopupDialogs) == "table" then
 end
 
 function addon:OnAddonLoaded(loadedName)
+    -- Blizzard_AchievementUI is load-on-demand; hook it once it appears.
+    if loadedName == "Blizzard_AchievementUI" then
+        addon:InitAchievementLinkHook()
+        return
+    end
+
     if loadedName ~= addon.name then
         return
     end
@@ -6058,6 +6776,9 @@ end
 function addon:OnPlayerLogin()
     addon:InitInspectRuntime()
     addon:InitLFMMessageLinkHook()
+    if type(IsAddOnLoaded) == "function" and IsAddOnLoaded("Blizzard_AchievementUI") then
+        addon:InitAchievementLinkHook()
+    end
     Print("loaded (" .. addon.version .. ")")
     Print("type /ri help for commands")
     addon:RefreshMainWindow()
@@ -6072,8 +6793,10 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
         command = string.lower(command or "")
         args = args or ""
 
-        if command == "" or command == "help" then
+        if command == "help" then
             Print("commands:")
+            Print("/ri - open main window (same as /ri show)")
+            Print("/ri help - show this command list")
             Print("/ri show - open main window")
             Print("/ri hide - close main window")
             Print("/ri inspect <name> <realm> - inspect a matching target/party/raid unit")
@@ -6088,7 +6811,8 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri share [name-realm] - short summary to selected chat channels")
             Print("/ri lfm - switch to the LFM tab")
             Print("/ri inspector - switch to the Inspector tab")
-            Print("/ri post [message] - post LFM message to selected channels (uses selected delay)")
+            Print("/ri post [message] - post LFM message to selected channels (uses delay + repeat)")
+            Print("/ri cancel - cancel any pending LFM posts")
             Print("/ri savereport [name-realm] - save current or selected report snapshot")
             Print("/ri sharesaved [latest|id|name-realm] - share saved snapshot to chat")
             Print("/ri status - show queue summary")
@@ -6097,7 +6821,7 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             return
         end
 
-        if command == "show" then
+        if command == "" or command == "show" then
             addon:ToggleWindow(true)
             return
         end
@@ -6185,11 +6909,17 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
         end
 
         if command == "post" then
+            addon:CommitLFMInputsFromUI()
             if Trim(args or "") ~= "" then
                 addon:SetLFMMessage(args)
             end
             addon:PostLFMMessage()
             addon:RefreshMainWindow()
+            return
+        end
+
+        if command == "cancel" then
+            addon:CancelLFMPostQueue()
             return
         end
 

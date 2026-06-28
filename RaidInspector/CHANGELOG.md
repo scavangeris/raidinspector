@@ -2,6 +2,49 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.12.9-alpha - 2026-06-28
+- Share summary now includes a `PvP Items: N` count (from resilience detection).
+- Reduced the empty gap between the tab row and the Share row on the Inspector tab.
+
+## 0.12.8-alpha - 2026-06-28
+- LFM: replaced the single "Clear" button with per-field clear buttons - a small `X` next to the message box and one at the end of each Need row (Tank/Healer/Melee/Ranged).
+- PvP detection reworked to be reliable: resilience is now found via a pattern match over `GetItemStats` keys plus a hidden-tooltip scan fallback, so PvP gear is correctly flagged orange with a `PVP` tag, `pvp=N` in the audit line, and an orange player name.
+- Achievements can now be linked into the focused LFM box directly from the Achievement window: on this client that shift-click routes to the achievement tracking toggle (the "already completed" message), so `AchievementButton_ToggleTracking` is now intercepted while the LFM box is focused and inserts the achievement link instead. The previous "link via chat" method still works.
+
+## 0.12.7-alpha - 2026-06-28
+- Added a `Clear` button to the LFM tab that wipes the message and the Need table (channels/delay/repeat are kept).
+- PvP gear detection: equipped items with a resilience stat are now flagged. The gear line is shown orange with a `PVP` tag, the audit line shows `pvp=N`, and a player with any PvP item has their name coloured orange in the overview and the selected header.
+- Achievements can now be linked straight from the Achievement window into the focused LFM message box (hooked `HandleModifiedItemClick`, not just `ChatEdit_InsertLink`).
+
+## 0.12.6-alpha - 2026-06-28
+- Removed the live-overview status counts line (Queue/Ready/Fresh/Stale/Issues/Errors) from the Inspector tab.
+- Player names no longer show the `-Realm` suffix in the overview list and the selected-player header.
+- Added a `? Info` button (next to the tabs) that opens a help dialog explaining the buttons and mouse actions.
+- Enlarged the window again (1100x560 -> 1180x610) and increased gear-list / overview row spacing and font size for readability.
+- Removed the `Save One` button (use `Save All`; `/ri savereport` still saves a single selected player from chat).
+
+## 0.12.5-alpha - 2026-06-28
+- Removed the Advanced/Easy mode dropdown; the window now always uses the easy layout.
+- Inspector action buttons: removed the Filter (`F:all`) and Status/Display buttons from the window (their `/ri filter` and `/ri status` slash commands still work). Renamed `Report` to `Save All` and `Save` to `Save One`.
+- Added a `Guild` checkbox to the Share row (Inspector tab) so summaries/reports can be sent to guild chat (`SendSummaryMessage` now supports GUILD).
+- Enlarged the main window (1000x500 -> 1100x560) and increased the visible overview rows and item-detail rows to use the extra space.
+- `/ri` with no argument now opens the window (same as `/ri show`); `/ri help` shows the command list.
+
+## 0.12.4-alpha - 2026-06-27
+- Right-click a gear/item row in the detail panel now opens that item in AtlasLoot (search view); falls back to the copy dialog if AtlasLoot is not loaded. Shift+right-click still copies the item value. Added `## OptionalDeps: AtlasLoot`.
+- Reworked the LFM "Need" picker: replaced the class/spec checkbox grid with a compact role table (Tank / Healer / Melee / Ranged), each row with a "Need" count box and a free-text "Class" box (e.g. `mage, boomy`). Output reads e.g. `NEED: 1 Melee (mage, boomy)`.
+- LFM delay is now a typed numeric input (1-3600s) instead of a fixed dropdown; applied and saved on POST.
+- Added an LFM "Repeat" input: the whole broadcast is queued repeat x channels times, each post spaced by the delay.
+- Added an LFM "Cancel" button (and `/ri cancel`) to clear any pending posts.
+- Added a `/guild` channel checkbox to the LFM "Post To" row (posts to GUILD when you are in a guild).
+
+## 0.12.3-alpha - 2026-06-27
+- Added right-click-to-copy in the main window:
+  - right-click a player row in the overview to copy that character's name
+  - right-click a gear/item row in the selected-player detail panel to copy the item name
+  - both open a small movable dialog with a pre-selected, focused EditBox (press Ctrl+C to copy, Esc to close), since 3.3.5a has no direct clipboard API
+  - left-clicking an overview row still selects the player as before
+
 ## 0.12.2-alpha - 2026-03-17
 - Removed unused bridge import code from `RaidInspector.lua` in bridgeless mode.
 - Removed legacy bridge assets from the repository:
