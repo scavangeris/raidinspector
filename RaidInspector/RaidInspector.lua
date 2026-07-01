@@ -184,6 +184,27 @@ local ITEM_LIST_FILTER_LABELS = {
     ["missing-gems"] = "Missing Gems",
 }
 
+-- Bindable action buttons (screenshot: PallyPower-style keybinds).
+local KEYBIND_ACTIONS = {
+    { key = "target", label = "Target", button = "RaidInspectorTargetButton" },
+    { key = "raid", label = "Raid", button = "RaidInspectorRaidButton" },
+    { key = "share", label = "Share", button = "RaidInspectorSyncButton" },
+    { key = "saveall", label = "Save All", button = "RaidInspectorReportButton" },
+    { key = "clear", label = "Clear", button = "RaidInspectorClearButton" },
+}
+local MIN_WINDOW_SCALE = 0.5
+local MAX_WINDOW_SCALE = 1.5
+local DEFAULT_WINDOW_SCALE = 1.0
+
+-- Fixed columns for the gear detail list (aligned fields).
+local DETAIL_COLUMNS = {
+    { key = "slot", header = "Slot", x = 4, width = 72 },
+    { key = "name", header = "Item Name", x = 78, width = 312, truncate = true },
+    { key = "ilvl", header = "iLvl", x = 394, width = 44 },
+    { key = "enchant", header = "Enchant", x = 440, width = 92 },
+    { key = "gems", header = "Gems", x = 534, width = 104 },
+}
+
 local SLOT_ORDER = {
     "HeadSlot",
     "NeckSlot",
@@ -2086,6 +2107,9 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.settings.window, "point", "CENTER")
     EnsureTable(RaidInspectorDB.settings.window, "x", 0)
     EnsureTable(RaidInspectorDB.settings.window, "y", 0)
+    EnsureTable(RaidInspectorDB.settings.window, "scale", 1.0)
+
+    EnsureTable(RaidInspectorDB.settings, "keybinds", {})
 
     EnsureTable(RaidInspectorDB.settings, "overview", {})
     EnsureTable(RaidInspectorDB.settings.overview, "sortMode", "recent")
@@ -2158,6 +2182,74 @@ function addon:GetFilterMode()
     end
     RaidInspectorDB.settings.overview.filterMode = "all"
     return "all"
+end
+
+function addon:GetWindowScale()
+    local scale = tonumber(RaidInspectorDB.settings.window.scale)
+    if not scale then
+        return DEFAULT_WINDOW_SCALE
+    end
+    if scale < MIN_WINDOW_SCALE then
+        scale = MIN_WINDOW_SCALE
+    elseif scale > MAX_WINDOW_SCALE then
+        scale = MAX_WINDOW_SCALE
+    end
+    return scale
+end
+
+function addon:SetWindowScale(scale)
+    scale = tonumber(scale) or DEFAULT_WINDOW_SCALE
+    if scale < MIN_WINDOW_SCALE then
+        scale = MIN_WINDOW_SCALE
+    elseif scale > MAX_WINDOW_SCALE then
+        scale = MAX_WINDOW_SCALE
+    end
+    RaidInspectorDB.settings.window.scale = scale
+    if addon.ui and addon.ui.frame then
+        addon.ui.frame:SetScale(scale)
+    end
+    return scale
+end
+
+function addon:GetKeybinds()
+    EnsureTable(RaidInspectorDB.settings, "keybinds", {})
+    return RaidInspectorDB.settings.keybinds
+end
+
+function addon:SetKeybind(actionKey, keyString)
+    local binds = addon:GetKeybinds()
+    binds[actionKey] = tostring(keyString or "")
+    addon:ApplyKeybinds()
+end
+
+function addon:ClearKeybind(actionKey)
+    local binds = addon:GetKeybinds()
+    binds[actionKey] = nil
+    addon:ApplyKeybinds()
+end
+
+-- Applies the saved keybinds as override bindings owned by the main frame, so
+-- they never touch the player's saved global bindings.
+function addon:ApplyKeybinds()
+    if not addon.ui or not addon.ui.frame then
+        return
+    end
+    if type(ClearOverrideBindings) ~= "function" or type(SetOverrideBindingClick) ~= "function" then
+        return
+    end
+
+    local owner = addon.ui.frame
+    ClearOverrideBindings(owner)
+
+    local binds = addon:GetKeybinds()
+    local i
+    for i = 1, #KEYBIND_ACTIONS do
+        local def = KEYBIND_ACTIONS[i]
+        local key = binds[def.key]
+        if type(key) == "string" and key ~= "" then
+            SetOverrideBindingClick(owner, true, key, def.button)
+        end
+    end
 end
 
 function addon:GetItemListFilterMode()
@@ -2327,6 +2419,493 @@ function addon:SetLFMRoleClasses(roleKey, value)
     return true
 end
 
+-- ===== LFM presets (save / load / delete / import / export) =====
+
+local LFM_COMM_PREFIX = "RInspLFM"
+local LFM_PRESET_FIELDS = 10
+
+-- Length-prefixed encoding ("<len>:<data>...") so fields can contain any bytes
+-- (achievement links include '|', ':' etc.) without needing escaping.
+local function SerializeFields(fields)
+    local parts = {}
+    local i
+    for i = 1, #fields do
+        local s = tostring(fields[i] or "")
+        parts[#parts + 1] = tostring(#s) .. ":" .. s
+    end
+    return table.concat(parts)
+end
+
+local function DeserializeFields(str, expectedCount)
+    local fields = {}
+    local pos = 1
+    local n = #str
+    while pos <= n and #fields < expectedCount do
+        local colon = string.find(str, ":", pos, true)
+        if not colon then
+            break
+        end
+        local len = tonumber(string.sub(str, pos, colon - 1))
+        if not len then
+            break
+        end
+        local dataStart = colon + 1
+        local dataEnd = dataStart + len - 1
+        if dataEnd > n then
+            break
+        end
+        fields[#fields + 1] = string.sub(str, dataStart, dataEnd)
+        pos = dataEnd + 1
+    end
+    while #fields < expectedCount do
+        fields[#fields + 1] = ""
+    end
+    return fields
+end
+
+-- Hex-encode the payload so the addon message contains only [0-9a-f]. This
+-- avoids the client/server mangling of '|' colour/hyperlink escapes that live
+-- inside achievement links, which otherwise corrupt or drop the message.
+local function ToHex(s)
+    return (string.gsub(tostring(s or ""), ".", function(c)
+        return string.format("%02x", string.byte(c))
+    end))
+end
+
+local function FromHex(h)
+    return (string.gsub(tostring(h or ""), "%x%x", function(cc)
+        return string.char(tonumber(cc, 16))
+    end))
+end
+
+local function PresetToFields(preset)
+    local roles = preset.roles or {}
+    local function rc(k, f)
+        local t = roles[k] or {}
+        return tostring(t[f] or "")
+    end
+    return {
+        tostring(preset.name or ""),
+        tostring(preset.message or ""),
+        rc("tank", "count"), rc("tank", "classes"),
+        rc("healer", "count"), rc("healer", "classes"),
+        rc("melee", "count"), rc("melee", "classes"),
+        rc("ranged", "count"), rc("ranged", "classes"),
+    }
+end
+
+local function FieldsToPreset(fields)
+    return {
+        name = fields[1] or "",
+        message = fields[2] or "",
+        roles = {
+            tank = { count = fields[3] or "", classes = fields[4] or "" },
+            healer = { count = fields[5] or "", classes = fields[6] or "" },
+            melee = { count = fields[7] or "", classes = fields[8] or "" },
+            ranged = { count = fields[9] or "", classes = fields[10] or "" },
+        },
+    }
+end
+
+function addon:GetLFMPresets()
+    EnsureTable(RaidInspectorDB, "lfmPresets", {})
+    EnsureTable(RaidInspectorDB.lfmPresets, "items", {})
+    return RaidInspectorDB.lfmPresets.items
+end
+
+function addon:FindLFMPreset(name)
+    name = Trim(tostring(name or ""))
+    if name == "" then
+        return nil
+    end
+    local items = addon:GetLFMPresets()
+    local i
+    for i = 1, #items do
+        if items[i].name == name then
+            return items[i], i
+        end
+    end
+    return nil
+end
+
+function addon:SaveLFMPresetObject(preset)
+    if type(preset) ~= "table" then
+        return false
+    end
+    local name = Trim(tostring(preset.name or ""))
+    if name == "" then
+        Print("lfm: preset needs a name")
+        return false
+    end
+    preset.name = name
+    local items = addon:GetLFMPresets()
+    local existing, idx = addon:FindLFMPreset(name)
+    if existing then
+        items[idx] = preset
+    else
+        items[#items + 1] = preset
+    end
+    return true
+end
+
+function addon:SaveLFMPreset(name)
+    name = Trim(tostring(name or ""))
+    if name == "" then
+        Print("lfm: enter a preset name")
+        return false
+    end
+
+    addon:CommitLFMInputsFromUI()
+    local roles = addon:GetLFMRoleState()
+    local function copyRole(k)
+        local t = roles[k] or {}
+        return { count = tostring(t.count or ""), classes = tostring(t.classes or "") }
+    end
+
+    addon:SaveLFMPresetObject({
+        name = name,
+        message = addon:GetLFMMessage(),
+        roles = {
+            tank = copyRole("tank"),
+            healer = copyRole("healer"),
+            melee = copyRole("melee"),
+            ranged = copyRole("ranged"),
+        },
+    })
+
+    addon.ui = addon.ui or {}
+    addon.ui.lfmSelectedPreset = name
+    Print("lfm: saved preset '" .. name .. "'")
+    addon:RefreshMainWindow()
+    return true
+end
+
+function addon:DeleteLFMPreset(name)
+    local existing, idx = addon:FindLFMPreset(name)
+    if not existing then
+        return false
+    end
+    table.remove(addon:GetLFMPresets(), idx)
+    if addon.ui and addon.ui.lfmSelectedPreset == name then
+        addon.ui.lfmSelectedPreset = nil
+    end
+    Print("lfm: deleted preset '" .. tostring(name) .. "'")
+    addon:RefreshMainWindow()
+    return true
+end
+
+function addon:LoadLFMPreset(name)
+    local preset = addon:FindLFMPreset(name)
+    if not preset then
+        return false
+    end
+
+    addon:SetLFMMessage(preset.message or "")
+    local roles = preset.roles or {}
+    local i
+    for i = 1, #LFM_ROLE_ROWS do
+        local key = LFM_ROLE_ROWS[i].key
+        local t = roles[key] or {}
+        addon:SetLFMRoleCount(key, t.count or "")
+        addon:SetLFMRoleClasses(key, t.classes or "")
+    end
+
+    addon.ui = addon.ui or {}
+    addon.ui.lfmSelectedPreset = name
+    if addon.ui.lfmMessageBox then
+        addon.ui.lfmMessageBox:SetText(preset.message or "")
+    end
+    if addon.ui.lfmRoleRows then
+        for i = 1, #addon.ui.lfmRoleRows do
+            local entry = addon.ui.lfmRoleRows[i]
+            local t = roles[entry.key] or {}
+            if entry.countBox then
+                entry.countBox:SetText(tostring(t.count or ""))
+            end
+            if entry.classBox then
+                entry.classBox:SetText(tostring(t.classes or ""))
+            end
+        end
+    end
+
+    addon:RefreshMainWindow()
+    return true
+end
+
+-- Sends the named preset to another player over addon whispers (chunked to fit
+-- the 255-byte addon-message limit; reassembled on the receiving side).
+function addon:ExportLFMPresetTo(presetName, recipient)
+    recipient = Trim(tostring(recipient or ""))
+    if recipient == "" then
+        Print("lfm: enter a character name to send the preset to")
+        return
+    end
+    local preset = addon:FindLFMPreset(presetName)
+    if not preset then
+        Print("lfm: select a preset to export first")
+        return
+    end
+    if type(SendAddonMessage) ~= "function" then
+        Print("lfm: addon messaging is unavailable")
+        return
+    end
+
+    local data = ToHex(SerializeFields(PresetToFields(preset)))
+    addon.lfmExportSeq = (tonumber(addon.lfmExportSeq) or 0) + 1
+    local seq = addon.lfmExportSeq
+    local recipientToken = string.gsub(recipient, "%s+", "")
+    local CHUNK = 200
+    local total = math.max(1, math.ceil(#data / CHUNK))
+
+    -- Build the chunk bodies once, then send over every available channel so the
+    -- preset reaches the target even when the server blocks WHISPER addon msgs.
+    -- Format: "<seq> <idx> <cnt> <recipient> <hexChunk>"; only the named
+    -- recipient acts on it, and duplicates from multiple channels are de-duped.
+    local bodies = {}
+    local idx
+    for idx = 1, total do
+        local chunk = string.sub(data, ((idx - 1) * CHUNK) + 1, idx * CHUNK)
+        bodies[idx] = tostring(seq) .. " " .. tostring(idx) .. " " .. tostring(total)
+            .. " " .. recipientToken .. " " .. chunk
+    end
+
+    local function sendAll(channel, target)
+        for idx = 1, #bodies do
+            if target then
+                SendAddonMessage(LFM_COMM_PREFIX, bodies[idx], channel, target)
+            else
+                SendAddonMessage(LFM_COMM_PREFIX, bodies[idx], channel)
+            end
+        end
+    end
+
+    sendAll("WHISPER", recipient)
+    if IsInGuild and IsInGuild() then
+        sendAll("GUILD")
+    end
+    if GetNumRaidMembers and GetNumRaidMembers() > 0 then
+        sendAll("RAID")
+    elseif GetNumPartyMembers and GetNumPartyMembers() > 0 then
+        sendAll("PARTY")
+    end
+
+    Print("lfm: sent preset '" .. tostring(preset.name) .. "' to " .. recipient .. " (they click Import to accept)")
+end
+
+local MAX_PENDING_IMPORTS = 20
+local MAX_VISIBLE_IMPORT_ROWS = 12
+
+-- Queues a received preset. Re-sends of the same preset from the same sender
+-- replace the earlier copy instead of stacking up.
+function addon:QueuePendingImport(sender, preset)
+    addon.lfmPendingImports = addon.lfmPendingImports or {}
+    local list = addon.lfmPendingImports
+    local i
+    for i = 1, #list do
+        local p = list[i]
+        if p.from == sender and p.preset and preset and p.preset.name == preset.name then
+            list[i] = { from = sender, preset = preset }
+            return #list
+        end
+    end
+    if #list >= MAX_PENDING_IMPORTS then
+        table.remove(list, 1)
+    end
+    list[#list + 1] = { from = sender, preset = preset }
+    return #list
+end
+
+function addon:OnCommReceived(prefix, message, channel, sender)
+    if prefix ~= LFM_COMM_PREFIX then
+        return
+    end
+    local seqStr, idxStr, cntStr, recipient, chunk = string.match(tostring(message or ""), "^(%d+) (%d+) (%d+) (%S+) (.*)$")
+    if not seqStr then
+        return
+    end
+    local seq, idx, cnt = tonumber(seqStr), tonumber(idxStr), tonumber(cntStr)
+    if not seq or not idx or not cnt or cnt < 1 then
+        return
+    end
+
+    -- Only the addressed character processes it (needed because we also broadcast
+    -- over guild/raid so the message still arrives when whispers are blocked).
+    local myName = UnitName("player") or ""
+    if string.lower(recipient) ~= string.lower(myName) then
+        return
+    end
+
+    sender = tostring(sender or "?")
+    -- Strip any realm suffix a channel might append (e.g. "Name-Realm").
+    sender = string.match(sender, "^([^%-]+)") or sender
+
+    local now = (GetTime and GetTime()) or 0
+    addon.lfmCommBuffers = addon.lfmCommBuffers or {}
+
+    -- Drop stale / long-completed transfers so buffers do not accumulate.
+    local key, b
+    for key, b in pairs(addon.lfmCommBuffers) do
+        if b.done and (now - (b.doneAt or 0)) > 120 then
+            addon.lfmCommBuffers[key] = nil
+        elseif not b.done and (now - (b.startedAt or 0)) > 300 then
+            addon.lfmCommBuffers[key] = nil
+        end
+    end
+
+    local bufKey = sender .. "#" .. tostring(seq)
+    local buf = addon.lfmCommBuffers[bufKey]
+    if buf and buf.done then
+        return -- already assembled (a duplicate arriving on another channel)
+    end
+    if not buf then
+        buf = { count = cnt, parts = {}, received = 0, startedAt = now }
+        addon.lfmCommBuffers[bufKey] = buf
+    end
+    if not buf.parts[idx] then
+        buf.parts[idx] = chunk
+        buf.received = buf.received + 1
+    end
+    if buf.received >= buf.count then
+        local data = FromHex(table.concat(buf.parts))
+        buf.parts = nil
+        buf.done = true
+        buf.doneAt = now
+        local preset = FieldsToPreset(DeserializeFields(data, LFM_PRESET_FIELDS))
+        local pendingCount = addon:QueuePendingImport(sender, preset)
+        Print("lfm: received preset '" .. tostring(preset.name) .. "' from " .. sender
+            .. " (" .. tostring(pendingCount) .. " pending) - open the LFM tab and click Import")
+        if addon.ui and addon.ui.importDialog and addon.ui.importDialog:IsShown() then
+            addon:RefreshImportDialog()
+        end
+    end
+end
+
+function addon:HasPendingImport()
+    return type(addon.lfmPendingImports) == "table" and #addon.lfmPendingImports > 0
+end
+
+local function RemovePendingEntry(entry)
+    local list = addon.lfmPendingImports or {}
+    local i
+    for i = 1, #list do
+        if list[i] == entry then
+            table.remove(list, i)
+            return true
+        end
+    end
+    return false
+end
+
+function addon:AcceptImportEntry(entry)
+    if type(entry) ~= "table" or not RemovePendingEntry(entry) then
+        return
+    end
+    if addon:SaveLFMPresetObject(entry.preset) then
+        addon.ui = addon.ui or {}
+        addon.ui.lfmSelectedPreset = entry.preset and entry.preset.name or nil
+        Print("lfm: imported preset '" .. tostring(entry.preset and entry.preset.name) .. "' from " .. tostring(entry.from))
+        addon:RefreshMainWindow()
+    end
+    addon:RefreshImportDialog()
+end
+
+function addon:DeclineImportEntry(entry)
+    if type(entry) ~= "table" or not RemovePendingEntry(entry) then
+        return
+    end
+    Print("lfm: declined preset '" .. tostring(entry.preset and entry.preset.name) .. "' from " .. tostring(entry.from))
+    addon:RefreshImportDialog()
+end
+
+function addon:AcceptAllImports()
+    local list = addon.lfmPendingImports or {}
+    if #list == 0 then
+        return
+    end
+    local count = 0
+    while #list > 0 do
+        local entry = table.remove(list, 1)
+        if addon:SaveLFMPresetObject(entry.preset) then
+            addon.ui = addon.ui or {}
+            addon.ui.lfmSelectedPreset = entry.preset and entry.preset.name or nil
+            count = count + 1
+        end
+    end
+    Print("lfm: imported " .. tostring(count) .. " preset(s)")
+    addon:RefreshMainWindow()
+    addon:RefreshImportDialog()
+end
+
+function addon:DeclineAllImports()
+    local list = addon.lfmPendingImports or {}
+    local n = #list
+    addon.lfmPendingImports = {}
+    if n > 0 then
+        Print("lfm: declined " .. tostring(n) .. " pending preset(s)")
+    end
+    addon:RefreshImportDialog()
+end
+
+function addon:PromptImportPreset()
+    if not addon:HasPendingImport() then
+        Print("lfm: no pending preset invitations")
+        return
+    end
+    addon:ShowImportDialog()
+end
+
+StaticPopupDialogs["RAIDINSPECTOR_SAVE_PRESET"] = {
+    text = "Save the current LFM message + Need table as a preset.\nName:",
+    button1 = "Save",
+    button2 = "Cancel",
+    hasEditBox = true,
+    maxLetters = 40,
+    OnShow = function(self)
+        local editBox = _G[self:GetName() .. "EditBox"]
+        if editBox then
+            editBox:SetText("")
+            editBox:SetFocus()
+        end
+    end,
+    OnAccept = function(self)
+        local editBox = _G[self:GetName() .. "EditBox"]
+        addon:SaveLFMPreset(editBox and editBox:GetText() or "")
+    end,
+    EditBoxOnEnterPressed = function(self)
+        addon:SaveLFMPreset(self:GetText() or "")
+        self:GetParent():Hide()
+    end,
+    EditBoxOnEscapePressed = function(self)
+        self:GetParent():Hide()
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+}
+
+StaticPopupDialogs["RAIDINSPECTOR_EXPORT_PRESET"] = {
+    text = "Send preset '%s' to which character?",
+    button1 = "Send",
+    button2 = "Cancel",
+    hasEditBox = true,
+    maxLetters = 40,
+    OnShow = function(self)
+        local editBox = _G[self:GetName() .. "EditBox"]
+        if editBox then
+            editBox:SetText("")
+            editBox:SetFocus()
+        end
+    end,
+    OnAccept = function(self)
+        local editBox = _G[self:GetName() .. "EditBox"]
+        addon:ExportLFMPresetTo(self.data, editBox and editBox:GetText() or "")
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+}
+
+
 function addon:GetLFMNeedState()
     local state = addon:GetLFMState()
     EnsureLFMNeedDefaults(state)
@@ -2454,8 +3033,10 @@ function addon:RefreshTabVisibility()
         addon.ui.savedReportsRow,
         addon.ui.savedReportsLabel,
         addon.ui.savedReportDropDown,
+        addon.ui.sortRow,
+        addon.ui.sortLabel,
+        addon.ui.sortDropDown,
         addon.ui.actionPanel,
-        addon.ui.sortButton,
         addon.ui.targetButton,
         addon.ui.raidButton,
         addon.ui.syncButton,
@@ -2471,6 +3052,7 @@ function addon:RefreshTabVisibility()
         addon.ui.detailAudit,
         addon.ui.itemFilterLabel,
         addon.ui.itemFilterDropDown,
+        addon.ui.detailHeaderRow,
         addon.ui.detailContainer,
         addon.ui.detailScroll,
     }
@@ -3886,9 +4468,9 @@ function addon:BuildOverviewRows(container, rowCount)
     container.rows = container.rows or {}
     local i
     local rowWidth = tonumber(container:GetWidth()) or 432
-    local actionWidth = 62
+    local actionWidth = 18
     local actionGap = 4
-    local actionArea = (actionWidth * 2) + actionGap + 6
+    local actionArea = (actionWidth * 2) + actionGap + 8
     local containerHeight = tonumber(container:GetHeight()) or 0
     local maxVisibleRows = math.max(1, math.min(OVERVIEW_VISIBLE_ROWS, math.floor(containerHeight / OVERVIEW_ROW_HEIGHT)))
     local parentLevel = (container.GetParent and container:GetParent() and container:GetParent():GetFrameLevel()) or 0
@@ -3924,14 +4506,29 @@ function addon:BuildOverviewRows(container, rowCount)
         text:SetText("")
         text:Show()
 
-        local refreshButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        -- Small square icon buttons (refresh arrow + red X) instead of text buttons.
+        local refreshButton = CreateFrame("Button", nil, row)
         refreshButton:SetWidth(actionWidth)
-        refreshButton:SetHeight(18)
-        refreshButton:SetPoint("RIGHT", row, "RIGHT", -(actionWidth + actionGap + 2), 0)
+        refreshButton:SetHeight(actionWidth)
+        refreshButton:SetPoint("RIGHT", row, "RIGHT", -(actionWidth + actionGap + 4), 0)
         refreshButton:SetFrameStrata("DIALOG")
         refreshButton:SetFrameLevel(parentLevel + 12)
-        refreshButton:SetText("Refresh")
+        refreshButton:SetNormalTexture("Interface\\Buttons\\UI-RotationRight-Button-Up")
+        refreshButton:SetPushedTexture("Interface\\Buttons\\UI-RotationRight-Button-Down")
+        refreshButton:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
         refreshButton:Hide()
+        refreshButton:SetScript("OnEnter", function(self)
+            if GameTooltip then
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Refresh")
+                GameTooltip:Show()
+            end
+        end)
+        refreshButton:SetScript("OnLeave", function()
+            if GameTooltip then
+                GameTooltip:Hide()
+            end
+        end)
         refreshButton:SetScript("OnClick", function(self)
             SafeInvoke("row-refresh", function()
                 local targetKey = self.key or row.key
@@ -3941,14 +4538,28 @@ function addon:BuildOverviewRows(container, rowCount)
             end)
         end)
 
-        local removeButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+        local removeButton = CreateFrame("Button", nil, row)
         removeButton:SetWidth(actionWidth)
-        removeButton:SetHeight(18)
-        removeButton:SetPoint("RIGHT", row, "RIGHT", -2, 0)
+        removeButton:SetHeight(actionWidth)
+        removeButton:SetPoint("RIGHT", row, "RIGHT", -4, 0)
         removeButton:SetFrameStrata("DIALOG")
         removeButton:SetFrameLevel(parentLevel + 12)
-        removeButton:SetText("Remove")
+        removeButton:SetNormalTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Up")
+        removeButton:SetPushedTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Down")
+        removeButton:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
         removeButton:Hide()
+        removeButton:SetScript("OnEnter", function(self)
+            if GameTooltip then
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText("Remove")
+                GameTooltip:Show()
+            end
+        end)
+        removeButton:SetScript("OnLeave", function()
+            if GameTooltip then
+                GameTooltip:Hide()
+            end
+        end)
         removeButton:SetScript("OnClick", function(self)
             SafeInvoke("row-remove", function()
                 local targetKey = self.key or row.key
@@ -3983,6 +4594,42 @@ function addon:BuildOverviewRows(container, rowCount)
     end
 end
 
+-- Sets a font string's text, shortening it with an ellipsis (binary search on
+-- the real rendered width) when it would overflow maxWidth.
+local function SetTruncatedText(fontString, text, maxWidth)
+    text = tostring(text or "")
+    fontString:SetText(text)
+    if not fontString.GetStringWidth or fontString:GetStringWidth() <= maxWidth then
+        return
+    end
+
+    local lo, hi, best = 1, #text, 1
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        fontString:SetText(string.sub(text, 1, mid) .. "...")
+        if fontString:GetStringWidth() <= maxWidth then
+            best = mid
+            lo = mid + 1
+        else
+            hi = mid - 1
+        end
+    end
+    fontString:SetText(string.sub(text, 1, best) .. "...")
+end
+
+local function ClearDetailRowColumns(row)
+    if not row or not row.colFS then
+        return
+    end
+    local c
+    for c = 1, #DETAIL_COLUMNS do
+        local fs = row.colFS[DETAIL_COLUMNS[c].key]
+        if fs then
+            fs:SetText("")
+        end
+    end
+end
+
 function addon:BuildDetailRows(container, rowCount)
     container.rows = container.rows or {}
     local i
@@ -3995,22 +4642,30 @@ function addon:BuildDetailRows(container, rowCount)
         row:SetPoint("TOPLEFT", container, "TOPLEFT", 0, -(i - 1) * DETAIL_ROW_HEIGHT)
         row:EnableMouse(true)
 
-        local text = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        text:SetPoint("LEFT", row, "LEFT", 0, 0)
-        text:SetWidth(rowWidth)
-        text:SetHeight(DETAIL_ROW_HEIGHT)
-        text:SetJustifyH("LEFT")
-        text:SetJustifyV("MIDDLE")
-        -- Slightly larger font for the gear list so lines read with better spacing.
-        if text.GetFont and text.SetFont then
-            local fontName, fontHeight, fontFlags = text:GetFont()
-            if fontName and fontHeight then
-                text:SetFont(fontName, fontHeight + 1, fontFlags)
+        -- One FontString per fixed column (Slot / Item Name / iLvl / Enchant / Gems).
+        row.colFS = {}
+        local c
+        for c = 1, #DETAIL_COLUMNS do
+            local col = DETAIL_COLUMNS[c]
+            local fs = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            fs:SetPoint("LEFT", row, "LEFT", col.x, 0)
+            fs:SetWidth(col.width)
+            fs:SetHeight(DETAIL_ROW_HEIGHT)
+            fs:SetJustifyH("LEFT")
+            fs:SetJustifyV("MIDDLE")
+            if fs.SetWordWrap then
+                fs:SetWordWrap(false)
             end
+            if fs.GetFont and fs.SetFont then
+                local fontName, fontHeight, fontFlags = fs:GetFont()
+                if fontName and fontHeight then
+                    fs:SetFont(fontName, fontHeight + 1, fontFlags)
+                end
+            end
+            fs:SetText("")
+            row.colFS[col.key] = fs
         end
-        text:SetText("")
 
-        row.text = text
         row.data = nil
         row:RegisterForClicks("RightButtonUp")
         row:SetScript("OnEnter", function(self)
@@ -4076,7 +4731,7 @@ function addon:ApplyButtonModeLayout()
     -- Filter, Status, Stale/Refresh, and Save One were removed from the window;
     -- their slash commands (/ri filter, /ri status, /ri refreshstale, /ri savereport) still work.
     local visible = {
-        sort = true,
+        sort = false,
         filter = false,
         target = true,
         raid = true,
@@ -4088,7 +4743,7 @@ function addon:ApplyButtonModeLayout()
         clear = true,
     }
 
-    local order = { "sort", "target", "raid", "sync", "report", "clear" }
+    local order = { "target", "raid", "sync", "report", "clear" }
 
     local key, button
     for key, button in pairs(buttons) do
@@ -4433,6 +5088,417 @@ function addon:GetDetailRowCopyValue(row)
     return nil
 end
 
+function addon:RefreshOptionsDialog()
+    local dialog = addon.ui and addon.ui.optionsDialog
+    if not dialog then
+        return
+    end
+
+    if dialog.scaleSlider then
+        local scale = addon:GetWindowScale()
+        dialog.scaleSlider:SetValue(scale)
+        local valueText = _G["RaidInspectorScaleSliderText"]
+        if valueText then
+            valueText:SetText("Scale: " .. tostring(scale))
+        end
+    end
+
+    local binds = addon:GetKeybinds()
+    if dialog.keyButtons then
+        local i
+        for i = 1, #KEYBIND_ACTIONS do
+            local def = KEYBIND_ACTIONS[i]
+            local btn = dialog.keyButtons[def.key]
+            if btn then
+                if dialog.capturingAction == def.key then
+                    btn:SetText("Press a key... (Esc)")
+                else
+                    local key = binds[def.key]
+                    if type(key) == "string" and key ~= "" then
+                        btn:SetText(key)
+                    else
+                        btn:SetText("Set")
+                    end
+                end
+            end
+        end
+    end
+end
+
+function addon:HandleKeybindKey(key)
+    local dialog = addon.ui and addon.ui.optionsDialog
+    if not dialog or not dialog.capturingAction then
+        return
+    end
+
+    -- Ignore lone modifier keys; wait for the actual key.
+    if key == "LSHIFT" or key == "RSHIFT" or key == "LCTRL" or key == "RCTRL"
+        or key == "LALT" or key == "RALT" or key == "UNKNOWN" then
+        return
+    end
+
+    dialog:EnableKeyboard(false)
+    dialog:SetScript("OnKeyDown", nil)
+
+    local action = dialog.capturingAction
+    dialog.capturingAction = nil
+
+    if key ~= "ESCAPE" then
+        local combo = ""
+        if IsShiftKeyDown() then
+            combo = combo .. "SHIFT-"
+        end
+        if IsControlKeyDown() then
+            combo = combo .. "CTRL-"
+        end
+        if IsAltKeyDown() then
+            combo = combo .. "ALT-"
+        end
+        combo = combo .. key
+        addon:SetKeybind(action, combo)
+    end
+
+    addon:RefreshOptionsDialog()
+end
+
+function addon:BeginKeybindCapture(actionKey)
+    local dialog = addon.ui and addon.ui.optionsDialog
+    if not dialog then
+        return
+    end
+    dialog.capturingAction = actionKey
+    dialog:EnableKeyboard(true)
+    dialog:SetScript("OnKeyDown", function(_, key)
+        SafeInvoke("keybind-capture", function()
+            addon:HandleKeybindKey(key)
+        end)
+    end)
+    addon:RefreshOptionsDialog()
+end
+
+function addon:RefreshImportDialog()
+    local dialog = addon.ui and addon.ui.importDialog
+    if not dialog then
+        return
+    end
+
+    local list = addon.lfmPendingImports or {}
+    local visible = math.min(#list, MAX_VISIBLE_IMPORT_ROWS)
+    local i
+    for i = 1, MAX_VISIBLE_IMPORT_ROWS do
+        local row = dialog.rows[i]
+        if not row then
+            break
+        end
+        local entry = (i <= visible) and list[i] or nil
+        if entry then
+            row.entry = entry
+            row.acceptButton.entry = entry
+            row.declineButton.entry = entry
+            local labelText = tostring(entry.preset and entry.preset.name or "?")
+                .. "   (from " .. tostring(entry.from) .. ")"
+            SetTruncatedText(row.label, labelText, 284)
+            row:Show()
+        else
+            row.entry = nil
+            row.acceptButton.entry = nil
+            row.declineButton.entry = nil
+            row:Hide()
+        end
+    end
+
+    if dialog.moreText then
+        if #list > MAX_VISIBLE_IMPORT_ROWS then
+            dialog.moreText:SetText("... and " .. tostring(#list - MAX_VISIBLE_IMPORT_ROWS) .. " more")
+            dialog.moreText:Show()
+        else
+            dialog.moreText:Hide()
+        end
+    end
+
+    if dialog.emptyText then
+        if #list == 0 then
+            dialog.emptyText:Show()
+        else
+            dialog.emptyText:Hide()
+        end
+    end
+end
+
+-- Lists every received LFM preset so each can be individually accepted/declined.
+function addon:ShowImportDialog()
+    addon.ui = addon.ui or {}
+    local dialog = addon.ui.importDialog
+
+    if not dialog then
+        dialog = CreateFrame("Frame", "RaidInspectorImportDialog", UIParent)
+        dialog:SetWidth(480)
+        dialog:SetHeight(470)
+        dialog:SetPoint("CENTER", UIParent, "CENTER", 0, 40)
+        dialog:SetFrameStrata("FULLSCREEN_DIALOG")
+        dialog:SetToplevel(true)
+        dialog:EnableMouse(true)
+        dialog:SetMovable(true)
+        dialog:RegisterForDrag("LeftButton")
+        dialog:SetScript("OnDragStart", function(self)
+            self:StartMoving()
+        end)
+        dialog:SetScript("OnDragStop", function(self)
+            self:StopMovingOrSizing()
+        end)
+        dialog:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true,
+            tileSize = 16,
+            edgeSize = 16,
+            insets = { left = 5, right = 5, top = 5, bottom = 5 },
+        })
+        if dialog.SetBackdropColor then
+            dialog:SetBackdropColor(0.02, 0.02, 0.02, 0.96)
+        end
+        if dialog.SetBackdropBorderColor then
+            dialog:SetBackdropBorderColor(0.85, 0.72, 0.18, 1)
+        end
+
+        local title = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        title:SetPoint("TOPLEFT", dialog, "TOPLEFT", 16, -14)
+        title:SetText("Raid Inspector - Pending Imports")
+
+        local hint = dialog:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        hint:SetPoint("TOPLEFT", dialog, "TOPLEFT", 18, -38)
+        hint:SetText("Accept or decline each received LFM preset.")
+
+        local emptyText = dialog:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+        emptyText:SetPoint("TOPLEFT", dialog, "TOPLEFT", 18, -70)
+        emptyText:SetText("No pending imports.")
+        emptyText:Hide()
+        dialog.emptyText = emptyText
+
+        dialog.rows = {}
+        local i
+        for i = 1, MAX_VISIBLE_IMPORT_ROWS do
+            local row = CreateFrame("Frame", nil, dialog)
+            row:SetPoint("TOPLEFT", dialog, "TOPLEFT", 18, -58 - ((i - 1) * 28))
+            row:SetWidth(444)
+            row:SetHeight(26)
+
+            local label = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            label:SetPoint("LEFT", row, "LEFT", 0, 0)
+            label:SetWidth(290)
+            label:SetJustifyH("LEFT")
+            if label.SetWordWrap then
+                label:SetWordWrap(false)
+            end
+            row.label = label
+
+            local acceptButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+            acceptButton:SetWidth(70)
+            acceptButton:SetHeight(22)
+            acceptButton:SetPoint("LEFT", label, "RIGHT", 8, 0)
+            acceptButton:SetText("|cff66ff66Accept|r")
+            acceptButton:SetScript("OnClick", function(self)
+                SafeInvoke("import-accept", function()
+                    addon:AcceptImportEntry(self.entry)
+                end)
+            end)
+            row.acceptButton = acceptButton
+
+            local declineButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+            declineButton:SetWidth(70)
+            declineButton:SetHeight(22)
+            declineButton:SetPoint("LEFT", acceptButton, "RIGHT", 6, 0)
+            declineButton:SetText("|cffff7777Decline|r")
+            declineButton:SetScript("OnClick", function(self)
+                SafeInvoke("import-decline", function()
+                    addon:DeclineImportEntry(self.entry)
+                end)
+            end)
+            row.declineButton = declineButton
+
+            row:Hide()
+            dialog.rows[i] = row
+        end
+
+        local moreText = dialog:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        moreText:SetPoint("TOPLEFT", dialog, "TOPLEFT", 18, -58 - (MAX_VISIBLE_IMPORT_ROWS * 28) - 2)
+        moreText:Hide()
+        dialog.moreText = moreText
+
+        local acceptAllButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+        acceptAllButton:SetWidth(100)
+        acceptAllButton:SetHeight(22)
+        acceptAllButton:SetPoint("BOTTOMLEFT", dialog, "BOTTOMLEFT", 16, 14)
+        acceptAllButton:SetText("Accept All")
+        acceptAllButton:SetScript("OnClick", function()
+            SafeInvoke("import-accept-all", function()
+                addon:AcceptAllImports()
+            end)
+        end)
+
+        local declineAllButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+        declineAllButton:SetWidth(100)
+        declineAllButton:SetHeight(22)
+        declineAllButton:SetPoint("LEFT", acceptAllButton, "RIGHT", 6, 0)
+        declineAllButton:SetText("Decline All")
+        declineAllButton:SetScript("OnClick", function()
+            SafeInvoke("import-decline-all", function()
+                addon:DeclineAllImports()
+            end)
+        end)
+
+        local closeButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+        closeButton:SetWidth(90)
+        closeButton:SetHeight(22)
+        closeButton:SetPoint("BOTTOMRIGHT", dialog, "BOTTOMRIGHT", -16, 14)
+        closeButton:SetText("Close")
+        closeButton:SetScript("OnClick", function()
+            dialog:Hide()
+        end)
+
+        addon.ui.importDialog = dialog
+    end
+
+    addon:RefreshImportDialog()
+    dialog:Show()
+    if dialog.Raise then
+        dialog:Raise()
+    end
+end
+
+-- Options: window scale slider + PallyPower-style keybinds for the action buttons.
+function addon:ShowOptionsDialog()
+    addon.ui = addon.ui or {}
+    local dialog = addon.ui.optionsDialog
+
+    if not dialog then
+        dialog = CreateFrame("Frame", "RaidInspectorOptionsDialog", UIParent)
+        dialog:SetWidth(440)
+        dialog:SetHeight(360)
+        dialog:SetPoint("CENTER", UIParent, "CENTER", 0, 60)
+        dialog:SetFrameStrata("FULLSCREEN_DIALOG")
+        dialog:SetToplevel(true)
+        dialog:EnableMouse(true)
+        dialog:SetMovable(true)
+        dialog:RegisterForDrag("LeftButton")
+        dialog:SetScript("OnDragStart", function(self)
+            self:StartMoving()
+        end)
+        dialog:SetScript("OnDragStop", function(self)
+            self:StopMovingOrSizing()
+        end)
+        dialog:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true,
+            tileSize = 16,
+            edgeSize = 16,
+            insets = { left = 5, right = 5, top = 5, bottom = 5 },
+        })
+        if dialog.SetBackdropColor then
+            dialog:SetBackdropColor(0.02, 0.02, 0.02, 0.96)
+        end
+        if dialog.SetBackdropBorderColor then
+            dialog:SetBackdropBorderColor(0.85, 0.72, 0.18, 1)
+        end
+
+        local title = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        title:SetPoint("TOPLEFT", dialog, "TOPLEFT", 16, -14)
+        title:SetText("Raid Inspector - Options")
+
+        local scaleLabel = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        scaleLabel:SetPoint("TOPLEFT", dialog, "TOPLEFT", 20, -46)
+        scaleLabel:SetText("Window Scale")
+
+        local slider = CreateFrame("Slider", "RaidInspectorScaleSlider", dialog, "OptionsSliderTemplate")
+        slider:SetPoint("TOPLEFT", scaleLabel, "BOTTOMLEFT", 8, -22)
+        slider:SetWidth(370)
+        slider:SetMinMaxValues(MIN_WINDOW_SCALE, MAX_WINDOW_SCALE)
+        slider:SetValueStep(0.05)
+        if _G["RaidInspectorScaleSliderLow"] then
+            _G["RaidInspectorScaleSliderLow"]:SetText(tostring(MIN_WINDOW_SCALE))
+        end
+        if _G["RaidInspectorScaleSliderHigh"] then
+            _G["RaidInspectorScaleSliderHigh"]:SetText(tostring(MAX_WINDOW_SCALE))
+        end
+        slider:SetScript("OnValueChanged", function(_, value)
+            local rounded = math.floor((value * 20) + 0.5) / 20
+            addon:SetWindowScale(rounded)
+            local valueText = _G["RaidInspectorScaleSliderText"]
+            if valueText then
+                valueText:SetText("Scale: " .. tostring(rounded))
+            end
+        end)
+        dialog.scaleSlider = slider
+
+        local keyHeader = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        keyHeader:SetPoint("TOPLEFT", slider, "BOTTOMLEFT", -8, -26)
+        keyHeader:SetText("|cffffd100Keybinds|r  (click Set, then press a key; Esc cancels)")
+
+        dialog.keyButtons = {}
+        local i
+        for i = 1, #KEYBIND_ACTIONS do
+            local def = KEYBIND_ACTIONS[i]
+            local rowY = -14 - ((i - 1) * 28)
+
+            local rowLabel = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            rowLabel:SetPoint("TOPLEFT", keyHeader, "BOTTOMLEFT", 6, rowY)
+            rowLabel:SetWidth(90)
+            rowLabel:SetJustifyH("LEFT")
+            rowLabel:SetText(def.label)
+
+            local keyButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+            keyButton:SetPoint("TOPLEFT", keyHeader, "BOTTOMLEFT", 104, rowY + 2)
+            keyButton:SetWidth(230)
+            keyButton:SetHeight(22)
+            keyButton:SetText("Set")
+            keyButton.actionKey = def.key
+            keyButton:SetScript("OnClick", function(self)
+                SafeInvoke("keybind-set", function()
+                    addon:BeginKeybindCapture(self.actionKey)
+                end)
+            end)
+            dialog.keyButtons[def.key] = keyButton
+
+            local clearButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+            clearButton:SetPoint("LEFT", keyButton, "RIGHT", 6, 0)
+            clearButton:SetWidth(24)
+            clearButton:SetHeight(22)
+            clearButton:SetText("X")
+            clearButton.actionKey = def.key
+            clearButton:SetScript("OnClick", function(self)
+                SafeInvoke("keybind-clear", function()
+                    addon:ClearKeybind(self.actionKey)
+                    addon:RefreshOptionsDialog()
+                end)
+            end)
+        end
+
+        local closeButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+        closeButton:SetWidth(90)
+        closeButton:SetHeight(22)
+        closeButton:SetPoint("BOTTOM", dialog, "BOTTOM", 0, 14)
+        closeButton:SetText("Close")
+        closeButton:SetScript("OnClick", function()
+            dialog.capturingAction = nil
+            dialog:EnableKeyboard(false)
+            dialog:SetScript("OnKeyDown", nil)
+            dialog:Hide()
+        end)
+
+        addon.ui.optionsDialog = dialog
+    end
+
+    dialog.capturingAction = nil
+    dialog:EnableKeyboard(false)
+    dialog:SetScript("OnKeyDown", nil)
+    addon:RefreshOptionsDialog()
+    dialog:Show()
+    if dialog.Raise then
+        dialog:Raise()
+    end
+end
+
 -- Movable help dialog that explains what the buttons / mouse actions do.
 function addon:ShowInfoDialog()
     addon.ui = addon.ui or {}
@@ -4506,6 +5572,11 @@ function addon:ShowInfoDialog()
             "Pick channels, set Delay (s) and Repeat, fill the Need table",
             "(Tank/Healer/Melee/Ranged with a count + classes), then press POST.",
             "Cancel stops any pending posts.",
+            "Presets: Save Template stores the message + Need table; pick it from the",
+            "dropdown to reload it. Export sends it to another player (they Import to accept).",
+            " ",
+            "|cffffd100Options button|r",
+            "Window scale slider + keybinds for Target / Raid / Share / Save All / Clear.",
             " ",
             "|cffffd100Chat commands|r",
             "/ri - open this window.   /ri help - list every command.",
@@ -4576,6 +5647,7 @@ function addon:CreateMainWindow()
         RaidInspectorDB.settings.window.x,
         RaidInspectorDB.settings.window.y
     )
+    f:SetScale(addon:GetWindowScale())
 
     local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", f, "TOPLEFT", 16, -14)
@@ -4617,6 +5689,17 @@ function addon:CreateMainWindow()
     infoButton:SetScript("OnClick", function()
         SafeInvoke("info", function()
             addon:ShowInfoDialog()
+        end)
+    end)
+
+    local optionsButton = CreateFrame("Button", "RaidInspectorOptionsButton", f, "UIPanelButtonTemplate")
+    optionsButton:SetWidth(80)
+    optionsButton:SetHeight(20)
+    optionsButton:SetPoint("LEFT", infoButton, "RIGHT", 6, 0)
+    optionsButton:SetText("|cffffd100Options|r")
+    optionsButton:SetScript("OnClick", function()
+        SafeInvoke("options", function()
+            addon:ShowOptionsDialog()
         end)
     end)
 
@@ -4744,8 +5827,44 @@ function addon:CreateMainWindow()
     UIDropDownMenu_SetSelectedValue(savedReportDropDown, "")
     UIDropDownMenu_SetText(savedReportDropDown, "Live Overview")
 
+    local sortRow = CreateFrame("Frame", nil, f)
+    sortRow:SetPoint("TOPLEFT", savedReportsRow, "BOTTOMLEFT", 0, -6)
+    sortRow:SetWidth(300)
+    sortRow:SetHeight(20)
+
+    local sortLabel = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    sortLabel:SetPoint("LEFT", sortRow, "LEFT", 0, 0)
+    sortLabel:SetText("Sort:")
+
+    local sortDropDown = CreateFrame("Frame", "RaidInspectorSortDropDown", f, "UIDropDownMenuTemplate")
+    sortDropDown:SetPoint("LEFT", sortLabel, "RIGHT", -6, 2)
+    UIDropDownMenu_SetWidth(sortDropDown, 120)
+    UIDropDownMenu_JustifyText(sortDropDown, "LEFT")
+    UIDropDownMenu_Initialize(sortDropDown, function(_, level)
+        if level ~= 1 then
+            return
+        end
+
+        local i
+        for i = 1, #SORT_MODES do
+            local mode = SORT_MODES[i]
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = SORT_LABELS[mode] or mode
+            info.value = mode
+            info.checked = (addon:GetSortMode() == mode)
+            info.func = function(btn)
+                addon:SetSortMode(btn.value)
+                UIDropDownMenu_SetSelectedValue(sortDropDown, btn.value)
+                UIDropDownMenu_SetText(sortDropDown, SORT_LABELS[btn.value] or btn.value)
+            end
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end)
+    UIDropDownMenu_SetSelectedValue(sortDropDown, addon:GetSortMode())
+    UIDropDownMenu_SetText(sortDropDown, SORT_LABELS[addon:GetSortMode()] or addon:GetSortMode())
+
     local actionPanel = CreateFrame("Frame", nil, f)
-    actionPanel:SetPoint("TOPLEFT", savedReportsRow, "BOTTOMLEFT", 0, -8)
+    actionPanel:SetPoint("TOPLEFT", sortRow, "BOTTOMLEFT", 0, -6)
     actionPanel:SetWidth(318)
     actionPanel:SetHeight(98)
 
@@ -4988,8 +6107,25 @@ function addon:CreateMainWindow()
     UIDropDownMenu_SetSelectedValue(itemFilterDropDown, selectedItemFilter)
     UIDropDownMenu_SetText(itemFilterDropDown, ITEM_LIST_FILTER_LABELS[selectedItemFilter] or selectedItemFilter)
 
+    -- Column header row for the gear list.
+    local detailHeaderRow = CreateFrame("Frame", nil, f)
+    detailHeaderRow:SetPoint("TOPLEFT", itemFilterLabel, "BOTTOMLEFT", 0, -8)
+    detailHeaderRow:SetWidth(rightPanelWidth)
+    detailHeaderRow:SetHeight(16)
+    do
+        local hc
+        for hc = 1, #DETAIL_COLUMNS do
+            local col = DETAIL_COLUMNS[hc]
+            local headerFS = detailHeaderRow:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            headerFS:SetPoint("LEFT", detailHeaderRow, "LEFT", col.x, 0)
+            headerFS:SetWidth(col.width)
+            headerFS:SetJustifyH("LEFT")
+            headerFS:SetText(col.header)
+        end
+    end
+
     local detailContainer = CreateFrame("Frame", nil, f)
-    detailContainer:SetPoint("TOPLEFT", itemFilterLabel, "BOTTOMLEFT", 0, -10)
+    detailContainer:SetPoint("TOPLEFT", detailHeaderRow, "BOTTOMLEFT", 0, -2)
     detailContainer:SetWidth(rightPanelWidth)
     detailContainer:SetHeight(340)
     if detailContainer.SetClipsChildren then
@@ -5275,6 +6411,102 @@ function addon:CreateMainWindow()
         })
     end
 
+    -- ===== LFM preset controls (save / load / delete / import / export) =====
+    local presetLabel = lfmNeedPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    presetLabel:SetPoint("TOPLEFT", lfmNeedLabel, "BOTTOMLEFT", 4, -142)
+    presetLabel:SetText("Preset:")
+
+    local lfmPresetDropDown = CreateFrame("Frame", "RaidInspectorLFMPresetDropDown", lfmNeedPanel, "UIDropDownMenuTemplate")
+    lfmPresetDropDown:SetPoint("LEFT", presetLabel, "RIGHT", -6, 2)
+    UIDropDownMenu_SetWidth(lfmPresetDropDown, 180)
+    UIDropDownMenu_JustifyText(lfmPresetDropDown, "LEFT")
+    UIDropDownMenu_Initialize(lfmPresetDropDown, function(_, level)
+        if level ~= 1 then
+            return
+        end
+        local presets = addon:GetLFMPresets()
+        if #presets == 0 then
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = "No saved presets"
+            info.disabled = true
+            UIDropDownMenu_AddButton(info, level)
+            return
+        end
+        local i
+        for i = 1, #presets do
+            local preset = presets[i]
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = preset.name
+            info.value = preset.name
+            info.checked = (addon.ui and addon.ui.lfmSelectedPreset == preset.name)
+            info.func = function(btn)
+                addon:LoadLFMPreset(btn.value)
+                UIDropDownMenu_SetSelectedValue(lfmPresetDropDown, btn.value)
+                UIDropDownMenu_SetText(lfmPresetDropDown, btn.value)
+            end
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end)
+    UIDropDownMenu_SetText(lfmPresetDropDown, "Select preset")
+
+    local lfmPresetDeleteButton = CreateFrame("Button", "RaidInspectorLFMPresetDelete", lfmNeedPanel, "UIPanelButtonTemplate")
+    lfmPresetDeleteButton:SetPoint("LEFT", lfmPresetDropDown, "RIGHT", -8, 2)
+    lfmPresetDeleteButton:SetWidth(24)
+    lfmPresetDeleteButton:SetHeight(22)
+    lfmPresetDeleteButton:SetText("X")
+    lfmPresetDeleteButton:SetScript("OnClick", function()
+        SafeInvoke("lfm-preset-delete", function()
+            local name = addon.ui and addon.ui.lfmSelectedPreset
+            if name and name ~= "" then
+                addon:DeleteLFMPreset(name)
+            else
+                Print("lfm: select a preset to delete")
+            end
+        end)
+    end)
+
+    local lfmSaveTemplateButton = CreateFrame("Button", "RaidInspectorLFMSaveTemplate", lfmNeedPanel, "UIPanelButtonTemplate")
+    lfmSaveTemplateButton:SetPoint("TOPLEFT", presetLabel, "BOTTOMLEFT", 0, -10)
+    lfmSaveTemplateButton:SetWidth(96)
+    lfmSaveTemplateButton:SetHeight(22)
+    lfmSaveTemplateButton:SetText("Save Template")
+    lfmSaveTemplateButton:SetScript("OnClick", function()
+        SafeInvoke("lfm-preset-save", function()
+            if type(StaticPopup_Show) == "function" then
+                StaticPopup_Show("RAIDINSPECTOR_SAVE_PRESET")
+            end
+        end)
+    end)
+
+    local lfmImportTemplateButton = CreateFrame("Button", "RaidInspectorLFMImportTemplate", lfmNeedPanel, "UIPanelButtonTemplate")
+    lfmImportTemplateButton:SetPoint("LEFT", lfmSaveTemplateButton, "RIGHT", 6, 0)
+    lfmImportTemplateButton:SetWidth(96)
+    lfmImportTemplateButton:SetHeight(22)
+    lfmImportTemplateButton:SetText("Import")
+    lfmImportTemplateButton:SetScript("OnClick", function()
+        SafeInvoke("lfm-preset-import", function()
+            addon:PromptImportPreset()
+        end)
+    end)
+
+    local lfmExportTemplateButton = CreateFrame("Button", "RaidInspectorLFMExportTemplate", lfmNeedPanel, "UIPanelButtonTemplate")
+    lfmExportTemplateButton:SetPoint("LEFT", lfmImportTemplateButton, "RIGHT", 6, 0)
+    lfmExportTemplateButton:SetWidth(96)
+    lfmExportTemplateButton:SetHeight(22)
+    lfmExportTemplateButton:SetText("Export")
+    lfmExportTemplateButton:SetScript("OnClick", function()
+        SafeInvoke("lfm-preset-export", function()
+            local name = addon.ui and addon.ui.lfmSelectedPreset
+            if not name or name == "" then
+                Print("lfm: select a preset to export first")
+                return
+            end
+            if type(StaticPopup_Show) == "function" then
+                StaticPopup_Show("RAIDINSPECTOR_EXPORT_PRESET", name, nil, name)
+            end
+        end)
+    end)
+
     addon.ui.frame = f
     addon.ui.subtitle = subtitle
     addon.ui.inspectorTabButton = inspectorTabButton
@@ -5288,6 +6520,9 @@ function addon:CreateMainWindow()
     addon.ui.guildShareCheck = guildShareCheck
     addon.ui.savedReportsRow = savedReportsRow
     addon.ui.savedReportsLabel = savedReportsLabel
+    addon.ui.sortRow = sortRow
+    addon.ui.sortLabel = sortLabel
+    addon.ui.sortDropDown = sortDropDown
     addon.ui.actionPanel = actionPanel
     addon.ui.sortButton = sortButton
     addon.ui.filterButton = filterButton
@@ -5312,6 +6547,7 @@ function addon:CreateMainWindow()
     addon.ui.detailAudit = detailAudit
     addon.ui.itemFilterLabel = itemFilterLabel
     addon.ui.itemFilterDropDown = itemFilterDropDown
+    addon.ui.detailHeaderRow = detailHeaderRow
     addon.ui.detailContainer = detailContainer
     addon.ui.detailRows = detailContainer.rows
     addon.ui.detailScroll = detailScroll
@@ -5330,9 +6566,11 @@ function addon:CreateMainWindow()
     addon.ui.lfmCancelButton = lfmCancelButton
     addon.ui.lfmChannelStatus = lfmChannelStatus
     addon.ui.lfmRoleRows = lfmRoleRows
+    addon.ui.lfmPresetDropDown = lfmPresetDropDown
 
     addon:ApplyButtonModeLayout()
     addon:SetActiveTab(addon:GetActiveTab())
+    addon:ApplyKeybinds()
 
     f:Hide()
 end
@@ -5557,10 +6795,12 @@ local function EntryIsPendingNotInspectable(entry)
     return entry.isFresh ~= true
 end
 
-function addon:BuildSlotLine(slotKey, item)
+-- Returns the aligned-column data for a gear slot: { slot, name, ilvl, enchant,
+-- gems, r, g, b }. Colour follows the same priority as the old single line.
+function addon:BuildSlotColumns(slotKey, item)
     local slotLabel = SLOT_LABELS[slotKey] or slotKey
     if not item then
-        return ColorText(slotLabel .. ": -", "bbbbbb")
+        return { slot = slotLabel, name = "-", ilvl = "", enchant = "", gems = "", r = 0.72, g = 0.72, b = 0.72 }
     end
 
     local itemName = item.name
@@ -5576,7 +6816,7 @@ function addon:BuildSlotLine(slotKey, item)
     local ilvl = tonumber(item.ilvl)
     local ilvlText = ""
     if ilvl and ilvl > 0 then
-        ilvlText = " i" .. tostring(ilvl)
+        ilvlText = "i" .. tostring(ilvl)
     end
 
     local enchantText = "E:n/a"
@@ -5614,23 +6854,30 @@ function addon:BuildSlotLine(slotKey, item)
         end
     end
 
-    local line = slotLabel .. ": " .. itemName .. ilvlText .. " | " .. enchantText .. " | " .. gemText
-
-    -- PvP gear (has resilience) is flagged and coloured orange, taking priority
-    -- so it stands out even if it is otherwise fully enchanted/gemmed.
     if item.isPvp then
-        return ColorText(line .. " | PVP", "ff8000")
+        gemText = gemText .. " PVP"
     end
 
-    if missingEnchant or missingGems then
-        return ColorText(line, "ff6666")
+    local columns = {
+        slot = slotLabel,
+        name = itemName,
+        ilvl = ilvlText,
+        enchant = enchantText,
+        gems = gemText,
+    }
+
+    -- PvP orange takes priority so it stands out even if otherwise complete.
+    if item.isPvp then
+        columns.r, columns.g, columns.b = 1.0, 0.5, 0.0
+    elseif missingEnchant or missingGems then
+        columns.r, columns.g, columns.b = 1.0, 0.4, 0.4
+    elseif ENCHANTABLE_SLOTS[slotKey] or socketCount > 0 then
+        columns.r, columns.g, columns.b = 0.4, 1.0, 0.4
+    else
+        columns.r, columns.g, columns.b = 0.87, 0.87, 0.87
     end
 
-    if ENCHANTABLE_SLOTS[slotKey] or socketCount > 0 then
-        return ColorText(line, "66ff66")
-    end
-
-    return ColorText(line, "dddddd")
+    return columns
 end
 
 local function ItemMatchesListFilter(mode, slotKey, item)
@@ -5690,7 +6937,7 @@ function addon:RefreshDetailPanel(selectedEntry)
         end
         local i
         for i = 1, #addon.ui.detailRows do
-            addon.ui.detailRows[i].text:SetText("")
+            ClearDetailRowColumns(addon.ui.detailRows[i])
             addon.ui.detailRows[i].data = nil
         end
         return
@@ -5725,7 +6972,7 @@ function addon:RefreshDetailPanel(selectedEntry)
         end
         local i
         for i = 1, #addon.ui.detailRows do
-            addon.ui.detailRows[i].text:SetText("")
+            ClearDetailRowColumns(addon.ui.detailRows[i])
             addon.ui.detailRows[i].data = nil
         end
         return
@@ -5806,7 +7053,7 @@ function addon:RefreshDetailPanel(selectedEntry)
         local slotItem = itemsBySlot[slotKey]
         if ItemMatchesListFilter(filterMode, slotKey, slotItem) then
             table.insert(detailLines, {
-                text = addon:BuildSlotLine(slotKey, slotItem),
+                columns = addon:BuildSlotColumns(slotKey, slotItem),
                 item = slotItem,
                 slotKey = slotKey,
             })
@@ -5815,13 +7062,15 @@ function addon:RefreshDetailPanel(selectedEntry)
 
     if unslotted > 0 and filterMode == "all" then
         table.insert(detailLines, {
-            text = ColorText("Other: " .. tostring(unslotted) .. " unslotted item(s)", "ffcc66"),
+            infoText = "Other: " .. tostring(unslotted) .. " unslotted item(s)",
+            r = 1.0, g = 0.8, b = 0.4,
         })
     end
 
     if #detailLines == 0 then
         table.insert(detailLines, {
-            text = ColorText("No items match selected filter.", "ffcc66"),
+            infoText = "No items match selected filter.",
+            r = 1.0, g = 0.8, b = 0.4,
         })
     end
 
@@ -5850,11 +7099,37 @@ function addon:RefreshDetailPanel(selectedEntry)
     for rowIndex = 1, #addon.ui.detailRows do
         local lineData = detailLines[rowIndex + offset]
         local row = addon.ui.detailRows[rowIndex]
-        if lineData then
-            row.text:SetText(lineData.text or "")
+        local c
+        if lineData and lineData.columns then
+            local cols = lineData.columns
+            for c = 1, #DETAIL_COLUMNS do
+                local col = DETAIL_COLUMNS[c]
+                local fs = row.colFS[col.key]
+                local value = cols[col.key] or ""
+                if col.truncate then
+                    SetTruncatedText(fs, value, col.width)
+                else
+                    fs:SetText(value)
+                end
+                fs:SetTextColor(cols.r or 1, cols.g or 1, cols.b or 1)
+            end
             row.data = lineData
+        elseif lineData and lineData.infoText then
+            for c = 1, #DETAIL_COLUMNS do
+                local col = DETAIL_COLUMNS[c]
+                local fs = row.colFS[col.key]
+                if col.key == "name" then
+                    fs:SetText(lineData.infoText)
+                    fs:SetTextColor(lineData.r or 1, lineData.g or 1, lineData.b or 1)
+                else
+                    fs:SetText("")
+                end
+            end
+            row.data = nil
         else
-            row.text:SetText("")
+            for c = 1, #DETAIL_COLUMNS do
+                row.colFS[DETAIL_COLUMNS[c].key]:SetText("")
+            end
             row.data = nil
         end
     end
@@ -5902,8 +7177,10 @@ function addon:RefreshMainWindow()
         addon.ui.statusText:SetText("")
     end
 
-    if addon.ui.sortButton then
-        addon.ui.sortButton:SetText("|cff66ff66S:" .. addon:GetSortMode() .. "|r")
+    if addon.ui.sortDropDown then
+        local sortMode = addon:GetSortMode()
+        UIDropDownMenu_SetSelectedValue(addon.ui.sortDropDown, sortMode)
+        UIDropDownMenu_SetText(addon.ui.sortDropDown, SORT_LABELS[sortMode] or sortMode)
     end
 
     if addon.ui.filterButton then
@@ -5987,6 +7264,16 @@ function addon:RefreshMainWindow()
         local desired = tostring(addon:GetLFMRepeatCount())
         if (addon.ui.lfmRepeatBox:GetText() or "") ~= desired then
             addon.ui.lfmRepeatBox:SetText(desired)
+        end
+    end
+
+    if addon.ui.lfmPresetDropDown then
+        local selected = addon.ui.lfmSelectedPreset
+        if selected and addon:FindLFMPreset(selected) then
+            UIDropDownMenu_SetSelectedValue(addon.ui.lfmPresetDropDown, selected)
+            UIDropDownMenu_SetText(addon.ui.lfmPresetDropDown, selected)
+        else
+            UIDropDownMenu_SetText(addon.ui.lfmPresetDropDown, "Select preset")
         end
     end
 
@@ -6962,8 +8249,9 @@ events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 events:RegisterEvent("INSPECT_READY")
 events:RegisterEvent("INSPECT_TALENT_READY")
+events:RegisterEvent("CHAT_MSG_ADDON")
 events:SetScript("OnEvent", function(_, event, ...)
-    local arg1 = select(1, ...)
+    local arg1, arg2, arg3, arg4 = ...
     SafeInvoke("event " .. tostring(event), function()
         if event == "ADDON_LOADED" then
             addon:OnAddonLoaded(arg1)
@@ -6973,6 +8261,8 @@ events:SetScript("OnEvent", function(_, event, ...)
             addon:OnInspectReady(arg1)
         elseif event == "INSPECT_TALENT_READY" then
             addon:OnInspectTalentReady()
+        elseif event == "CHAT_MSG_ADDON" then
+            addon:OnCommReceived(arg1, arg2, arg3, arg4)
         end
     end)
 end)

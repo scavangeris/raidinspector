@@ -2,6 +2,13 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.13.0-alpha - 2026-06-28
+- Overview rows: replaced the text Refresh/Remove buttons with small square icon buttons (refresh arrow + red X, with tooltips).
+- Replaced the Sort toggle button with a Sort dropdown (Recent / GS / Issues / Name) on its own row.
+- Gear detail list is now a fixed-column table (Slot | Item Name | iLvl | Enchant | Gems) with a header row; long item names are shortened with an ellipsis to fit the column.
+- Added an Options window (button next to ? Info): a window-scale slider (0.5-1.5) and PallyPower-style keybinds for Target / Raid / Share / Save All / Clear (click Set, press a key; applied as override bindings, saved per character).
+- LFM presets: save the current message + Need table as a named preset, pick it from a dropdown to reload, and delete it with the X. Save Template / Import / Export buttons under the Need table. Export sends the preset to another player over addon comms (hex-encoded so achievement-link characters survive, chunked to fit, and broadcast over whisper + guild + party/raid with a recipient filter so it still arrives when the server blocks whisper addon messages). The receiver clicks Import to open a list of all pending templates (name + sender) and can Accept or Decline each one individually, or Accept All / Decline All. Re-sends of the same preset from the same sender replace the earlier copy, and channel duplicates are de-duped.
+
 ## 0.12.9-alpha - 2026-06-28
 - Share summary now includes a `PvP Items: N` count (from resilience detection).
 - Reduced the empty gap between the tab row and the Share row on the Inspector tab.
