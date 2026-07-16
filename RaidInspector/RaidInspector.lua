@@ -5,7 +5,7 @@ RaidInspectorDB = RaidInspectorDB or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.12.2-alpha"
+addon.version = "0.14.0-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
@@ -14,6 +14,21 @@ local INSPECT_THROTTLE_SECONDS = 2
 local INSPECT_TIMEOUT_SECONDS = 8
 local INSPECT_TALENT_MIN_WAIT_SECONDS = 1
 local INSPECT_TALENT_GRACE_SECONDS = 3
+local INSPECT_RETRY_INTERVAL_SECONDS = 15
+
+-- Failure reasons that are transient (out of range, unit token gone, no reply in
+-- time). Entries stuck on one of these are swept back into the inspect queue by
+-- addon:RetryPendingInspects() as soon as the player becomes inspectable again.
+local INSPECT_RETRY_REASONS = {
+    ["cannot-inspect"] = true,
+    ["unit-not-found"] = true,
+    ["unit-changed"] = true,
+    ["inspect-timeout"] = true,
+}
+
+-- Autoscan: re-runs the raid scan on its own while enabled.
+local AUTOSCAN_IDLE_SECONDS = 10
+local AUTOSCAN_ROSTER_DEBOUNCE_SECONDS = 2
 local DEFAULT_LFM_POST_DELAY_SECONDS = 10
 local LFM_GENERAL_ALIASES = { "general" }
 local LFM_GLOBAL_ALIASES = { "global", "globalchat", "world", "worldchat" }
@@ -1056,6 +1071,27 @@ local function EnsureTable(tbl, key, defaultValue)
     end
 end
 
+-- True when both tables hold exactly the same set of player keys.
+local function MemberSetsMatch(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+
+    local key
+    for key in pairs(a) do
+        if not b[key] then
+            return false
+        end
+    end
+    for key in pairs(b) do
+        if not a[key] then
+            return false
+        end
+    end
+
+    return true
+end
+
 local function EnsureLFMNeedDefaults(lfmState)
     EnsureTable(lfmState, "needs", {})
     EnsureTable(lfmState.needs, "groups", {})
@@ -1157,10 +1193,10 @@ local function FormatStatusReason(reason)
         ["queued-refresh"] = "refresh queued",
         ["waiting-inspect"] = "waiting inspect",
         ["inspecting"] = "inspecting",
-        ["cannot-inspect"] = "not inspectable",
-        ["unit-not-found"] = "unit not found",
-        ["unit-changed"] = "unit changed",
-        ["inspect-timeout"] = "inspect timeout",
+        ["cannot-inspect"] = "not inspectable, retrying",
+        ["unit-not-found"] = "unit not found, retrying",
+        ["unit-changed"] = "unit changed, retrying",
+        ["inspect-timeout"] = "inspect timeout, retrying",
         ["inspect-build-failed"] = "inspect build failed",
         ["local-only"] = "not in current target, party, or raid",
     }
@@ -1643,6 +1679,11 @@ function addon:InitInspectRuntime()
     addon.inspectCurrent = nil
     addon.inspectLastRequestAt = addon.inspectLastRequestAt or 0
     addon.inspectTickAccum = 0
+    addon.inspectRetryAccum = 0
+
+    addon.autoScanAccum = 0
+    addon.autoScanRosterAccum = 0
+    addon.autoScanRosterDirty = false
 
     addon.lfmPostQueue = addon.lfmPostQueue or {}
     addon.lfmPostSentCount = addon.lfmPostSentCount or 0
@@ -1935,6 +1976,158 @@ function addon:BuildLocalInspectResult(unit, key, name, realm, inspectTalentsRea
     }
 end
 
+function addon:IsAutoScanEnabled()
+    return RaidInspectorDB.settings
+        and RaidInspectorDB.settings.autoScan
+        and RaidInspectorDB.settings.autoScan.enabled == true
+end
+
+function addon:SetAutoScanEnabled(enabled)
+    if not RaidInspectorDB.settings then
+        return false
+    end
+
+    EnsureTable(RaidInspectorDB.settings, "autoScan", {})
+    RaidInspectorDB.settings.autoScan.enabled = enabled and true or false
+
+    addon.autoScanAccum = 0
+    addon.autoScanRosterAccum = 0
+    addon.autoScanRosterDirty = false
+
+    if RaidInspectorDB.settings.autoScan.enabled then
+        Print("autoscan: ON (rescans on raid join/leave, and every "
+            .. AUTOSCAN_IDLE_SECONDS .. "s once the queue is idle)")
+        -- Kick off the first scan immediately rather than waiting a full cycle.
+        if GetNumRaidMembers and GetNumRaidMembers() > 0 then
+            addon:RunAutoScan()
+        else
+            Print("autoscan: waiting, you are not in a raid")
+        end
+    else
+        Print("autoscan: OFF")
+    end
+
+    addon:RefreshMainWindow()
+    return RaidInspectorDB.settings.autoScan.enabled
+end
+
+function addon:ToggleAutoScan()
+    return addon:SetAutoScanEnabled(not addon:IsAutoScanEnabled())
+end
+
+-- The one scan autoscan performs: quiet, reuses the raid history entry, and
+-- prunes players who have left the raid.
+function addon:RunAutoScan()
+    return addon:QueueRaidSnapshot({ silent = true, reuseHistory = true, pruneMissing = true })
+end
+
+-- Drives autoscan from addon:OnUpdate. Two triggers:
+--   1. roster change (someone joined/left) - rescans once the roster settles;
+--   2. idle - rescans every AUTOSCAN_IDLE_SECONDS, but only once the inspect
+--      queue has drained, so it never fights the work already in flight.
+function addon:ProcessAutoScan()
+    if not addon:IsAutoScanEnabled() then
+        addon.autoScanAccum = 0
+        addon.autoScanRosterAccum = 0
+        addon.autoScanRosterDirty = false
+        return false
+    end
+
+    if addon:GetSelectedSavedReportFile() ~= "" then
+        addon.autoScanAccum = 0
+        addon.autoScanRosterAccum = 0
+        return false
+    end
+
+    if not GetNumRaidMembers or GetNumRaidMembers() <= 0 then
+        addon.autoScanAccum = 0
+        addon.autoScanRosterAccum = 0
+        addon.autoScanRosterDirty = false
+        return false
+    end
+
+    if addon.autoScanRosterDirty then
+        -- Roster events fire in bursts, so wait for them to settle first.
+        if (addon.autoScanRosterAccum or 0) < AUTOSCAN_ROSTER_DEBOUNCE_SECONDS then
+            return false
+        end
+        addon.autoScanRosterDirty = false
+        addon.autoScanRosterAccum = 0
+        addon.autoScanAccum = 0
+        addon:RunAutoScan()
+        return true
+    end
+
+    if addon.inspectCurrent or (addon.inspectQueue and #addon.inspectQueue > 0) then
+        addon.autoScanAccum = 0
+        return false
+    end
+
+    if (addon.autoScanAccum or 0) < AUTOSCAN_IDLE_SECONDS then
+        return false
+    end
+
+    addon.autoScanAccum = 0
+    addon:RunAutoScan()
+    return true
+end
+
+function addon:OnRosterChanged()
+    if not addon:IsAutoScanEnabled() then
+        return
+    end
+    addon.autoScanRosterDirty = true
+    addon.autoScanRosterAccum = 0
+end
+
+-- Sweeps every entry that failed for a transient reason (most often "not
+-- inspectable", i.e. the player was out of range) and re-queues the ones that
+-- have become inspectable again. Called on a timer from addon:OnUpdate, so a
+-- player who walks into range is picked up without any manual refresh.
+function addon:RetryPendingInspects()
+    if not RaidInspectorDB.requests or not RaidInspectorDB.results or not addon.inspectQueuedKeys then
+        return 0
+    end
+
+    if addon:GetSelectedSavedReportFile() ~= "" then
+        return 0
+    end
+
+    local latestByKey = addon:GetLatestRequestMap()
+    local requeued = 0
+    local key
+
+    for key in pairs(latestByKey) do
+        local req = latestByKey[key]
+        local reason = tostring(req.statusReason or "")
+        local retryable = INSPECT_RETRY_REASONS[reason]
+            and (req.status == "error" or req.status == "queued")
+            and not RaidInspectorDB.results[key]
+            and not addon.inspectQueuedKeys[key]
+            and not (addon.inspectCurrent and addon.inspectCurrent.key == key)
+
+        if retryable then
+            -- Only re-queue units that are inspectable right now, otherwise the
+            -- entry would just burn a queue slot and fail again immediately.
+            -- QueueLiveInspectUnit sets the request to queued/waiting-inspect
+            -- itself, keyed off the unit, so no extra state write is needed here.
+            local unit = addon:FindUnitByName(req.name)
+            if unit and CanInspectUnit(unit) then
+                if addon:QueueLiveInspectUnit(unit, false) then
+                    requeued = requeued + 1
+                end
+            end
+        end
+    end
+
+    if requeued > 0 then
+        addon:ProcessInspectQueue(false)
+        addon:RefreshMainWindow()
+    end
+
+    return requeued
+end
+
 function addon:ProcessInspectQueue(force)
     if addon.inspectCurrent then
         return
@@ -2042,11 +2235,22 @@ function addon:OnInspectTalentReady()
 end
 
 function addon:OnUpdate(elapsed)
-    addon.inspectTickAccum = (addon.inspectTickAccum or 0) + (elapsed or 0)
+    local delta = elapsed or 0
+    addon.inspectRetryAccum = (addon.inspectRetryAccum or 0) + delta
+    addon.autoScanAccum = (addon.autoScanAccum or 0) + delta
+    addon.autoScanRosterAccum = (addon.autoScanRosterAccum or 0) + delta
+    addon.inspectTickAccum = (addon.inspectTickAccum or 0) + delta
     if addon.inspectTickAccum < 0.2 then
         return
     end
     addon.inspectTickAccum = 0
+
+    if addon.inspectRetryAccum >= INSPECT_RETRY_INTERVAL_SECONDS then
+        addon.inspectRetryAccum = 0
+        addon:RetryPendingInspects()
+    end
+
+    addon:ProcessAutoScan()
 
     if addon.inspectCurrent then
         local now = GetNow()
@@ -2114,6 +2318,9 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.settings, "overview", {})
     EnsureTable(RaidInspectorDB.settings.overview, "sortMode", "recent")
     EnsureTable(RaidInspectorDB.settings.overview, "filterMode", "all")
+
+    EnsureTable(RaidInspectorDB.settings, "autoScan", {})
+    EnsureTable(RaidInspectorDB.settings.autoScan, "enabled", false)
 
     EnsureTable(RaidInspectorDB, "state", {})
     EnsureTable(RaidInspectorDB.state, "nextRequestId", 1)
@@ -3039,6 +3246,7 @@ function addon:RefreshTabVisibility()
         addon.ui.actionPanel,
         addon.ui.targetButton,
         addon.ui.raidButton,
+        addon.ui.autoScanButton,
         addon.ui.syncButton,
         addon.ui.reportButton,
         addon.ui.clearButton,
@@ -3992,9 +4200,23 @@ function addon:QueueInspect(name, realm, opts)
     return true
 end
 
-function addon:QueueRaidSnapshot()
+-- opts.silent       - no chat summary (used by autoscan, which runs every 10s)
+-- opts.reuseHistory - keep updating the current raid history entry while the
+--                     roster is unchanged, instead of appending a new entry per
+--                     scan. Without this an autoscan would add ~6 entries/minute.
+-- opts.pruneMissing - drop list entries for players no longer on the roster, so
+--                     the list tracks the raid. Autoscan only; the manual Raid
+--                     button must not delete anything the user added by hand.
+function addon:QueueRaidSnapshot(opts)
+    opts = type(opts) == "table" and opts or {}
+    local silent = opts.silent == true
+    local reuseHistory = opts.reuseHistory == true
+    local pruneMissing = opts.pruneMissing == true
+
     if not GetNumRaidMembers or GetNumRaidMembers() <= 0 then
-        Print("not in a raid")
+        if not silent then
+            Print("not in a raid")
+        end
         return
     end
 
@@ -4038,13 +4260,30 @@ function addon:QueueRaidSnapshot()
         end
     end
 
+    if pruneMissing then
+        local pruned = addon:PruneEntriesNotInSet(members)
+        if pruned > 0 then
+            Print("autoscan: removed " .. pruned .. " no longer in the raid")
+        end
+    end
+
     local snapshotAt = GetNow()
+    local sameRoster = reuseHistory and MemberSetsMatch(members, RaidInspectorDB.state.lastSnapshot.members)
     RaidInspectorDB.state.lastSnapshot.at = snapshotAt
     RaidInspectorDB.state.lastSnapshot.members = members
-    addon:CreateRaidHistoryEntry(snapshotAt, members)
+    if sameRoster then
+        -- Falls back to a new entry if the active one is gone (pruned/cleared).
+        if not addon:RefreshActiveRaidHistoryEntry() then
+            addon:CreateRaidHistoryEntry(snapshotAt, members)
+        end
+    else
+        addon:CreateRaidHistoryEntry(snapshotAt, members)
+    end
 
     addon:ProcessInspectQueue(true)
-    Print("raid snapshot: queued=" .. queued .. ", skipped=" .. skipped .. ", total=" .. count .. " | live=" .. liveQueued .. ", liveSkipped=" .. liveSkipped)
+    if not silent then
+        Print("raid snapshot: queued=" .. queued .. ", skipped=" .. skipped .. ", total=" .. count .. " | live=" .. liveQueued .. ", liveSkipped=" .. liveSkipped)
+    end
     addon:RefreshMainWindow()
 end
 
@@ -4218,6 +4457,77 @@ function addon:RemoveOverviewEntryByKey(key)
 
     Print("remove: player not found in live list")
     return false
+end
+
+-- Drops every list entry whose key is not in `members`. Used by autoscan so that
+-- players who leave the raid disappear from the list instead of lingering.
+-- Batch equivalent of RemoveOverviewEntryByKey: one pass, no per-key chat spam.
+function addon:PruneEntriesNotInSet(members)
+    if type(members) ~= "table" then
+        return 0
+    end
+
+    local removed = {}
+    local removedCount = 0
+    local keptRequests = {}
+    local i
+    local key
+
+    for i = 1, #RaidInspectorDB.requests do
+        local req = RaidInspectorDB.requests[i]
+        key = type(req) == "table" and tostring(req.key or "") or ""
+        if key ~= "" and not members[key] then
+            if not removed[key] then
+                removed[key] = true
+                removedCount = removedCount + 1
+            end
+        else
+            keptRequests[#keptRequests + 1] = req
+        end
+    end
+
+    for key in pairs(RaidInspectorDB.results) do
+        if not members[key] and not removed[key] then
+            removed[key] = true
+            removedCount = removedCount + 1
+        end
+    end
+
+    if removedCount == 0 then
+        return 0
+    end
+
+    RaidInspectorDB.requests = keptRequests
+
+    for key in pairs(removed) do
+        RaidInspectorDB.results[key] = nil
+        if addon.inspectQueuedKeys then
+            addon.inspectQueuedKeys[key] = nil
+        end
+    end
+
+    local keptQueue = {}
+    for i = 1, #(addon.inspectQueue or {}) do
+        local entry = addon.inspectQueue[i]
+        local entryKey = type(entry) == "table" and tostring(entry.key or "") or ""
+        if not removed[entryKey] then
+            keptQueue[#keptQueue + 1] = entry
+        end
+    end
+    addon.inspectQueue = keptQueue
+
+    if addon.inspectCurrent and removed[addon.inspectCurrent.key] then
+        addon.inspectCurrent = nil
+        if ClearInspectPlayer then
+            ClearInspectPlayer()
+        end
+    end
+
+    if removed[addon:GetSelectedKey()] then
+        addon:SetSelectedKey("")
+    end
+
+    return removedCount
 end
 
 function addon:GetSnapshotProgress()
@@ -4704,10 +5014,24 @@ function addon:BuildDetailRows(container, rowCount)
     end
 end
 
+function addon:RefreshAutoScanButton()
+    if not addon.ui or not addon.ui.autoScanButton then
+        return
+    end
+
+    if addon:IsAutoScanEnabled() then
+        addon.ui.autoScanButton:SetText("|cff66ff66Autoscan: on|r")
+    else
+        addon.ui.autoScanButton:SetText("|cff999999Autoscan: off|r")
+    end
+end
+
 function addon:ApplyButtonModeLayout()
     if not addon.ui or not addon.ui.actionPanel then
         return
     end
+
+    addon:RefreshAutoScanButton()
 
     local ACTION_BUTTON_WIDTH = 100
     local ACTION_BUTTON_HEIGHT = 20
@@ -4720,6 +5044,7 @@ function addon:ApplyButtonModeLayout()
         filter = addon.ui.filterButton,
         target = addon.ui.targetButton,
         raid = addon.ui.raidButton,
+        autoscan = addon.ui.autoScanButton,
         sync = addon.ui.syncButton,
         force = addon.ui.forceSyncButton,
         report = addon.ui.reportButton,
@@ -4735,6 +5060,7 @@ function addon:ApplyButtonModeLayout()
         filter = false,
         target = true,
         raid = true,
+        autoscan = true,
         sync = true,
         force = false,
         report = true,
@@ -4743,7 +5069,7 @@ function addon:ApplyButtonModeLayout()
         clear = true,
     }
 
-    local order = { "target", "raid", "sync", "report", "clear" }
+    local order = { "target", "raid", "autoscan", "sync", "report", "clear" }
 
     local key, button
     for key, button in pairs(buttons) do
@@ -5553,9 +5879,17 @@ function addon:ShowInfoDialog()
             "S:<mode> - click to cycle the list sort (recent / gs / issues / name).",
             "Target - inspect your current target and add them to the list.",
             "Raid - inspect everyone in your party/raid.",
+            "Autoscan - toggle. While on, the raid is rescanned automatically:",
+            "  once whenever someone joins or leaves, and every 10s after the queue",
+            "  finishes. Anyone who leaves the raid is dropped from the list, so the",
+            "  list always matches the raid. Click again (or /ri autoscan off) to stop.",
             "Share - send a short summary of the selected player to the ticked Share channels.",
             "Save All - save a full report of the current overview into the addon.",
             "Clear - clear the queue and results (asks to confirm).",
+            " ",
+            "|cffffd100Out of range|r",
+            "Players too far away show \"not inspectable\" and are retried automatically",
+            "every 15s until they come into range and get inspected.",
             " ",
             "|cffffd100Share / Reports|r",
             "Share checkboxes (Raid / Say / Whisper / Guild) choose where Share sends.",
@@ -5913,6 +6247,18 @@ function addon:CreateMainWindow()
     raidButton:SetScript("OnClick", function()
         SafeInvoke("raid", function()
             addon:QueueRaidSnapshot()
+        end)
+    end)
+
+    local autoScanButton = CreateFrame("Button", "RaidInspectorAutoScanButton", f, "UIPanelButtonTemplate")
+    ActivateActionButton(autoScanButton)
+    autoScanButton:SetWidth(100)
+    autoScanButton:SetHeight(20)
+    autoScanButton:SetPoint("LEFT", raidButton, "RIGHT", 6, 0)
+    SetActionButtonLabel(autoScanButton, "ff66ff66", "Autoscan: off")
+    autoScanButton:SetScript("OnClick", function()
+        SafeInvoke("autoscan", function()
+            addon:ToggleAutoScan()
         end)
     end)
 
@@ -6528,6 +6874,7 @@ function addon:CreateMainWindow()
     addon.ui.filterButton = filterButton
     addon.ui.targetButton = targetButton
     addon.ui.raidButton = raidButton
+    addon.ui.autoScanButton = autoScanButton
     addon.ui.syncButton = syncButton
     addon.ui.forceSyncButton = forceSyncButton
     addon.ui.reportButton = reportButton
@@ -8010,6 +8357,10 @@ function addon:ClearQueue()
     addon.inspectQueuedKeys = {}
     addon.inspectCurrent = nil
     addon.inspectTickAccum = 0
+    addon.inspectRetryAccum = 0
+    addon.autoScanAccum = 0
+    addon.autoScanRosterAccum = 0
+    addon.autoScanRosterDirty = false
     if ClearInspectPlayer then
         ClearInspectPlayer()
     end
@@ -8090,6 +8441,7 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri inspect <name-realm> - inspect a matching target/party/raid unit")
             Print("/ri inspecttarget - queue + live inspect current target")
             Print("/ri inspectraid - snapshot + live inspect current raid members")
+            Print("/ri autoscan [on|off] - keep rescanning the raid automatically")
             Print("/ri inspecttarget and /ri inspectraid also attempt in-game AP comparison (inspectable targets)")
             Print("/ri sort [recent|gs|issues|name] - set or cycle sort")
             Print("/ri filter [all|snapshot|ready|queued|issues] - set or cycle filter")
@@ -8135,6 +8487,20 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
 
         if command == "inspectraid" then
             addon:QueueRaidSnapshot()
+            return
+        end
+
+        if command == "autoscan" then
+            local mode = string.lower(Trim(args))
+            if mode == "on" or mode == "start" then
+                addon:SetAutoScanEnabled(true)
+            elseif mode == "off" or mode == "stop" then
+                addon:SetAutoScanEnabled(false)
+            elseif mode == "" then
+                addon:ToggleAutoScan()
+            else
+                Print("usage: /ri autoscan [on|off]")
+            end
             return
         end
 
@@ -8250,6 +8616,8 @@ events:RegisterEvent("PLAYER_LOGIN")
 events:RegisterEvent("INSPECT_READY")
 events:RegisterEvent("INSPECT_TALENT_READY")
 events:RegisterEvent("CHAT_MSG_ADDON")
+events:RegisterEvent("RAID_ROSTER_UPDATE")
+events:RegisterEvent("PARTY_MEMBERS_CHANGED")
 events:SetScript("OnEvent", function(_, event, ...)
     local arg1, arg2, arg3, arg4 = ...
     SafeInvoke("event " .. tostring(event), function()
@@ -8263,6 +8631,8 @@ events:SetScript("OnEvent", function(_, event, ...)
             addon:OnInspectTalentReady()
         elseif event == "CHAT_MSG_ADDON" then
             addon:OnCommReceived(arg1, arg2, arg3, arg4)
+        elseif event == "RAID_ROSTER_UPDATE" or event == "PARTY_MEMBERS_CHANGED" then
+            addon:OnRosterChanged()
         end
     end)
 end)

@@ -2,6 +2,13 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.14.0-alpha - 2026-07-16
+- Players who are out of range are no longer written off. Anyone who fails to inspect for a temporary reason (not inspectable / unit not found / unit changed / inspect timeout) is now retried automatically every 15 seconds until they come into range and get inspected. Only players who are inspectable at that moment are re-queued, so retries never waste a queue slot, and the overview now reads "not inspectable, retrying" instead of looking final.
+- New `Autoscan` toggle button on the Inspector tab (next to `Raid`). While it is on, the raid is rescanned automatically: once whenever someone joins or leaves the raid, and every 10 seconds once the inspect queue has drained, so it never fights work already in flight. The setting is saved per character and can also be driven from chat with `/ri autoscan [on|off]`.
+- Autoscan keeps the list in sync with the raid: anyone who leaves is removed from the list automatically, along with their queued inspect and cached result. Leaving the raid yourself does not wipe the list. The manual `Raid` button is unaffected and never removes anything.
+- Autoscan rescans are quiet - they do not print a scan summary every 10 seconds, and they keep updating the current raid history entry while the roster is unchanged instead of appending a new entry per scan.
+- Fixed the version shown on login: the addon printed `loaded (0.12.2-alpha)` regardless of the actual release.
+
 ## 0.13.0-alpha - 2026-06-28
 - Overview rows: replaced the text Refresh/Remove buttons with small square icon buttons (refresh arrow + red X, with tooltips).
 - Replaced the Sort toggle button with a Sort dropdown (Recent / GS / Issues / Name) on its own row.
