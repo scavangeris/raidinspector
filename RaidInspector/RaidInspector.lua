@@ -5,7 +5,7 @@ RaidInspectorDB = RaidInspectorDB or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.14.0-alpha"
+addon.version = "0.15.0-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
@@ -1820,13 +1820,12 @@ function addon:FinalizeInspectCurrent(success, failureReason)
             end
         end
     elseif req then
-        if not RaidInspectorDB.results[current.key] then
-            req.status = "error"
-            req.statusReason = failureReason or "inspect-timeout"
-        else
-            req.status = "ready"
-            req.statusReason = nil
-        end
+        -- A cached result from an earlier scan is not evidence that this attempt
+        -- worked, so the failure is recorded either way. The result itself stays
+        -- in the DB and keeps rendering; only the status reflects this attempt,
+        -- so the row reads [error] next to the age instead of claiming "ready".
+        req.status = "error"
+        req.statusReason = failureReason or "inspect-timeout"
         req.updatedAt = GetNow()
     end
 
@@ -2100,9 +2099,12 @@ function addon:RetryPendingInspects()
     for key in pairs(latestByKey) do
         local req = latestByKey[key]
         local reason = tostring(req.statusReason or "")
+        -- Cached data for the key is deliberately not a reason to skip: a failed
+        -- attempt on someone we already know is exactly the entry whose data has
+        -- gone stale, and the status reasons above all advertise "retrying".
+        -- A successful scan leaves status "ready", so this never re-queues one.
         local retryable = INSPECT_RETRY_REASONS[reason]
             and (req.status == "error" or req.status == "queued")
-            and not RaidInspectorDB.results[key]
             and not addon.inspectQueuedKeys[key]
             and not (addon.inspectCurrent and addon.inspectCurrent.key == key)
 
@@ -2148,9 +2150,13 @@ function addon:ProcessInspectQueue(force)
 
     addon.inspectQueuedKeys[entry.key] = nil
 
+    -- As in addon:FinalizeInspectCurrent, these failures are recorded whether or
+    -- not older data is cached for the key. Skipping the write used to leave the
+    -- request on "queued"/"waiting-inspect", which the overview then displayed as
+    -- "ready" because a result existed.
     if not UnitExists(entry.unit) then
         local reqMissing = addon:GetLatestRequestForKey(entry.key)
-        if reqMissing and not RaidInspectorDB.results[entry.key] then
+        if reqMissing then
             reqMissing.status = "error"
             reqMissing.statusReason = "unit-not-found"
             reqMissing.updatedAt = GetNow()
@@ -2160,7 +2166,7 @@ function addon:ProcessInspectQueue(force)
 
     if entry.guid and UnitGUID(entry.unit) ~= entry.guid then
         local reqGuid = addon:GetLatestRequestForKey(entry.key)
-        if reqGuid and not RaidInspectorDB.results[entry.key] then
+        if reqGuid then
             reqGuid.status = "error"
             reqGuid.statusReason = "unit-changed"
             reqGuid.updatedAt = GetNow()
@@ -2170,7 +2176,7 @@ function addon:ProcessInspectQueue(force)
 
     if not CanInspectUnit(entry.unit) then
         local reqInspect = addon:GetLatestRequestForKey(entry.key)
-        if reqInspect and not RaidInspectorDB.results[entry.key] then
+        if reqInspect then
             reqInspect.status = "error"
             reqInspect.statusReason = "cannot-inspect"
             reqInspect.updatedAt = GetNow()
@@ -4780,7 +4786,8 @@ function addon:BuildOverviewRows(container, rowCount)
     local rowWidth = tonumber(container:GetWidth()) or 432
     local actionWidth = 18
     local actionGap = 4
-    local actionArea = (actionWidth * 2) + actionGap + 8
+    -- three icons now: refresh, remove, and the gear-preview button
+    local actionArea = (actionWidth * 3) + (actionGap * 2) + 8
     local containerHeight = tonumber(container:GetHeight()) or 0
     local maxVisibleRows = math.max(1, math.min(OVERVIEW_VISIBLE_ROWS, math.floor(containerHeight / OVERVIEW_ROW_HEIGHT)))
     local parentLevel = (container.GetParent and container:GetParent() and container:GetParent():GetFrameLevel()) or 0
@@ -4820,7 +4827,7 @@ function addon:BuildOverviewRows(container, rowCount)
         local refreshButton = CreateFrame("Button", nil, row)
         refreshButton:SetWidth(actionWidth)
         refreshButton:SetHeight(actionWidth)
-        refreshButton:SetPoint("RIGHT", row, "RIGHT", -(actionWidth + actionGap + 4), 0)
+        refreshButton:SetPoint("RIGHT", row, "RIGHT", -(2 * (actionWidth + actionGap) + 4), 0)
         refreshButton:SetFrameStrata("DIALOG")
         refreshButton:SetFrameLevel(parentLevel + 12)
         refreshButton:SetNormalTexture("Interface\\Buttons\\UI-RotationRight-Button-Up")
@@ -4851,7 +4858,7 @@ function addon:BuildOverviewRows(container, rowCount)
         local removeButton = CreateFrame("Button", nil, row)
         removeButton:SetWidth(actionWidth)
         removeButton:SetHeight(actionWidth)
-        removeButton:SetPoint("RIGHT", row, "RIGHT", -4, 0)
+        removeButton:SetPoint("RIGHT", row, "RIGHT", -(actionWidth + actionGap + 4), 0)
         removeButton:SetFrameStrata("DIALOG")
         removeButton:SetFrameLevel(parentLevel + 12)
         removeButton:SetNormalTexture("Interface\\Buttons\\UI-GroupLoot-Pass-Up")
@@ -4879,9 +4886,43 @@ function addon:BuildOverviewRows(container, rowCount)
             end)
         end)
 
+        -- Gear preview: opens a character-panel-style window populated from this
+        -- player's stored gear. Shown on any row that has gear, so it works for
+        -- saved lists and offline players, not just the live-selected row.
+        local gearButton = CreateFrame("Button", nil, row)
+        gearButton:SetWidth(actionWidth)
+        gearButton:SetHeight(actionWidth)
+        gearButton:SetPoint("RIGHT", row, "RIGHT", -4, 0)
+        gearButton:SetFrameStrata("DIALOG")
+        gearButton:SetFrameLevel(parentLevel + 12)
+        gearButton:SetNormalTexture("Interface\\Icons\\INV_Chest_Plate06")
+        gearButton:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+        gearButton:Hide()
+        gearButton:SetScript("OnEnter", function(self)
+            if GameTooltip then
+                GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                GameTooltip:SetText("View gear")
+                GameTooltip:Show()
+            end
+        end)
+        gearButton:SetScript("OnLeave", function()
+            if GameTooltip then
+                GameTooltip:Hide()
+            end
+        end)
+        gearButton:SetScript("OnClick", function(self)
+            SafeInvoke("row-gear", function()
+                local targetKey = self.key or row.key
+                if targetKey and targetKey ~= "" then
+                    addon:ShowGearPreview(targetKey)
+                end
+            end)
+        end)
+
         row.text = text
         row.refreshButton = refreshButton
         row.removeButton = removeButton
+        row.gearButton = gearButton
         row.key = nil
         row.playerName = nil
         row:SetScript("OnClick", function(self, button)
@@ -5200,6 +5241,355 @@ function addon:ShowDetailRowTooltip(row)
     end
 
     GameTooltip:Show()
+end
+
+--[[-------------------------------------------------------------------------
+    Saved-gear preview ("paper doll") window
+    Opens a character-panel-style layout for any list entry - live OR saved -
+    and fills each equipment slot from the gear RaidInspector has stored, so an
+    offline or long-gone player's gear can still be browsed with real item
+    tooltips on mouseover, exactly like the character info screen.
+---------------------------------------------------------------------------]]
+
+local GEAR_DOLL_LEFT = { "HeadSlot", "NeckSlot", "ShoulderSlot", "BackSlot", "ChestSlot", "WristSlot" }
+local GEAR_DOLL_RIGHT = { "HandsSlot", "WaistSlot", "LegsSlot", "FeetSlot", "Finger0Slot", "Finger1Slot", "Trinket0Slot", "Trinket1Slot" }
+local GEAR_DOLL_BOTTOM = { "MainHandSlot", "SecondaryHandSlot", "RangedSlot" }
+
+local GEAR_SLOT_SIZE = 36
+local GEAR_SLOT_PITCH = 40
+local GEAR_DOLL_HEADER = 74
+local GEAR_DOLL_WIDTH = 300
+
+-- Empty-slot background texture for a slot key, taken from the client itself so
+-- it always matches this build (avoids hardcoding PaperDoll texture paths).
+local function GetEmptySlotTexture(slotKey)
+    if GetInventorySlotInfo then
+        local ok, _, texture = pcall(GetInventorySlotInfo, slotKey)
+        if ok and texture then
+            return texture
+        end
+    end
+    return nil
+end
+
+local function GetGearItemIcon(item)
+    if type(item) ~= "table" then
+        return nil
+    end
+    local itemId = tonumber(item.itemId)
+    if itemId and GetItemIcon then
+        local tex = GetItemIcon(itemId)
+        if tex then
+            return tex
+        end
+    end
+    local link = BuildInspectItemHyperlink(item)
+    if link then
+        local tex = select(10, GetItemInfo(link))
+        if tex then
+            return tex
+        end
+    end
+    return "Interface\\Icons\\INV_Misc_QuestionMark"
+end
+
+-- True when an item is missing an enchant it should have, or has an empty gem
+-- socket. Mirrors the "issues" list filter's per-item rule so the red slot icon
+-- lines up with the audit counts.
+local function GearSlotHasIssue(item, slotKey)
+    if type(item) ~= "table" then
+        return false
+    end
+    if ENCHANTABLE_SLOTS[slotKey] and not OPTIONAL_ENCHANT_SLOTS[slotKey]
+        and not GetRecordedEnchantId(item) then
+        return true
+    end
+    local socketCount = tonumber(item.socketCount) or 0
+    local gemCount = (type(item.gems) == "table") and #item.gems or 0
+    if socketCount > 0 and gemCount < socketCount then
+        return true
+    end
+    return false
+end
+
+local function GearSlot_OnEnter(self)
+    if not GameTooltip then
+        return
+    end
+    if self.data and type(self.data.item) == "table" then
+        -- Reuse the detail-list tooltip: real item link + enchant/gem fallback.
+        addon:ShowDetailRowTooltip(self)
+    else
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText(SLOT_LABELS[self.slotKey] or "Slot", 1, 1, 1)
+        GameTooltip:AddLine("Empty", 0.7, 0.7, 0.7)
+        GameTooltip:Show()
+    end
+end
+
+local function GearSlot_OnLeave()
+    if GameTooltip then
+        GameTooltip:Hide()
+    end
+end
+
+-- Right-click a filled slot to open the item in AtlasLoot (shift+right-click
+-- copies it instead), exactly like the gear detail list. The slot's .data is the
+-- same {item, slotKey} shape those rows use, so the existing helpers just work.
+local function GearSlot_OnClick(self, button)
+    if button ~= "RightButton" then
+        return
+    end
+    if not (self.data and type(self.data.item) == "table") then
+        return
+    end
+    if IsShiftKeyDown() then
+        SafeInvoke("gear-slot-copy", function()
+            local value, label = addon:GetDetailRowCopyValue(self)
+            if value then
+                addon:ShowCopyDialog(value, label)
+            end
+        end)
+        return
+    end
+    SafeInvoke("gear-slot-atlasloot", function()
+        if not addon:OpenItemInAtlasLoot(self) then
+            local value, label = addon:GetDetailRowCopyValue(self)
+            if value then
+                addon:ShowCopyDialog(value, label)
+            end
+        end
+    end)
+end
+
+local function CreateGearSlot(parent, slotKey)
+    local btn = CreateFrame("Button", nil, parent)
+    btn:SetWidth(GEAR_SLOT_SIZE)
+    btn:SetHeight(GEAR_SLOT_SIZE)
+    btn.slotKey = slotKey
+
+    local bg = btn:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(btn)
+    local emptyTex = GetEmptySlotTexture(slotKey)
+    if emptyTex then
+        bg:SetTexture(emptyTex)
+    else
+        bg:SetTexture(0.1, 0.1, 0.1, 0.6)
+    end
+    btn.bg = bg
+
+    local icon = btn:CreateTexture(nil, "ARTWORK")
+    icon:SetPoint("TOPLEFT", btn, "TOPLEFT", 1, -1)
+    icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -1, 1)
+    icon:SetTexCoord(0.07, 0.93, 0.07, 0.93) -- trim the icon's built-in border
+    icon:Hide()
+    btn.icon = icon
+
+    -- Quality glow, tinted per item quality (same texture action buttons use).
+    local border = btn:CreateTexture(nil, "OVERLAY")
+    border:SetTexture("Interface\\Buttons\\UI-ActionButton-Border")
+    border:SetBlendMode("ADD")
+    border:SetPoint("CENTER", btn, "CENTER", 0, 0)
+    border:SetWidth(GEAR_SLOT_SIZE * 1.9)
+    border:SetHeight(GEAR_SLOT_SIZE * 1.9)
+    border:Hide()
+    btn.border = border
+
+    btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+    btn:RegisterForClicks("RightButtonUp")
+    btn:SetScript("OnEnter", GearSlot_OnEnter)
+    btn:SetScript("OnLeave", GearSlot_OnLeave)
+    btn:SetScript("OnClick", GearSlot_OnClick)
+    return btn
+end
+
+function addon:EnsureGearPreviewFrame()
+    if addon.ui and addon.ui.gearPreview then
+        return addon.ui.gearPreview
+    end
+    addon.ui = addon.ui or {}
+
+    local width = GEAR_DOLL_WIDTH
+    local columnRows = #GEAR_DOLL_RIGHT -- the taller of the two columns
+    local height = GEAR_DOLL_HEADER + (columnRows * GEAR_SLOT_PITCH) + GEAR_SLOT_PITCH + 24
+
+    local f = CreateFrame("Frame", "RaidInspectorGearPreview", UIParent)
+    f:SetWidth(width)
+    f:SetHeight(height)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
+    f:SetFrameStrata("DIALOG")
+    if f.SetToplevel then
+        f:SetToplevel(true)
+    end
+    f:EnableMouse(true)
+    f:SetMovable(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    f:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+    if f.SetBackdrop then
+        f:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = { left = 8, right = 8, top = 8, bottom = 8 },
+        })
+    end
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+    title:SetPoint("TOP", f, "TOP", 0, -12)
+    f.titleText = title
+
+    local info = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    info:SetPoint("TOP", title, "BOTTOM", 0, -4)
+    f.infoText = info
+
+    local close = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    close:SetPoint("TOPRIGHT", f, "TOPRIGHT", -4, -4)
+
+    -- Legend: red = missing enchant or empty gem socket.
+    local legend = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    legend:SetPoint("BOTTOM", f, "BOTTOM", 0, 8)
+    legend:SetText("red icon = missing enchant or gem")
+    legend:SetTextColor(1.0, 0.4, 0.4)
+    f.legend = legend
+
+    f.slots = {}
+    local leftX = 16
+    local rightX = width - 16 - GEAR_SLOT_SIZE
+    local topY = -GEAR_DOLL_HEADER
+    local idx
+
+    for idx = 1, #GEAR_DOLL_LEFT do
+        local slotKey = GEAR_DOLL_LEFT[idx]
+        local btn = CreateGearSlot(f, slotKey)
+        btn:SetPoint("TOPLEFT", f, "TOPLEFT", leftX, topY - (idx - 1) * GEAR_SLOT_PITCH)
+        f.slots[slotKey] = btn
+    end
+
+    for idx = 1, #GEAR_DOLL_RIGHT do
+        local slotKey = GEAR_DOLL_RIGHT[idx]
+        local btn = CreateGearSlot(f, slotKey)
+        btn:SetPoint("TOPLEFT", f, "TOPLEFT", rightX, topY - (idx - 1) * GEAR_SLOT_PITCH)
+        f.slots[slotKey] = btn
+    end
+
+    local bottomCount = #GEAR_DOLL_BOTTOM
+    local bottomGap = 8
+    local bottomWidth = (bottomCount * GEAR_SLOT_SIZE) + ((bottomCount - 1) * bottomGap)
+    local bottomStartX = math.floor((width - bottomWidth) / 2)
+    local bottomY = topY - (#GEAR_DOLL_RIGHT * GEAR_SLOT_PITCH) - 6
+    for idx = 1, bottomCount do
+        local slotKey = GEAR_DOLL_BOTTOM[idx]
+        local btn = CreateGearSlot(f, slotKey)
+        btn:SetPoint("TOPLEFT", f, "TOPLEFT", bottomStartX + (idx - 1) * (GEAR_SLOT_SIZE + bottomGap), bottomY)
+        f.slots[slotKey] = btn
+    end
+
+    f:Hide()
+    if type(UISpecialFrames) == "table" then
+        table.insert(UISpecialFrames, "RaidInspectorGearPreview") -- Escape closes it
+    end
+    addon.ui.gearPreview = f
+    return f
+end
+
+function addon:FindOverviewEntryByKey(key)
+    if not key or key == "" then
+        return nil
+    end
+    local entries = addon:GetOverviewEntries()
+    local i
+    for i = 1, #entries do
+        if entries[i].key == key then
+            return entries[i]
+        end
+    end
+    return nil
+end
+
+function addon:ShowGearPreview(key)
+    local entry = addon:FindOverviewEntryByKey(key)
+    if not entry then
+        Print("no stored gear to preview for that player")
+        return
+    end
+
+    local result = entry.result
+    local req = entry.req or {}
+    local f = addon:EnsureGearPreviewFrame()
+
+    local name = SafeText((result and result.name) or req.name)
+    if result and result.class then
+        f.titleText:SetText(ColorClassText(name, result.class))
+    else
+        f.titleText:SetText(name)
+    end
+
+    if result then
+        local levelText = result.level and tostring(result.level) or "?"
+        local classText = result.class and tostring(result.class) or "?"
+        local specText = result.spec and tostring(result.spec) or "?"
+        local gsText = result.gearScore
+            and ColorText(tostring(result.gearScore), GetGearScoreColorCode(result.gearScore))
+            or "N/A"
+        f.infoText:SetText(
+            "Lvl " .. levelText
+            .. " " .. ColorClassText(classText, result.class)
+            .. " " .. ColorText(specText, "ff9933")
+            .. "  |  GS: " .. gsText
+        )
+    else
+        f.infoText:SetText("No stored gear for this player.")
+    end
+
+    -- Map stored items onto slots (first item per slot wins, as the detail list).
+    local itemsBySlot = {}
+    if result and type(result.items) == "table" then
+        local i
+        for i = 1, #result.items do
+            local item = result.items[i]
+            local slot = NormalizeSlot(item.slot)
+            if slot and not itemsBySlot[slot] then
+                itemsBySlot[slot] = item
+            end
+        end
+    end
+
+    local slotKey, btn
+    for slotKey, btn in pairs(f.slots) do
+        local item = itemsBySlot[slotKey]
+        if item then
+            btn.data = { item = item, slotKey = slotKey }
+            btn.icon:SetTexture(GetGearItemIcon(item))
+            btn.icon:Show()
+            if GearSlotHasIssue(item, slotKey) then
+                -- Missing enchant or empty gem socket: flag the slot red.
+                btn.icon:SetVertexColor(1, 0.3, 0.3)
+                btn.border:SetVertexColor(1, 0.1, 0.1)
+                btn.border:Show()
+            else
+                btn.icon:SetVertexColor(1, 1, 1)
+                local quality = tonumber(item.quality)
+                local qc = quality and ITEM_QUALITY_COLORS and ITEM_QUALITY_COLORS[quality]
+                if qc and quality > 0 then
+                    btn.border:SetVertexColor(qc.r, qc.g, qc.b)
+                    btn.border:Show()
+                else
+                    btn.border:Hide()
+                end
+            end
+        else
+            btn.data = nil
+            btn.icon:SetVertexColor(1, 1, 1)
+            btn.icon:Hide()
+            btn.border:Hide()
+        end
+    end
+
+    f:Show()
+    if f.Raise then
+        f:Raise()
+    end
 end
 
 -- Pops a small dialog containing a pre-selected, focused EditBox so the player
@@ -7126,6 +7516,13 @@ local function EntryHasMissingAuditIssues(entry)
     return missingEnchant > 0 or missingGems > 0
 end
 
+local function EntryHasStoredGear(entry)
+    return type(entry) == "table"
+        and type(entry.result) == "table"
+        and type(entry.result.items) == "table"
+        and #entry.result.items > 0
+end
+
 local function EntryIsPendingNotInspectable(entry)
     if type(entry) ~= "table" then
         return false
@@ -7689,11 +8086,17 @@ function addon:RefreshMainWindow()
         for key in pairs(latestByKey) do
             local req = latestByKey[key]
             local result = RaidInspectorDB.results[key]
+            -- Same derivation as addon:GetOverviewEntries: a stored result only
+            -- upgrades the state to "ready" when the request did not fail.
+            local state = req.status or "queued"
+            if state ~= "error" and result and not result.error then
+                state = "ready"
+            end
             table.insert(entries, {
                 key = key,
                 req = req,
                 result = result,
-                state = (result and not result.error) and "ready" or (req.status or "queued"),
+                state = state,
                 statusReason = req.statusReason,
                 updatedAt = result and (tonumber(result.updatedAt) or tonumber(result.fetchedAt) or 0) or 0,
                 ageMinutes = -1,
@@ -7794,6 +8197,15 @@ function addon:RefreshMainWindow()
                 end
             end
 
+            if row.gearButton then
+                row.gearButton.key = entry.key
+                if EntryHasStoredGear(entry) then
+                    row.gearButton:Show()
+                else
+                    row.gearButton:Hide()
+                end
+            end
+
             row:Show()
         else
             row.key = nil
@@ -7807,6 +8219,10 @@ function addon:RefreshMainWindow()
                 row.removeButton.key = nil
                 row.refreshButton:Hide()
                 row.removeButton:Hide()
+            end
+            if row.gearButton then
+                row.gearButton.key = nil
+                row.gearButton:Hide()
             end
             row:Hide()
         end
