@@ -51,6 +51,11 @@ Name-only remote lookups are intentionally not supported here.
 - `/ri status`
 - `/ri refreshstale [minutes]`
 - `/ri clearqueue [confirm]`
+- `/ri ms [on|off]`
+- `/ri ms list`
+- `/ri ms set <name> <spec>`
+- `/ri ms share`
+- `/ri ms clear`
 
 ## Main Window Actions
 - `Target`: inspect the current target immediately.
@@ -60,8 +65,36 @@ Name-only remote lookups are intentionally not supported here.
 - `Report`: save the full current overview as a detailed local report.
 - `Refresh`: attempt live refresh for stale entries that are currently present in target/party/raid.
 - `Status`: print runtime status into chat.
-- `Clear`: clear queued requests and cached live-inspect results.
+- `Clear`: clear queued requests, cached live-inspect results and recorded MS changes.
+- `MS: on/off`: start/stop recording MS changes from raid chat.
+- `MS Share`: post the recorded MS list to the ticked Share channels.
+- `MS Clear`: wipe the recorded MS list (asks to confirm).
 - Selected row actions: `Refresh` re-queues a live inspect for that player, `Remove` deletes that player from the live list/cache.
+- Right-click a player row to set or edit that player's MS by hand.
+
+## MS Tracking
+
+Raid members call out spec changes in raid chat, and the addon records them.
+
+1. Click `MS: off` so it reads `MS: on` (or `/ri ms on`) when you open the MS-change window.
+2. Players type `MS <spec>` in raid or party chat - `MS resto`, `ms heal`, `MS: boomy`, `MS - frost`, `mainspec fury` all work.
+3. Click `MS: on` again (or `/ri ms off`) to stop listening once the window closes.
+
+Recorded players show `MS:<spec>` on their overview row in place of `Scanned=<age>`. Use the `MS Changes` sort to bring everyone who changed to the top.
+
+What is deliberately ignored:
+- open/close announcements such as `MS CHANGE CLOSE`, `ms close`, `ms open`
+- lines where `ms` is not the first word (`anyone need ms?`)
+- words that merely start with `ms` (`msg me for inv`)
+- a bare `ms` with no spec, and messages containing an item/achievement link
+
+Corrections: right-click a player's row to type their MS by hand, or `/ri ms set <name> <spec>`. Saving an empty box clears that player's MS. Shift+right-click still copies the player's name.
+
+Reporting: `MS Share` (or `/ri ms share`) posts the list to the ticked Share channels, split across several messages when needed. The `RW` checkbox adds Raid Warning as a target and requires raid leader or assistant.
+
+MS records are stored separately from scan results, so rescans, `/reload` and relogging all keep them. They are wiped by `Clear` (along with the queue and results) or by `MS Clear` / `/ri ms clear`, which removes only the MS list and leaves the scan list alone.
+
+Saved reports keep their own copy of the MS. `Save All` writes the recorded MS into the report, and loading it shows the specs from when it was saved - not the current MS list - so clearing or refilling the MS list never rewrites an old report. Reports saved before `0.16.0-alpha` have no MS stored and keep showing the scan age.
 
 ## LFM Tab (Initial)
 - Use the `LFM` tab to compose your recruitment message.
@@ -83,7 +116,7 @@ Raid snapshot history remains in `RaidInspectorDB.raidScanHistory.scans`.
 ## SavedVariables Shape
 ```lua
 RaidInspectorDB = {
-	meta = { schemaVersion = 4, lastLoadedAt = 0 },
+	meta = { schemaVersion = 5, lastLoadedAt = 0 },
 	settings = { window = { point = "CENTER", x = 0, y = 0 } },
 	state = {
 		nextRequestId = 1,
@@ -113,9 +146,21 @@ RaidInspectorDB = {
 		scans = {
 			-- { id, snapshotAt, updatedAt, roster = {...}, summaryPayloads = {...} }
 		}
+	},
+	msTracking = {
+		enabled = false,
+		startedAt = 0,
+		nextSeq = 1,
+		entries = {
+			-- ["name-realm"] = { key, name, realm, spec, previousSpec, at, seq, source, changeCount }
+		}
 	}
 }
 ```
+
+Saved report payloads additionally carry `mainSpec`, `mainSpecAt` and `mainSpecPrevious`, copied from the MS list when the report is saved.
+
+MS records are kept in `RaidInspectorDB.msTracking.entries`, outside `results`, so a rescan never drops them. `Clear` and `MS Clear` wipe them explicitly.
 
 ## Bridge Status
 Bridge assets were removed from this repository to keep the release branch fully in-game and self-contained.

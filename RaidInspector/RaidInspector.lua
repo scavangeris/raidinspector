@@ -5,7 +5,7 @@ RaidInspectorDB = RaidInspectorDB or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.15.0-alpha"
+addon.version = "0.16.0-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
@@ -24,6 +24,10 @@ local INSPECT_RETRY_REASONS = {
     ["unit-not-found"] = true,
     ["unit-changed"] = true,
     ["inspect-timeout"] = true,
+    -- The inspect "succeeded" but the client handed back no gear at all, which
+    -- is what an out-of-range unit looks like. Treated as transient so the
+    -- player is re-inspected instead of being left with an empty item list.
+    ["inspect-empty"] = true,
 }
 
 -- Autoscan: re-runs the raid scan on its own while enabled.
@@ -168,7 +172,7 @@ local RIGHT_PANEL_X = 474
 
 local RAID_ACHIEVEMENT_KEYS = { "icc10", "icc25", "toc10", "toc25", "rs10", "rs25" }
 
-local SORT_MODES = { "recent", "gs", "issues", "name" }
+local SORT_MODES = { "recent", "gs", "issues", "name", "ms" }
 local FILTER_MODES = { "all", "snapshot", "ready", "queued", "issues" }
 local ITEM_LIST_FILTER_MODES = { "all", "issues", "missing-enchant", "missing-gems" }
 
@@ -182,6 +186,51 @@ local SORT_LABELS = {
     gs = "GS",
     issues = "Issues",
     name = "Name",
+    ms = "MS Changes",
+}
+
+-- MS (main spec) tracking: raid members announce a spec change by typing
+-- "MS <spec>" in raid chat while registering is on.
+local MS_MAX_SPEC_LENGTH = 24
+local MS_REPORT_LINE_LENGTH = 230
+
+-- Words that follow "MS" when the raid leader is opening/closing the window
+-- rather than a player declaring a spec (e.g. the "MS CHANGE CLOSE" warning).
+-- These must never be stored as somebody's main spec.
+local MS_CONTROL_PHRASES = {
+    ["change"] = true,
+    ["changes"] = true,
+    ["change close"] = true,
+    ["changes close"] = true,
+    ["change closed"] = true,
+    ["change open"] = true,
+    ["changes open"] = true,
+    ["change now"] = true,
+    ["change time"] = true,
+    ["open"] = true,
+    ["opened"] = true,
+    ["close"] = true,
+    ["closed"] = true,
+    ["closing"] = true,
+    ["start"] = true,
+    ["stop"] = true,
+    ["now"] = true,
+    -- Loot-rule chatter said during the very window this feature runs in:
+    -- "MS only", "ms rolls first", "ms or os?", "MS over OS".
+    ["only"] = true,
+    ["roll"] = true,
+    ["rolls"] = true,
+    ["rolling"] = true,
+    ["or"] = true,
+    ["over"] = true,
+    ["before"] = true,
+    ["after"] = true,
+    ["and"] = true,
+    ["vs"] = true,
+    ["prio"] = true,
+    ["priority"] = true,
+    -- Our own broadcast header ("MS changes (3): ...") - see SanitizeSpecText.
+    ["changed"] = true,
 }
 
 local FILTER_LABELS = {
@@ -1197,6 +1246,7 @@ local function FormatStatusReason(reason)
         ["unit-not-found"] = "unit not found, retrying",
         ["unit-changed"] = "unit changed, retrying",
         ["inspect-timeout"] = "inspect timeout, retrying",
+        ["inspect-empty"] = "out of range, retrying",
         ["inspect-build-failed"] = "inspect build failed",
         ["local-only"] = "not in current target, party, or raid",
     }
@@ -1756,6 +1806,22 @@ function addon:GetInspectLinkCount(unit)
     return count
 end
 
+-- "Has gear" means the scan actually read something off the unit. Used to tell
+-- a real result apart from the empty shell an out-of-range inspect produces.
+local function ResultHasGear(result)
+    if type(result) ~= "table" then
+        return false
+    end
+    if type(result.items) == "table" and #result.items > 0 then
+        return true
+    end
+    return (tonumber(result.gearScore) or 0) > 0
+end
+
+local function ResultHasNoGear(result)
+    return not ResultHasGear(result)
+end
+
 function addon:FinalizeInspectCurrent(success, failureReason)
     if not addon.inspectCurrent then
         return
@@ -1781,6 +1847,43 @@ function addon:FinalizeInspectCurrent(success, failureReason)
         )
         if ok and type(resultOrErr) == "table" then
             local previous = RaidInspectorDB.results[current.key]
+
+            -- An inspect on a unit that has drifted out of range still reports
+            -- success, but every GetInventoryItemLink comes back nil, so the
+            -- "result" is an empty shell. Writing that over a good scan is what
+            -- made gear vanish from the item list. Keep the gear we already
+            -- have and mark the attempt for retry instead.
+            if ResultHasNoGear(resultOrErr) then
+                if ResultHasGear(previous) then
+                    if req then
+                        req.status = "error"
+                        req.statusReason = "inspect-empty"
+                        req.updatedAt = GetNow()
+                    end
+                    addon:RefreshActiveRaidHistoryEntry()
+                    if ClearInspectPlayer then
+                        ClearInspectPlayer()
+                    end
+                    addon:RefreshMainWindow()
+                    return
+                end
+
+                -- Nothing cached either: store the shell so the row exists, but
+                -- flag it so RetryPendingInspects picks it up (no GS -> rescan).
+                RaidInspectorDB.results[current.key] = resultOrErr
+                if req then
+                    req.status = "error"
+                    req.statusReason = "inspect-empty"
+                    req.updatedAt = GetNow()
+                end
+                addon:RefreshActiveRaidHistoryEntry()
+                if ClearInspectPlayer then
+                    ClearInspectPlayer()
+                end
+                addon:RefreshMainWindow()
+                return
+            end
+
             if type(previous) == "table" then
                 if resultOrErr.achievementPoints == nil and previous.achievementPoints ~= nil then
                     resultOrErr.achievementPoints = previous.achievementPoints
@@ -2071,7 +2174,106 @@ function addon:ProcessAutoScan()
     return true
 end
 
+-- Current raid/party member keys, in the same format the list uses, or nil when
+-- we are not in a group (so an empty roster can never be mistaken for
+-- "everyone left").
+function addon:GetGroupMemberKeys()
+    local members = {}
+    local found = false
+    local i
+
+    local raidCount = (GetNumRaidMembers and GetNumRaidMembers()) or 0
+    if raidCount > 0 then
+        for i = 1, raidCount do
+            local rosterName = GetRaidRosterInfo(i)
+            if rosterName and rosterName ~= "" then
+                local name = rosterName
+                local realm = GetRealmName() or ""
+                local splitName, splitRealm = string.match(rosterName, "^([^%-]+)%-(.+)$")
+                if splitName and splitRealm then
+                    name = splitName
+                    realm = splitRealm
+                end
+                members[MakePlayerKey(name, realm)] = true
+                found = true
+            end
+        end
+        return found and members or nil
+    end
+
+    local partyCount = (GetNumPartyMembers and GetNumPartyMembers()) or 0
+    if partyCount > 0 then
+        local realm = GetRealmName() or ""
+        for i = 1, partyCount do
+            local name = UnitName("party" .. tostring(i))
+            if name and name ~= "" then
+                members[MakePlayerKey(name, realm)] = true
+                found = true
+            end
+        end
+        local selfName = UnitName("player")
+        if selfName and selfName ~= "" then
+            members[MakePlayerKey(selfName, realm)] = true
+        end
+        return found and members or nil
+    end
+
+    return nil
+end
+
+-- Drops players who have left or been kicked, whether or not autoscan is on.
+-- Only keys we have actually seen in the group are eligible, so a player added
+-- by hand with /ri inspect (who was never in the raid) is never auto-removed.
+function addon:PruneDepartedGroupMembers()
+    if addon:GetSelectedSavedReportFile() ~= "" then
+        -- A saved report is a snapshot; the live roster must not edit it.
+        return 0
+    end
+
+    local members = addon:GetGroupMemberKeys()
+    if not members then
+        -- Not in a group: leaving the raid yourself must not wipe the list.
+        return 0
+    end
+
+    addon.rosterSeenKeys = addon.rosterSeenKeys or {}
+
+    local departed = {}
+    local removedCount = 0
+    local key
+
+    for key in pairs(addon.rosterSeenKeys) do
+        if not members[key] then
+            departed[key] = true
+        end
+    end
+
+    for key in pairs(members) do
+        addon.rosterSeenKeys[key] = true
+    end
+
+    for key in pairs(departed) do
+        addon.rosterSeenKeys[key] = nil
+        if addon:RemoveOverviewEntryByKey(key, true) then
+            removedCount = removedCount + 1
+        end
+    end
+
+    if removedCount > 0 then
+        Print("removed " .. tostring(removedCount) .. " who left the group")
+        addon:RefreshMainWindow()
+    end
+
+    return removedCount
+end
+
 function addon:OnRosterChanged()
+    -- Removal tracks the group regardless of autoscan; only the rescan below
+    -- is an autoscan feature.
+    SafeInvoke("roster-prune", function()
+        addon:PruneDepartedGroupMembers()
+    end)
+
     if not addon:IsAutoScanEnabled() then
         return
     end
@@ -2103,8 +2305,13 @@ function addon:RetryPendingInspects()
         -- attempt on someone we already know is exactly the entry whose data has
         -- gone stale, and the status reasons above all advertise "retrying".
         -- A successful scan leaves status "ready", so this never re-queues one.
-        local retryable = INSPECT_RETRY_REASONS[reason]
-            and (req.status == "error" or req.status == "queued")
+        -- No gear/GS cached means the scan never really landed - including rows
+        -- left behind by an older build that stored an empty result as "ready".
+        -- Those are retried regardless of status, so a player only has to come
+        -- into range once; a scan that did return gear is still never re-queued.
+        local missingGear = ResultHasNoGear(RaidInspectorDB.results[key])
+        local retryable = (INSPECT_RETRY_REASONS[reason] or missingGear)
+            and (req.status == "error" or req.status == "queued" or missingGear)
             and not addon.inspectQueuedKeys[key]
             and not (addon.inspectCurrent and addon.inspectCurrent.key == key)
 
@@ -2346,6 +2553,8 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "raid", true)
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "say", false)
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "whisper", false)
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "guild", false)
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "rw", false)
     EnsureTable(RaidInspectorDB.state.ui, "lfm", {})
     EnsureTable(RaidInspectorDB.state.ui.lfm, "message", "")
     EnsureTable(RaidInspectorDB.state.ui.lfm, "channels", {})
@@ -2373,7 +2582,14 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.raidScanHistory, "nextId", 1)
     EnsureTable(RaidInspectorDB.raidScanHistory, "scans", {})
 
-    RaidInspectorDB.meta.schemaVersion = 4
+    -- MS records live outside `results` so a rescan or Clear never drops them.
+    EnsureTable(RaidInspectorDB, "msTracking", {})
+    EnsureTable(RaidInspectorDB.msTracking, "enabled", false)
+    EnsureTable(RaidInspectorDB.msTracking, "entries", {})
+    EnsureTable(RaidInspectorDB.msTracking, "nextSeq", 1)
+    EnsureTable(RaidInspectorDB.msTracking, "startedAt", 0)
+
+    RaidInspectorDB.meta.schemaVersion = 5
     RaidInspectorDB.meta.lastLoadedAt = GetNow()
     addon:MigrateReportFileQueueToSavedReports()
     addon:PruneRaidScanHistory()
@@ -3204,17 +3420,400 @@ function addon:GetExportChannels()
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "say", false)
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "whisper", false)
     EnsureTable(RaidInspectorDB.state.ui.exportChannels, "guild", false)
+    EnsureTable(RaidInspectorDB.state.ui.exportChannels, "rw", false)
     return RaidInspectorDB.state.ui.exportChannels
 end
 
 function addon:SetExportChannel(channel, enabled)
-    if channel ~= "raid" and channel ~= "say" and channel ~= "whisper" and channel ~= "guild" then
+    if channel ~= "raid" and channel ~= "say" and channel ~= "whisper"
+        and channel ~= "guild" and channel ~= "rw" then
         return false
     end
 
     local channels = addon:GetExportChannels()
     channels[channel] = enabled and true or false
     return true
+end
+
+-- ---------------------------------------------------------------------------
+-- MS (main spec) tracking
+--
+-- While registering is on, every raid/party chat line is checked for an
+-- "MS <spec>" declaration. Matches are stored per player in their own table so
+-- they survive scans, reloads and the Clear button - only an explicit MS clear
+-- wipes them.
+-- ---------------------------------------------------------------------------
+
+function addon:GetMSTracking()
+    EnsureTable(RaidInspectorDB, "msTracking", {})
+    EnsureTable(RaidInspectorDB.msTracking, "enabled", false)
+    EnsureTable(RaidInspectorDB.msTracking, "entries", {})
+    EnsureTable(RaidInspectorDB.msTracking, "nextSeq", 1)
+    EnsureTable(RaidInspectorDB.msTracking, "startedAt", 0)
+    return RaidInspectorDB.msTracking
+end
+
+function addon:IsMSTrackingEnabled()
+    return addon:GetMSTracking().enabled == true
+end
+
+function addon:GetMainSpecRecord(key)
+    if type(key) ~= "string" or key == "" then
+        return nil
+    end
+    local record = addon:GetMSTracking().entries[key]
+    if type(record) ~= "table" then
+        return nil
+    end
+    return record
+end
+
+-- Chat authors arrive as "Name" on a single-realm server and occasionally as
+-- "Name-Realm"; normalize both to the same key the inspect list uses.
+local function SplitChatAuthor(author)
+    local text = Trim(author or "")
+    if text == "" then
+        return nil, nil
+    end
+
+    local name, realm = string.match(text, "^(.+)%-(.+)$")
+    if name and realm then
+        return Trim(name), Trim(realm)
+    end
+
+    local currentRealm = (type(GetRealmName) == "function" and GetRealmName()) or "Unknown"
+    return text, currentRealm
+end
+
+-- Accepts "MS resto", "ms: heal", "ms - ret", "mainspec tank", "main spec dps".
+-- Returns the cleaned spec text, or nil when the line is not an MS declaration
+-- (or is one of the leader's open/close control announcements).
+-- Cuts to at most MS_MAX_SPEC_LENGTH bytes without slicing a multi-byte UTF-8
+-- sequence in half - ruRU/deDE realms would otherwise store an invalid byte
+-- that renders as a glyph artefact and gets sent verbatim to chat.
+local function TruncateSpecText(spec)
+    if string.len(spec) <= MS_MAX_SPEC_LENGTH then
+        return spec
+    end
+
+    local cut = MS_MAX_SPEC_LENGTH
+    while cut > 1 do
+        local nextByte = string.byte(spec, cut + 1)
+        -- 0x80-0xBF is a UTF-8 continuation byte: back off to its lead byte.
+        if not nextByte or nextByte < 128 or nextByte >= 192 then
+            break
+        end
+        cut = cut - 1
+    end
+
+    return Trim(string.sub(spec, 1, cut))
+end
+
+-- The single gate every recorded spec passes through, whether it came from
+-- chat, /ri ms set, or the right-click editor. Returns nil to reject.
+local function SanitizeSpecText(text)
+    local spec = Trim(text or "")
+    if spec == "" then
+        return nil
+    end
+
+    -- Colour/link escapes would corrupt the overview row (which wraps the spec
+    -- in its own |cff..|r) and the outgoing chat line.
+    if string.find(spec, "|", 1, true) then
+        return nil
+    end
+
+    spec = Trim(string.gsub(spec, "%s+", " "))
+    -- Drop trailing chat punctuation ("ms resto!!" / "ms heal.").
+    spec = Trim(string.gsub(spec, "[%.%!%?,;:]+$", ""))
+    if spec == "" then
+        return nil
+    end
+
+    -- A spec starts with a letter, which rejects loot-rule chatter that happens
+    -- to follow "MS" ("MS > OS", "MS = main spec"). Only ASCII is tested: %a is
+    -- locale-dependent and would throw away every Cyrillic spec on a ruRU realm,
+    -- so any high byte (a UTF-8 lead) is accepted as a letter.
+    local firstByte = string.byte(spec, 1)
+    if firstByte and firstByte < 128 and not string.find(spec, "^%a") then
+        return nil
+    end
+
+    -- Check the FIRST WORD, not the whole string: the leader's announcements
+    -- ("MS CHANGE CLOSE") and this addon's own broadcast ("MS changes (3):
+    -- Bob=resto, ...") both carry extra text that a whole-string lookup misses.
+    -- Without this the share output is re-read by our own chat hook and stored
+    -- as the sharer's main spec, re-triggering on every share.
+    local firstWord = string.lower(string.match(spec, "^(%a+)") or "")
+    if MS_CONTROL_PHRASES[firstWord] or MS_CONTROL_PHRASES[string.lower(spec)] then
+        return nil
+    end
+
+    return TruncateSpecText(spec)
+end
+
+local function ParseMainSpecMessage(text)
+    local body = Trim(text or "")
+    if body == "" then
+        return nil
+    end
+
+    -- Require a real separator after "ms" so words like "msg" never match.
+    local spec = string.match(body, "^[Mm][Ss]%s*[:%-]+%s*(.+)$")
+        or string.match(body, "^[Mm][Ss]%s+(.+)$")
+        or string.match(body, "^[Mm]ain%s*[Ss]pec%s*[:%-]*%s*(.+)$")
+    if not spec then
+        return nil
+    end
+
+    return SanitizeSpecText(spec)
+end
+
+-- Stores one MS declaration. Returns the record plus whether it actually
+-- changed anything, so repeated identical lines stay quiet.
+-- realmOverride keeps a manual edit on the exact key the row already uses,
+-- instead of re-deriving it from the player's current realm.
+function addon:RecordMainSpecChange(playerName, specText, sourceLabel, realmOverride)
+    local name, realm = SplitChatAuthor(playerName)
+    if not name then
+        return nil, false
+    end
+
+    if realmOverride and realmOverride ~= "" then
+        realm = realmOverride
+    end
+
+    -- Every path lands here, so the manual editor and /ri ms set get the same
+    -- escape-stripping and length cap as a parsed chat line.
+    local spec = SanitizeSpecText(specText)
+    if not spec then
+        return nil, false
+    end
+
+    local tracking = addon:GetMSTracking()
+    local key = MakePlayerKey(name, realm)
+    local existing = tracking.entries[key]
+    local previousSpec = type(existing) == "table" and existing.spec or nil
+
+    if previousSpec and string.lower(previousSpec) == string.lower(spec) then
+        -- Same spec re-announced: refresh the timestamp, do not count a change.
+        existing.at = GetNow()
+        existing.source = sourceLabel or existing.source
+        return existing, false
+    end
+
+    local record = {
+        key = key,
+        name = name,
+        realm = realm,
+        spec = spec,
+        previousSpec = previousSpec,
+        at = GetNow(),
+        seq = tonumber(tracking.nextSeq) or 1,
+        source = sourceLabel or "manual",
+        changeCount = (type(existing) == "table" and (tonumber(existing.changeCount) or 0) or 0) + 1,
+    }
+
+    tracking.nextSeq = record.seq + 1
+    tracking.entries[key] = record
+    return record, true
+end
+
+function addon:RemoveMainSpecRecord(key)
+    local tracking = addon:GetMSTracking()
+    if type(key) ~= "string" or key == "" or tracking.entries[key] == nil then
+        return false
+    end
+    tracking.entries[key] = nil
+    return true
+end
+
+-- Recorded MS entries, newest declaration first.
+function addon:GetMainSpecRecords()
+    local tracking = addon:GetMSTracking()
+    local records = {}
+    local key, record
+    for key, record in pairs(tracking.entries) do
+        if type(record) == "table" then
+            table.insert(records, record)
+        end
+    end
+
+    table.sort(records, function(a, b)
+        local aSeq = tonumber(a and a.seq) or 0
+        local bSeq = tonumber(b and b.seq) or 0
+        if aSeq ~= bSeq then
+            return aSeq > bSeq
+        end
+        return string.lower(tostring(a and a.name or "")) < string.lower(tostring(b and b.name or ""))
+    end)
+
+    return records
+end
+
+function addon:GetMainSpecCount()
+    local count = 0
+    local _, record
+    for _, record in pairs(addon:GetMSTracking().entries) do
+        if type(record) == "table" then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+function addon:SetMSTrackingEnabled(enabled)
+    local tracking = addon:GetMSTracking()
+    tracking.enabled = enabled and true or false
+
+    if tracking.enabled then
+        tracking.startedAt = GetNow()
+        Print("MS registering: ON - raid/party lines like \"MS resto\" are now recorded")
+    else
+        Print("MS registering: OFF (" .. tostring(addon:GetMainSpecCount()) .. " recorded)")
+    end
+
+    addon:RefreshMSButton()
+    addon:RefreshMainWindow()
+    return tracking.enabled
+end
+
+function addon:ToggleMSTracking()
+    return addon:SetMSTrackingEnabled(not addon:IsMSTrackingEnabled())
+end
+
+function addon:ClearMainSpecRecords()
+    local removed = addon:GetMainSpecCount()
+    local tracking = addon:GetMSTracking()
+    tracking.entries = {}
+    tracking.nextSeq = 1
+    Print("MS list cleared (" .. tostring(removed) .. " removed)")
+    addon:RefreshMainWindow()
+    return removed
+end
+
+function addon:RequestClearMainSpecRecords()
+    if type(StaticPopup_Show) ~= "function" or type(StaticPopupDialogs) ~= "table" then
+        addon:ClearMainSpecRecords()
+        return
+    end
+
+    StaticPopup_Hide("RAIDINSPECTOR_CONFIRM_CLEAR_MS")
+    StaticPopup_Show("RAIDINSPECTOR_CONFIRM_CLEAR_MS")
+end
+
+-- Raid chat hook. Only listens while registering is on.
+function addon:OnRaidChatMessage(event, message, author)
+    if not addon:IsMSTrackingEnabled() then
+        return
+    end
+
+    local spec = ParseMainSpecMessage(message)
+    if not spec then
+        return
+    end
+
+    local record, changed = addon:RecordMainSpecChange(author, spec, event)
+    if not record or not changed then
+        return
+    end
+
+    if record.previousSpec then
+        Print("MS: " .. record.name .. " " .. tostring(record.previousSpec) .. " -> " .. record.spec)
+    else
+        Print("MS: " .. record.name .. " = " .. record.spec)
+    end
+
+    addon:RefreshMainWindow()
+end
+
+-- Packs every recorded MS into as few chat lines as possible (chat caps a
+-- message at 255 characters, so long raids need several lines).
+function addon:BuildMainSpecReportLines()
+    local records = addon:GetMainSpecRecords()
+    if #records == 0 then
+        return {}
+    end
+
+    local lines = {}
+    local header = "MS changes (" .. tostring(#records) .. "): "
+    local current = header
+    local isFirstOnLine = true
+
+    local i
+    for i = 1, #records do
+        local record = records[i]
+        local piece = tostring(record.name) .. "=" .. tostring(record.spec)
+        local candidate = current .. (isFirstOnLine and "" or ", ") .. piece
+
+        if string.len(candidate) > MS_REPORT_LINE_LENGTH and not isFirstOnLine then
+            table.insert(lines, current)
+            current = "MS changes (cont.): " .. piece
+            -- A single oversized entry still has to fit inside one chat message.
+            if string.len(current) > MS_REPORT_LINE_LENGTH then
+                current = string.sub(current, 1, MS_REPORT_LINE_LENGTH)
+            end
+        else
+            current = candidate
+        end
+        isFirstOnLine = false
+    end
+
+    if current ~= header then
+        table.insert(lines, current)
+    end
+
+    return lines
+end
+
+function addon:ShareMainSpecChanges()
+    local lines = addon:BuildMainSpecReportLines()
+    if #lines == 0 then
+        Print("MS: nothing recorded yet")
+        return 0
+    end
+
+    -- Check the channel selection once up front; otherwise SendSummaryMessage
+    -- repeats its "no channels selected" / "whisper target missing" warning
+    -- for every line of a multi-line report.
+    local channels = addon:GetExportChannels()
+    if not (channels.raid or channels.say or channels.guild or channels.rw) then
+        if channels.whisper then
+            Print("MS: WHISPER is not a target for the MS list - tick Raid/Say/Guild/RW")
+        else
+            Print("MS: no channels selected (Raid/Say/Guild/RW)")
+        end
+        return 0
+    end
+
+    -- Whisper is per-player and meaningless for a roster-wide list; skip it so
+    -- it cannot warn once per line.
+    local restoreWhisper = channels.whisper
+    channels.whisper = false
+
+    local i
+    for i = 1, #lines do
+        addon:SendSummaryMessage(lines[i])
+    end
+
+    channels.whisper = restoreWhisper
+    return #lines
+end
+
+function addon:PrintMainSpecRecords()
+    local records = addon:GetMainSpecRecords()
+    Print("MS registering: " .. (addon:IsMSTrackingEnabled() and "ON" or "OFF")
+        .. ", recorded=" .. tostring(#records))
+
+    local i
+    for i = 1, #records do
+        local record = records[i]
+        local changeText = ""
+        if record.previousSpec then
+            changeText = " (was " .. tostring(record.previousSpec) .. ")"
+        end
+        Print("  " .. tostring(record.name) .. " = " .. tostring(record.spec) .. changeText)
+    end
 end
 
 function addon:RefreshTabVisibility()
@@ -3243,6 +3842,7 @@ function addon:RefreshTabVisibility()
         addon.ui.sayShareCheck,
         addon.ui.whisperShareCheck,
         addon.ui.guildShareCheck,
+        addon.ui.rwShareCheck,
         addon.ui.savedReportsRow,
         addon.ui.savedReportsLabel,
         addon.ui.savedReportDropDown,
@@ -3256,6 +3856,9 @@ function addon:RefreshTabVisibility()
         addon.ui.syncButton,
         addon.ui.reportButton,
         addon.ui.clearButton,
+        addon.ui.msButton,
+        addon.ui.msShareButton,
+        addon.ui.msClearButton,
         addon.ui.rowsViewport,
         addon.ui.overviewScroll,
         addon.ui.compositionHeader,
@@ -3518,6 +4121,16 @@ function addon:BuildStoredSummaryPayload(key, req, result, state, statusReason)
         payload.updatedAt = tonumber(result.updatedAt) or tonumber(result.fetchedAt) or payload.updatedAt or 0
     end
 
+    -- MS lives outside `results`, so it has to be pulled from the MS list by
+    -- key. Saving it into the payload is what lets a saved report keep the
+    -- specs that were recorded at the time it was saved.
+    local msRecord = addon:GetMainSpecRecord(payload.key)
+    if msRecord then
+        payload.mainSpec = msRecord.spec
+        payload.mainSpecAt = tonumber(msRecord.at) or 0
+        payload.mainSpecPrevious = msRecord.previousSpec
+    end
+
     return payload
 end
 
@@ -3566,6 +4179,11 @@ function addon:BuildReportEntryFromPayload(payload, index)
         raidAchievements = CopyTable(payload.raidAchievements or {}),
         specificAchievements = CopyTable(payload.specificAchievements or {}),
         raw = CopyTable(payload.raw),
+        -- Restored from the report itself, not the live MS list, so an old
+        -- report shows the specs it was saved with.
+        mainSpec = payload.mainSpec,
+        mainSpecAt = tonumber(payload.mainSpecAt) or nil,
+        mainSpecPrevious = payload.mainSpecPrevious,
         fetchedAt = updatedAt,
         updatedAt = updatedAt,
     }
@@ -4400,15 +5018,21 @@ function addon:RefreshOverviewEntryByKey(key)
     return false
 end
 
-function addon:RemoveOverviewEntryByKey(key)
+-- silent: used by the roster prune, which removes several players at once and
+-- prints one summary line + refreshes the window itself.
+function addon:RemoveOverviewEntryByKey(key, silent)
     local normalizedKey = string.lower(tostring(key or ""))
     if normalizedKey == "" then
-        Print("remove: missing key")
+        if not silent then
+            Print("remove: missing key")
+        end
         return false
     end
 
     if addon:GetSelectedSavedReportFile() ~= "" then
-        Print("remove is disabled while a saved report is loaded")
+        if not silent then
+            Print("remove is disabled while a saved report is loaded")
+        end
         return false
     end
 
@@ -4454,14 +5078,20 @@ function addon:RemoveOverviewEntryByKey(key)
         addon:SetSelectedKey("")
     end
 
-    addon:RefreshMainWindow()
+    if not silent then
+        addon:RefreshMainWindow()
+    end
 
     if removedRequests > 0 or hadResult then
-        Print("removed from list: " .. normalizedKey)
+        if not silent then
+            Print("removed from list: " .. normalizedKey)
+        end
         return true
     end
 
-    Print("remove: player not found in live list")
+    if not silent then
+        Print("remove: player not found in live list")
+    end
     return false
 end
 
@@ -4712,6 +5342,19 @@ function addon:GetOverviewEntries()
             return aName < bName
         end
 
+        -- MS: players who announced a spec change float to the top, most
+        -- recent declaration first; everyone else keeps the default order.
+        if sortMode == "ms" then
+            local aMs = addon:GetMainSpecRecord(a.key)
+            local bMs = addon:GetMainSpecRecord(b.key)
+            local aSeq = aMs and (tonumber(aMs.seq) or 0) or 0
+            local bSeq = bMs and (tonumber(bMs.seq) or 0) or 0
+            if aSeq ~= bSeq then
+                return aSeq > bSeq
+            end
+            return aId > bId
+        end
+
         return aId > bId
     end)
 
@@ -4814,6 +5457,11 @@ function addon:BuildOverviewRows(container, rowCount)
         text:SetHeight(OVERVIEW_ROW_HEIGHT)
         text:SetJustifyH("LEFT")
         text:SetJustifyV("MIDDLE")
+        -- MS:<spec> is far longer than the Scanned=Xm it replaces, so without
+        -- this a long name + issues + MS wraps and draws over the next row.
+        if text.SetWordWrap then
+            text:SetWordWrap(false)
+        end
         if text.GetFont and text.SetFont then
             local fontName, fontHeight, fontFlags = text:GetFont()
             if fontName and fontHeight then
@@ -4927,11 +5575,25 @@ function addon:BuildOverviewRows(container, rowCount)
         row.playerName = nil
         row:SetScript("OnClick", function(self, button)
             if button == "RightButton" then
-                SafeInvoke("row-copy", function()
-                    local value, label = addon:GetOverviewRowCopyValue(self)
-                    if value then
-                        addon:ShowCopyDialog(value, label)
+                -- Plain right-click edits the MS; shift+right-click keeps the
+                -- old copy-name dialog, matching the gear detail rows.
+                if IsShiftKeyDown() then
+                    SafeInvoke("row-copy", function()
+                        local value, label = addon:GetOverviewRowCopyValue(self)
+                        if value then
+                            addon:ShowCopyDialog(value, label)
+                        end
+                    end)
+                    return
+                end
+                SafeInvoke("row-ms-edit", function()
+                    -- Saved reports are read-only; editing there would silently
+                    -- rewrite the live MS list from a historical view.
+                    if addon:GetSelectedSavedReportFile() ~= "" then
+                        Print("MS: switch to Live Overview to edit MS")
+                        return
                     end
+                    addon:ShowMainSpecEditDialog(self.key, self.playerName)
                 end)
                 return
             end
@@ -5067,12 +5729,34 @@ function addon:RefreshAutoScanButton()
     end
 end
 
+function addon:RefreshMSButton()
+    if not addon.ui or not addon.ui.msButton then
+        return
+    end
+
+    if addon:IsMSTrackingEnabled() then
+        addon.ui.msButton:SetText("|cff66ff66MS: on|r")
+    else
+        addon.ui.msButton:SetText("|cff999999MS: off|r")
+    end
+
+    if addon.ui.msShareButton then
+        local count = addon:GetMainSpecCount()
+        if count > 0 then
+            addon.ui.msShareButton:SetText("|cff66ff66MS Share (" .. tostring(count) .. ")|r")
+        else
+            addon.ui.msShareButton:SetText("|cff66ff66MS Share|r")
+        end
+    end
+end
+
 function addon:ApplyButtonModeLayout()
     if not addon.ui or not addon.ui.actionPanel then
         return
     end
 
     addon:RefreshAutoScanButton()
+    addon:RefreshMSButton()
 
     local ACTION_BUTTON_WIDTH = 100
     local ACTION_BUTTON_HEIGHT = 20
@@ -5092,6 +5776,9 @@ function addon:ApplyButtonModeLayout()
         stale = addon.ui.staleButton,
         status = addon.ui.statusButton,
         clear = addon.ui.clearButton,
+        ms = addon.ui.msButton,
+        msshare = addon.ui.msShareButton,
+        msclear = addon.ui.msClearButton,
     }
 
     -- Filter, Status, Stale/Refresh, and Save One were removed from the window;
@@ -5108,9 +5795,12 @@ function addon:ApplyButtonModeLayout()
         stale = false,
         status = false,
         clear = true,
+        ms = true,
+        msshare = true,
+        msclear = true,
     }
 
-    local order = { "target", "raid", "autoscan", "sync", "report", "clear" }
+    local order = { "target", "raid", "autoscan", "sync", "report", "clear", "ms", "msshare", "msclear" }
 
     local key, button
     for key, button in pairs(buttons) do
@@ -5700,6 +6390,146 @@ function addon:ShowCopyDialog(text, label)
     editBox:HighlightText()
 end
 
+-- Right-clicking an overview row edits that player's MS by hand, for the ones
+-- who never typed it in raid chat (or typed it wrong). Saving an empty box
+-- removes the record.
+function addon:ShowMainSpecEditDialog(key, playerName)
+    if type(key) ~= "string" or key == "" then
+        return
+    end
+
+    local parsedName, parsedRealm = ParseKey(key)
+    local name = playerName
+    if not name or name == "" then
+        name = parsedName or key
+    end
+
+    addon.ui = addon.ui or {}
+    local dialog = addon.ui.msEditDialog
+
+    if not dialog then
+        dialog = CreateFrame("Frame", "RaidInspectorMSEditDialog", UIParent)
+        dialog:SetWidth(340)
+        dialog:SetHeight(126)
+        dialog:SetPoint("CENTER", UIParent, "CENTER", 0, 140)
+        dialog:SetFrameStrata("FULLSCREEN_DIALOG")
+        dialog:SetToplevel(true)
+        dialog:EnableMouse(true)
+        dialog:SetMovable(true)
+        dialog:RegisterForDrag("LeftButton")
+        dialog:SetScript("OnDragStart", function(self)
+            self:StartMoving()
+        end)
+        dialog:SetScript("OnDragStop", function(self)
+            self:StopMovingOrSizing()
+        end)
+        dialog:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true,
+            tileSize = 16,
+            edgeSize = 16,
+            insets = { left = 5, right = 5, top = 5, bottom = 5 },
+        })
+        if dialog.SetBackdropColor then
+            dialog:SetBackdropColor(0.02, 0.02, 0.02, 0.96)
+        end
+        if dialog.SetBackdropBorderColor then
+            dialog:SetBackdropBorderColor(0.85, 0.72, 0.18, 1)
+        end
+
+        local title = dialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        title:SetPoint("TOPLEFT", dialog, "TOPLEFT", 16, -14)
+        title:SetPoint("TOPRIGHT", dialog, "TOPRIGHT", -16, -14)
+        title:SetJustifyH("LEFT")
+        dialog.title = title
+
+        local editBox = CreateFrame("EditBox", "RaidInspectorMSEditDialogEditBox", dialog, "InputBoxTemplate")
+        editBox:SetPoint("TOPLEFT", dialog, "TOPLEFT", 20, -38)
+        editBox:SetPoint("TOPRIGHT", dialog, "TOPRIGHT", -20, -38)
+        editBox:SetHeight(20)
+        editBox:SetAutoFocus(false)
+        editBox:SetMaxLetters(MS_MAX_SPEC_LENGTH)
+        editBox:SetScript("OnEscapePressed", function(self)
+            self:ClearFocus()
+            dialog:Hide()
+        end)
+        dialog.editBox = editBox
+
+        local hint = dialog:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        hint:SetPoint("TOPLEFT", editBox, "BOTTOMLEFT", 0, -8)
+        hint:SetText("Enter saves, empty box clears the MS. Esc closes.")
+        dialog.hint = hint
+
+        local saveButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+        saveButton:SetWidth(72)
+        saveButton:SetHeight(20)
+        saveButton:SetPoint("BOTTOMRIGHT", dialog, "BOTTOMRIGHT", -16, 12)
+        saveButton:SetText("Save")
+        dialog.saveButton = saveButton
+
+        local cancelButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
+        cancelButton:SetWidth(72)
+        cancelButton:SetHeight(20)
+        cancelButton:SetPoint("RIGHT", saveButton, "LEFT", -6, 0)
+        cancelButton:SetText("Cancel")
+        cancelButton:SetScript("OnClick", function()
+            dialog.editBox:ClearFocus()
+            dialog:Hide()
+        end)
+        dialog.cancelButton = cancelButton
+
+        -- Commits whatever is in the box for the player the dialog was opened
+        -- for. Reads dialog.playerKey at click time so one frame serves all rows.
+        local function CommitMainSpecEdit()
+            SafeInvoke("ms-edit-save", function()
+                local targetKey = dialog.playerKey
+                if not targetKey or targetKey == "" then
+                    return
+                end
+
+                local value = Trim(dialog.editBox:GetText() or "")
+                if value == "" then
+                    if addon:RemoveMainSpecRecord(targetKey) then
+                        Print("MS cleared for " .. tostring(dialog.playerLabel or targetKey))
+                    end
+                else
+                    local record = addon:RecordMainSpecChange(
+                        dialog.playerLabel or targetKey, value, "manual", dialog.playerRealm)
+                    if record then
+                        Print("MS set: " .. tostring(record.name) .. " = " .. tostring(record.spec))
+                    else
+                        Print("MS: '" .. tostring(value) .. "' is not a usable spec (no links, must start with a letter)")
+                        return
+                    end
+                end
+
+                dialog.editBox:ClearFocus()
+                dialog:Hide()
+                addon:RefreshMainWindow()
+            end)
+        end
+
+        saveButton:SetScript("OnClick", CommitMainSpecEdit)
+        editBox:SetScript("OnEnterPressed", CommitMainSpecEdit)
+
+        addon.ui.msEditDialog = dialog
+    end
+
+    local record = addon:GetMainSpecRecord(key)
+    dialog.playerKey = key
+    -- Prefer the name/realm already stored on the record so a manual edit
+    -- re-keys to exactly the same entry the chat hook created.
+    dialog.playerLabel = (record and record.name) or name
+    dialog.playerRealm = (record and record.realm) or parsedRealm
+    dialog.title:SetText("Set MS - " .. SafeText(dialog.playerLabel))
+
+    dialog.editBox:SetText(record and tostring(record.spec) or "")
+    dialog:Show()
+    dialog.editBox:SetFocus()
+    dialog.editBox:HighlightText()
+end
+
 -- Resolves the copyable value + dialog label for a player overview row.
 function addon:GetOverviewRowCopyValue(row)
     if not row then
@@ -6266,7 +7096,7 @@ function addon:ShowInfoDialog()
             "LFM - compose and post a \"looking for more\" message.",
             " ",
             "|cffffd100Inspector buttons|r",
-            "S:<mode> - click to cycle the list sort (recent / gs / issues / name).",
+            "S:<mode> - click to cycle the list sort (recent / gs / issues / name / MS changes).",
             "Target - inspect your current target and add them to the list.",
             "Raid - inspect everyone in your party/raid.",
             "Autoscan - toggle. While on, the raid is rescanned automatically:",
@@ -6275,20 +7105,28 @@ function addon:ShowInfoDialog()
             "  list always matches the raid. Click again (or /ri autoscan off) to stop.",
             "Share - send a short summary of the selected player to the ticked Share channels.",
             "Save All - save a full report of the current overview into the addon.",
-            "Clear - clear the queue and results (asks to confirm).",
+            "Clear - clear the queue, results and recorded MS changes (asks to confirm).",
+            "MS: on/off - toggle MS registering. While on, raid/party lines like",
+            "  \"MS resto\" are recorded against whoever typed them, and the row shows",
+            "  MS:<spec> in place of Scanned=<age>. Records survive rescans and relogs;",
+            "  Clear or MS Clear wipes them.",
+            "MS Share - post the whole recorded MS list to the ticked Share channels.",
+            "MS Clear - wipe the recorded MS changes only, keeping the scan list.",
+            "RW - a Share channel for Raid Warning (needs leader/assistant).",
             " ",
             "|cffffd100Out of range|r",
             "Players too far away show \"not inspectable\" and are retried automatically",
             "every 15s until they come into range and get inspected.",
             " ",
             "|cffffd100Share / Reports|r",
-            "Share checkboxes (Raid / Say / Whisper / Guild) choose where Share sends.",
+            "Share checkboxes (Raid / Say / Whisper / Guild / RW) choose where Share sends.",
             "Reports dropdown - view the live overview or a previously saved report.",
             "Item List dropdown - filter which gear slots are listed.",
             " ",
             "|cffffd100Mouse|r",
             "Left-click a player row - select that player.",
-            "Right-click a player row - copy their name.",
+            "Right-click a player row - set/edit that player's MS (empty box clears it).",
+            "Shift+right-click a player row - copy their name.",
             "Right-click a gear row - open the item in AtlasLoot.",
             "Shift+right-click a gear row - copy the item value.",
             " ",
@@ -6491,6 +7329,27 @@ function addon:CreateMainWindow()
     _G[guildShareCheck:GetName() .. "Text"]:SetText("Guild")
     guildShareCheck:SetScript("OnClick", function(self)
         addon:SetExportChannel("guild", self:GetChecked() and true or false)
+    end)
+
+    local rwShareCheck = CreateFrame("CheckButton", "RaidInspectorShareRWCheck", f, "UICheckButtonTemplate")
+    rwShareCheck:SetPoint("LEFT", guildShareCheck, "RIGHT", 48, 0)
+    rwShareCheck:SetHitRectInsets(0, -22, 0, 0)
+    _G[rwShareCheck:GetName() .. "Text"]:SetText("RW")
+    rwShareCheck:SetScript("OnClick", function(self)
+        addon:SetExportChannel("rw", self:GetChecked() and true or false)
+    end)
+    rwShareCheck:SetScript("OnEnter", function(self)
+        if GameTooltip then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Raid Warning")
+            GameTooltip:AddLine("Needs raid leader or assistant.", 1, 1, 1)
+            GameTooltip:Show()
+        end
+    end)
+    rwShareCheck:SetScript("OnLeave", function()
+        if GameTooltip then
+            GameTooltip:Hide()
+        end
     end)
 
     local savedReportsRow = CreateFrame("Frame", nil, f)
@@ -6723,6 +7582,85 @@ function addon:CreateMainWindow()
         SafeInvoke("clear", function()
             addon:RequestClearQueue()
         end)
+    end)
+
+    local msButton = CreateFrame("Button", "RaidInspectorMSButton", f, "UIPanelButtonTemplate")
+    ActivateActionButton(msButton)
+    msButton:SetWidth(100)
+    msButton:SetHeight(20)
+    msButton:SetPoint("TOPLEFT", statusButton, "BOTTOMLEFT", 0, -6)
+    SetActionButtonLabel(msButton, "ff999999", "MS: off")
+    msButton:SetScript("OnClick", function()
+        SafeInvoke("ms-toggle", function()
+            addon:ToggleMSTracking()
+        end)
+    end)
+    msButton:SetScript("OnEnter", function(self)
+        if GameTooltip then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("MS registering")
+            GameTooltip:AddLine("While on, raid/party lines like \"MS resto\"", 1, 1, 1)
+            GameTooltip:AddLine("are recorded against that player.", 1, 1, 1)
+            GameTooltip:AddLine("Right-click a row to edit an MS by hand.", 0.7, 0.7, 0.7)
+            GameTooltip:Show()
+        end
+    end)
+    msButton:SetScript("OnLeave", function()
+        if GameTooltip then
+            GameTooltip:Hide()
+        end
+    end)
+
+    local msShareButton = CreateFrame("Button", "RaidInspectorMSShareButton", f, "UIPanelButtonTemplate")
+    ActivateActionButton(msShareButton)
+    msShareButton:SetWidth(100)
+    msShareButton:SetHeight(20)
+    msShareButton:SetPoint("LEFT", msButton, "RIGHT", 6, 0)
+    SetActionButtonLabel(msShareButton, "ff66ff66", "MS Share")
+    msShareButton:SetScript("OnClick", function()
+        SafeInvoke("ms-share", function()
+            addon:ShareMainSpecChanges()
+        end)
+    end)
+    msShareButton:SetScript("OnEnter", function(self)
+        if GameTooltip then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Share MS changes")
+            GameTooltip:AddLine("Posts every recorded MS to the ticked", 1, 1, 1)
+            GameTooltip:AddLine("Share channels (Raid/Say/Whisper/Guild/RW).", 1, 1, 1)
+            GameTooltip:Show()
+        end
+    end)
+    msShareButton:SetScript("OnLeave", function()
+        if GameTooltip then
+            GameTooltip:Hide()
+        end
+    end)
+
+    local msClearButton = CreateFrame("Button", "RaidInspectorMSClearButton", f, "UIPanelButtonTemplate")
+    ActivateActionButton(msClearButton)
+    msClearButton:SetWidth(100)
+    msClearButton:SetHeight(20)
+    msClearButton:SetPoint("LEFT", msShareButton, "RIGHT", 6, 0)
+    SetActionButtonLabel(msClearButton, "ffffaa33", "MS Clear")
+    msClearButton:SetScript("OnClick", function()
+        SafeInvoke("ms-clear", function()
+            addon:RequestClearMainSpecRecords()
+        end)
+    end)
+    msClearButton:SetScript("OnEnter", function(self)
+        if GameTooltip then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Clear MS list")
+            GameTooltip:AddLine("Wipes every recorded MS (asks to confirm).", 1, 1, 1)
+            GameTooltip:AddLine("Keeps the scan list, unlike the Clear button.", 0.7, 0.7, 0.7)
+            GameTooltip:Show()
+        end
+    end)
+    msClearButton:SetScript("OnLeave", function()
+        if GameTooltip then
+            GameTooltip:Hide()
+        end
     end)
 
     local rowsViewport = CreateFrame("ScrollFrame", nil, f)
@@ -7265,6 +8203,10 @@ function addon:CreateMainWindow()
     addon.ui.targetButton = targetButton
     addon.ui.raidButton = raidButton
     addon.ui.autoScanButton = autoScanButton
+    addon.ui.msButton = msButton
+    addon.ui.msShareButton = msShareButton
+    addon.ui.msClearButton = msClearButton
+    addon.ui.rwShareCheck = rwShareCheck
     addon.ui.syncButton = syncButton
     addon.ui.forceSyncButton = forceSyncButton
     addon.ui.reportButton = reportButton
@@ -7336,8 +8278,22 @@ function addon:BuildOverviewRowText(entry)
         gsText = ColorText(tostring(result.gearScore), GetGearScoreColorCode(result.gearScore))
     end
 
+    -- A recorded MS replaces the scan age on the row: during a raid the spec a
+    -- player just called out matters more than how old their gear scan is.
+    -- A saved report shows the MS stored in the report itself, so it stays a
+    -- snapshot of that raid instead of following today's live MS list.
     local ageText = ""
-    if entry.ageMinutes >= 0 then
+    local msText = nil
+    if addon:GetSelectedSavedReportFile() ~= "" then
+        msText = result and result.mainSpec
+    else
+        local msRecord = addon:GetMainSpecRecord(entry.key)
+        msText = msRecord and msRecord.spec
+    end
+
+    if msText and msText ~= "" then
+        ageText = " " .. ColorText("MS:" .. SafeText(msText), "ffd200")
+    elseif entry.ageMinutes >= 0 then
         ageText = " Scanned=" .. tostring(entry.ageMinutes) .. "m"
     end
 
@@ -7958,6 +8914,9 @@ function addon:RefreshMainWindow()
     if addon.ui.whisperShareCheck then
         addon.ui.whisperShareCheck:SetChecked(channels.whisper == true)
     end
+    if addon.ui.rwShareCheck then
+        addon.ui.rwShareCheck:SetChecked(channels.rw == true)
+    end
     if addon.ui.guildShareCheck then
         addon.ui.guildShareCheck:SetChecked(channels.guild == true)
     end
@@ -8395,9 +9354,17 @@ function addon:BuildExportSummaryFromPayload(payload)
     local pvpItems = tonumber(summary.pvpItems or 0) or 0
     local name = tostring(payload.name or "Unknown") .. "-" .. tostring(payload.realm or "Unknown")
 
+    -- Only added when an MS was recorded, so summaries without one are unchanged.
+    local mainSpec = Trim(payload.mainSpec or "")
+    local mainSpecText = ""
+    if mainSpec ~= "" then
+        mainSpecText = ", MS: " .. mainSpec
+    end
+
     return "Name: " .. name
         .. ", GearScore: " .. score
         .. ", Spec: " .. (spec ~= "" and spec or "?")
+        .. mainSpecText
         .. ", Missing Enchants: " .. tostring(missingEnchant)
         .. ", Missing Gems: " .. tostring(missingGems)
         .. ", PvP Items: " .. tostring(pvpItems)
@@ -8671,8 +9638,22 @@ function addon:SendSummaryMessage(message, whisperTarget)
         end
     end
 
+    if channels.rw then
+        attempted = attempted + 1
+        local isLeader = (type(IsRaidLeader) == "function" and IsRaidLeader())
+            or (type(IsRaidOfficer) == "function" and IsRaidOfficer())
+        if not (GetNumRaidMembers and GetNumRaidMembers() > 0) then
+            Print("share: RAID WARNING checked, but you are not in a raid")
+        elseif not isLeader then
+            Print("share: RAID WARNING checked, but you are not raid leader/assistant")
+        else
+            SendChatMessage(chatMessage, "RAID_WARNING")
+            sent = sent + 1
+        end
+    end
+
     if attempted == 0 then
-        Print("share: no channels selected (Raid/Say/Whisper/Guild)")
+        Print("share: no channels selected (Raid/Say/Whisper/Guild/RW)")
         return 0, 0, chatMessage
     end
 
@@ -8749,6 +9730,8 @@ function addon:PrintStatus()
     Print("queued=" .. queued .. ", ready=" .. ready .. ", fresh=" .. fresh .. ", stale=" .. stale .. ", errors=" .. errorCount)
     Print("issues: total=" .. totalIssues .. ", playersWithIssues=" .. playersWithIssues)
     Print("overview mode: sort=" .. addon:GetSortMode() .. ", filter=" .. addon:GetFilterMode())
+    Print("MS registering: " .. (addon:IsMSTrackingEnabled() and "ON" or "OFF")
+        .. ", recorded=" .. tostring(addon:GetMainSpecCount()))
     Print("live inspect: pending=" .. tostring(livePending) .. ", active=" .. tostring(liveActive))
     Print("achievement compare: disabled")
     Print("saved reports=" .. tostring(#reports.items) .. ", raid scan history=" .. tostring(#history.scans))
@@ -8763,11 +9746,19 @@ function addon:PrintStatus()
 end
 
 function addon:ClearQueue()
+    local clearedMS = addon:GetMainSpecCount()
+
     RaidInspectorDB.requests = {}
     RaidInspectorDB.results = {}
     RaidInspectorDB.state.lastSnapshot = { at = 0, historyId = 0, members = {} }
     RaidInspectorDB.state.nextRequestId = 1
     RaidInspectorDB.reportFileQueue = { nextId = 1, items = {} }
+
+    -- MS records survive rescans and relogs, but Clear is the explicit
+    -- "wipe the list" action, so it takes them too.
+    local tracking = addon:GetMSTracking()
+    tracking.entries = {}
+    tracking.nextSeq = 1
 
     addon.inspectQueue = {}
     addon.inspectQueuedKeys = {}
@@ -8781,7 +9772,11 @@ function addon:ClearQueue()
         ClearInspectPlayer()
     end
     addon:SetSelectedKey("")
-    Print("queue + results cleared")
+    if clearedMS > 0 then
+        Print("queue + results cleared (" .. tostring(clearedMS) .. " MS records removed)")
+    else
+        Print("queue + results cleared")
+    end
     addon:RefreshMainWindow()
 end
 
@@ -8797,11 +9792,24 @@ end
 
 if type(StaticPopupDialogs) == "table" then
     StaticPopupDialogs["RAIDINSPECTOR_CONFIRM_CLEAR"] = {
-        text = "Clear queued requests and cached live-inspect results?",
+        text = "Clear queued requests, cached live-inspect results and recorded MS changes?",
         button1 = "Clear",
         button2 = CANCEL or "Cancel",
         OnAccept = function()
             addon:ClearQueue()
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+        preferredIndex = 3,
+    }
+
+    StaticPopupDialogs["RAIDINSPECTOR_CONFIRM_CLEAR_MS"] = {
+        text = "Clear every recorded MS change?",
+        button1 = "Clear MS",
+        button2 = CANCEL or "Cancel",
+        OnAccept = function()
+            addon:ClearMainSpecRecords()
         end,
         timeout = 0,
         whileDead = true,
@@ -8858,8 +9866,13 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri inspecttarget - queue + live inspect current target")
             Print("/ri inspectraid - snapshot + live inspect current raid members")
             Print("/ri autoscan [on|off] - keep rescanning the raid automatically")
+            Print("/ri ms [on|off] - start/stop recording \"MS <spec>\" lines from raid chat")
+            Print("/ri ms list - print every recorded MS change")
+            Print("/ri ms set <name> <spec> - set one player's MS by hand")
+            Print("/ri ms share - post the MS list to the ticked Share channels")
+            Print("/ri ms clear - wipe the recorded MS list (asks to confirm)")
             Print("/ri inspecttarget and /ri inspectraid also attempt in-game AP comparison (inspectable targets)")
-            Print("/ri sort [recent|gs|issues|name] - set or cycle sort")
+            Print("/ri sort [recent|gs|issues|name|ms] - set or cycle sort")
             Print("/ri filter [all|snapshot|ready|queued|issues] - set or cycle filter")
             Print("/ri report - save a detailed roster report into SavedVariables")
             Print("/ri loadreport [latest|report-id] - load a saved report into the overview")
@@ -8903,6 +9916,42 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
 
         if command == "inspectraid" then
             addon:QueueRaidSnapshot()
+            return
+        end
+
+        if command == "ms" then
+            local rest = Trim(args)
+            local sub, subArgs = string.match(rest, "^(%S*)%s*(.-)$")
+            sub = string.lower(sub or "")
+
+            if sub == "" or sub == "toggle" then
+                addon:ToggleMSTracking()
+            elseif sub == "on" or sub == "start" then
+                addon:SetMSTrackingEnabled(true)
+            elseif sub == "off" or sub == "stop" then
+                addon:SetMSTrackingEnabled(false)
+            elseif sub == "list" or sub == "status" then
+                addon:PrintMainSpecRecords()
+            elseif sub == "share" or sub == "report" then
+                addon:ShareMainSpecChanges()
+            elseif sub == "clear" then
+                addon:RequestClearMainSpecRecords()
+            elseif sub == "set" then
+                local targetName, spec = string.match(Trim(subArgs), "^(%S+)%s+(.+)$")
+                if not targetName or not spec then
+                    Print("usage: /ri ms set <name> <spec>")
+                else
+                    local record = addon:RecordMainSpecChange(targetName, Trim(spec), "manual")
+                    if record then
+                        Print("MS set: " .. tostring(record.name) .. " = " .. tostring(record.spec))
+                        addon:RefreshMainWindow()
+                    else
+                        Print("could not set MS for " .. tostring(targetName))
+                    end
+                end
+            else
+                Print("usage: /ri ms [on|off|list|set <name> <spec>|share|clear]")
+            end
             return
         end
 
@@ -9034,6 +10083,12 @@ events:RegisterEvent("INSPECT_TALENT_READY")
 events:RegisterEvent("CHAT_MSG_ADDON")
 events:RegisterEvent("RAID_ROSTER_UPDATE")
 events:RegisterEvent("PARTY_MEMBERS_CHANGED")
+-- MS registering reads these; the handler no-ops while the toggle is off.
+events:RegisterEvent("CHAT_MSG_RAID")
+events:RegisterEvent("CHAT_MSG_RAID_LEADER")
+events:RegisterEvent("CHAT_MSG_RAID_WARNING")
+events:RegisterEvent("CHAT_MSG_PARTY")
+events:RegisterEvent("CHAT_MSG_PARTY_LEADER")
 events:SetScript("OnEvent", function(_, event, ...)
     local arg1, arg2, arg3, arg4 = ...
     SafeInvoke("event " .. tostring(event), function()
@@ -9049,6 +10104,10 @@ events:SetScript("OnEvent", function(_, event, ...)
             addon:OnCommReceived(arg1, arg2, arg3, arg4)
         elseif event == "RAID_ROSTER_UPDATE" or event == "PARTY_MEMBERS_CHANGED" then
             addon:OnRosterChanged()
+        elseif event == "CHAT_MSG_RAID" or event == "CHAT_MSG_RAID_LEADER"
+            or event == "CHAT_MSG_RAID_WARNING" or event == "CHAT_MSG_PARTY"
+            or event == "CHAT_MSG_PARTY_LEADER" then
+            addon:OnRaidChatMessage(event, arg1, arg2)
         end
     end)
 end)

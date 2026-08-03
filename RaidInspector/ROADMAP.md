@@ -12,6 +12,9 @@
    - confirmation window before destructive clear actions
    - class colors on overview and selected-player character info
    - bridgeless runtime flow with no sync/import step
+   - MS tracking (Phase 12): raid-chat `MS <spec>` registration behind a start/stop
+     toggle, `MS:<spec>` shown in place of the scan age, manual right-click edit,
+     MS-change sort, share to selected channels incl. Raid Warning, dedicated clear
 - Next:
    - show data source/confidence in UI:
       - overall result source (`local-inspect` vs `saved-report`)
@@ -152,6 +155,22 @@
 4. Add a `POST` action button to broadcast the composed message.
 5. Broadcast to all checked channels in one action while skipping unchecked channels.
 6. Validate empty message/channel selections and show a user-facing error hint instead of posting.
+
+## Phase 12 - MS Tracking (done in 0.16.0-alpha)
+1. Register main-spec changes announced in raid/party chat as `MS <spec>`.
+2. Gate recording behind a start/stop toggle so only the MS-change window is captured.
+3. Ignore the leader's open/close control calls (`MS CHANGE CLOSE`) and near-miss text (`msg ...`).
+4. Show `MS:<spec>` on the overview row in place of `Scanned=<age>`.
+5. Persist records outside the scan results so rescans, `Clear` and relogs keep them.
+6. Add a dedicated MS clear as the only way to wipe the list.
+7. Add an MS-change sort mode.
+8. Allow manual correction by right-clicking a player row.
+9. Share the MS list to the selected channels, including a new Raid Warning channel.
+
+Possible follow-ups (not built):
+- feed a recorded MS into the composition counts so role totals follow the announced
+  spec rather than the currently-inspected talents
+- auto-stop registering when the leader's own `MS CHANGE CLOSE` warning goes out
 
 ## Suggested First Build Milestone
 1. `/ri inspect <name>` creates queue entry.
