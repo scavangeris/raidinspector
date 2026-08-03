@@ -17,18 +17,9 @@ local INSPECT_TALENT_GRACE_SECONDS = 3
 local INSPECT_RETRY_INTERVAL_SECONDS = 15
 
 -- Failure reasons that are transient (out of range, unit token gone, no reply in
--- time). Entries stuck on one of these are swept back into the inspect queue by
--- addon:RetryPendingInspects() as soon as the player becomes inspectable again.
-local INSPECT_RETRY_REASONS = {
-    ["cannot-inspect"] = true,
-    ["unit-not-found"] = true,
-    ["unit-changed"] = true,
-    ["inspect-timeout"] = true,
-    -- The inspect "succeeded" but the client handed back no gear at all, which
-    -- is what an out-of-range unit looks like. Treated as transient so the
-    -- player is re-inspected instead of being left with an empty item list.
-    ["inspect-empty"] = true,
-}
+-- time). addon:RetryPendingInspects() no longer keys off this list - it retries
+-- purely on "has no gear yet" - but the reasons are still shown on the row by
+-- FormatStatusReason, which is where the wording lives.
 
 -- Autoscan: re-runs the raid scan on its own while enabled.
 local AUTOSCAN_IDLE_SECONDS = 10
@@ -1864,9 +1855,15 @@ function addon:FinalizeInspectCurrent(success, failureReason)
             -- have and mark the attempt for retry instead.
             if ResultHasNoGear(resultOrErr) then
                 if ResultHasGear(previous) then
+                    -- We already have a real scan for this player. An empty
+                    -- re-read is a timing race (or they stepped out of range),
+                    -- not new information, so keep the gear AND the ready
+                    -- status. Flagging it as an error here made the row flip
+                    -- between "ready" and "out of range, retrying" on every
+                    -- autoscan pass while the player stood right next to us.
                     if req then
-                        req.status = "error"
-                        req.statusReason = "inspect-empty"
+                        req.status = "ready"
+                        req.statusReason = nil
                         req.updatedAt = GetNow()
                     end
                     addon:RefreshActiveRaidHistoryEntry()
@@ -2129,7 +2126,17 @@ end
 -- The one scan autoscan performs: quiet, reuses the raid history entry, and
 -- prunes players who have left the raid.
 function addon:RunAutoScan()
-    return addon:QueueRaidSnapshot({ silent = true, reuseHistory = true, pruneMissing = true })
+    -- skipScanned: autoscan keeps the LIST in sync with the raid (adds joiners,
+    -- drops leavers) but never re-inspects someone whose gear we already have.
+    -- Without it every pass re-queued the whole raid, and any racy empty read
+    -- knocked a good row back to "retrying" - a permanent scan/retry loop.
+    -- Use the Raid button or a row Refresh to deliberately re-scan.
+    return addon:QueueRaidSnapshot({
+        silent = true,
+        reuseHistory = true,
+        pruneMissing = true,
+        skipScanned = true,
+    })
 end
 
 -- Drives autoscan from addon:OnUpdate. Two triggers:
@@ -2309,18 +2316,13 @@ function addon:RetryPendingInspects()
 
     for key in pairs(latestByKey) do
         local req = latestByKey[key]
-        local reason = tostring(req.statusReason or "")
-        -- Cached data for the key is deliberately not a reason to skip: a failed
-        -- attempt on someone we already know is exactly the entry whose data has
-        -- gone stale, and the status reasons above all advertise "retrying".
-        -- A successful scan leaves status "ready", so this never re-queues one.
-        -- No gear/GS cached means the scan never really landed - including rows
-        -- left behind by an older build that stored an empty result as "ready".
-        -- Those are retried regardless of status, so a player only has to come
-        -- into range once; a scan that did return gear is still never re-queued.
-        local missingGear = ResultHasNoGear(RaidInspectorDB.results[key])
-        local retryable = (INSPECT_RETRY_REASONS[reason] or missingGear)
-            and (req.status == "error" or req.status == "queued" or missingGear)
+        -- The rule is simply: gear collected => never re-inspect automatically.
+        -- Once a scan has landed the data stays put until the user asks for a
+        -- refresh (row Refresh button, Raid button, or /ri refreshstale).
+        -- Anyone still without gear keeps being retried - whatever their stored
+        -- status says, which also heals rows an older build left empty but
+        -- marked "ready" - so they fill in the moment they become inspectable.
+        local retryable = ResultHasNoGear(RaidInspectorDB.results[key])
             and not addon.inspectQueuedKeys[key]
             and not (addon.inspectCurrent and addon.inspectCurrent.key == key)
 
@@ -4910,6 +4912,7 @@ function addon:QueueRaidSnapshot(opts)
     local silent = opts.silent == true
     local reuseHistory = opts.reuseHistory == true
     local pruneMissing = opts.pruneMissing == true
+    local skipScanned = opts.skipScanned == true
 
     if not GetNumRaidMembers or GetNumRaidMembers() <= 0 then
         if not silent then
@@ -4939,20 +4942,27 @@ function addon:QueueRaidSnapshot(opts)
 
             local key = MakePlayerKey(name, explicitRealm)
             members[key] = true
-            if addon:QueueInspect(name, explicitRealm, { allowDuplicate = false, silent = true, reason = "queued-snapshot" }) then
-                queued = queued + 1
-            else
-                skipped = skipped + 1
-            end
 
-            local unit = "raid" .. tostring(i)
-            local okLive, liveReason = addon:QueueLiveInspectUnit(unit, false)
-            if okLive then
-                liveQueued = liveQueued + 1
-            else
+            -- Already have real gear for them: nothing to re-read.
+            if skipScanned and ResultHasGear(RaidInspectorDB.results[key]) then
+                skipped = skipped + 1
                 liveSkipped = liveSkipped + 1
-                if liveReason == "cannot-inspect" or liveReason == "unit-not-found" then
-                    addon:SetLatestRequestState(key, "queued", liveReason)
+            else
+                if addon:QueueInspect(name, explicitRealm, { allowDuplicate = false, silent = true, reason = "queued-snapshot" }) then
+                    queued = queued + 1
+                else
+                    skipped = skipped + 1
+                end
+
+                local unit = "raid" .. tostring(i)
+                local okLive, liveReason = addon:QueueLiveInspectUnit(unit, false)
+                if okLive then
+                    liveQueued = liveQueued + 1
+                else
+                    liveSkipped = liveSkipped + 1
+                    if liveReason == "cannot-inspect" or liveReason == "unit-not-found" then
+                        addon:SetLatestRequestState(key, "queued", liveReason)
+                    end
                 end
             end
         end
@@ -7173,10 +7183,11 @@ function addon:ShowInfoDialog()
             "S:<mode> - click to cycle the list sort (recent / gs / issues / name / MS changes).",
             "Target - inspect your current target and add them to the list.",
             "Raid - inspect everyone in your party/raid.",
-            "Autoscan - toggle. While on, the raid is rescanned automatically:",
-            "  once whenever someone joins or leaves, and every 10s after the queue",
-            "  finishes. Anyone who leaves the raid is dropped from the list, so the",
-            "  list always matches the raid. Click again (or /ri autoscan off) to stop.",
+            "Autoscan - toggle. While on, the list is kept in step with the raid:",
+            "  anyone who joins is scanned, anyone who leaves is dropped. Players",
+            "  whose gear has already been collected are NOT re-scanned - use the row",
+            "  Refresh button, Raid, or /ri refreshstale for that. Click again",
+            "  (or /ri autoscan off) to stop.",
             "Share - send a short summary of the selected player to the ticked Share channels.",
             "Save All - save a full report of the current overview into the addon.",
             "Clear - clear the queue, results and recorded MS changes (asks to confirm).",
