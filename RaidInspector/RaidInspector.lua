@@ -5,7 +5,7 @@ RaidInspectorDB = RaidInspectorDB or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.16.0-alpha"
+addon.version = "0.16.1-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
