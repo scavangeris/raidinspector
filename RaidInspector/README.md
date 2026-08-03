@@ -76,9 +76,11 @@ Name-only remote lookups are intentionally not supported here.
 
 Raid members call out spec changes in raid chat, and the addon records them.
 
-1. Click `MS: off` so it reads `MS: on` (or `/ri ms on`) when you open the MS-change window.
+1. Click `MS: off` so it reads `MS: on` (or `/ri ms on`). This also announces `MS CHANGES IN RAID CHAT NOW: MS blabla` to the raid.
 2. Players type `MS <spec>` in raid or party chat - `MS resto`, `ms heal`, `MS: boomy`, `MS - frost`, `mainspec fury` all work.
-3. Click `MS: on` again (or `/ri ms off`) to stop listening once the window closes.
+3. Click `MS: on` again (or `/ri ms off`) to stop listening. This announces `MS CHANGE CLOSED`.
+
+Both announcements go out as a raid warning, falling back to normal raid chat when you are not leader or assistant. Nothing is sent outside a raid. To reword them, edit `MS_ANNOUNCE_OPEN` / `MS_ANNOUNCE_CLOSE` near the top of `RaidInspector.lua`.
 
 Recorded players show `MS:<spec>` on their overview row in place of `Scanned=<age>`. Use the `MS Changes` sort to bring everyone who changed to the top.
 

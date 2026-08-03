@@ -194,6 +194,15 @@ local SORT_LABELS = {
 local MS_MAX_SPEC_LENGTH = 24
 local MS_REPORT_LINE_LENGTH = 230
 
+-- Broadcast when the MS window is opened/closed from the toggle. Edit these two
+-- lines to change the wording the raid sees.
+local MS_ANNOUNCE_OPEN = "MS CHANGES IN RAID CHAT NOW: MS blabla"
+local MS_ANNOUNCE_CLOSE = "MS CHANGE CLOSED"
+
+-- How long an outgoing line stays on the ignore list, so the copy that echoes
+-- back through CHAT_MSG_RAID is not read in as data.
+local MS_SELF_ECHO_SECONDS = 15
+
 -- Words that follow "MS" when the raid leader is opening/closing the window
 -- rather than a player declaring a spec (e.g. the "MS CHANGE CLOSE" warning).
 -- These must never be stored as somebody's main spec.
@@ -3662,15 +3671,74 @@ function addon:GetMainSpecCount()
     return count
 end
 
+-- Remembers a line the addon just broadcast. Our own messages come straight
+-- back through the chat events, and without this they would be parsed as if a
+-- player had typed them.
+function addon:NoteSelfAnnouncement(text)
+    addon.msSelfAnnouncements = addon.msSelfAnnouncements or {}
+    addon.msSelfAnnouncements[tostring(text or "")] = GetNow() + MS_SELF_ECHO_SECONDS
+end
+
+function addon:IsSelfAnnouncement(text)
+    local pending = addon.msSelfAnnouncements
+    if type(pending) ~= "table" then
+        return false
+    end
+
+    local key = tostring(text or "")
+    local expiry = tonumber(pending[key])
+    if not expiry then
+        return false
+    end
+
+    if GetNow() > expiry then
+        pending[key] = nil
+        return false
+    end
+
+    return true
+end
+
+-- Tells the raid the MS window just opened or closed. Uses raid warning, and
+-- falls back to raid chat when we are not leader/assistant so the call still
+-- goes out instead of being silently swallowed by the client.
+function addon:AnnounceMSWindow(isOpen)
+    if not (GetNumRaidMembers and GetNumRaidMembers() > 0) then
+        return false
+    end
+
+    local message = isOpen and MS_ANNOUNCE_OPEN or MS_ANNOUNCE_CLOSE
+    local isLeader = (type(IsRaidLeader) == "function" and IsRaidLeader())
+        or (type(IsRaidOfficer) == "function" and IsRaidOfficer())
+
+    addon:NoteSelfAnnouncement(message)
+
+    if isLeader then
+        SendChatMessage(message, "RAID_WARNING")
+    else
+        SendChatMessage(message, "RAID")
+        Print("MS: announced in raid chat (raid warning needs leader/assistant)")
+    end
+
+    return true
+end
+
 function addon:SetMSTrackingEnabled(enabled)
     local tracking = addon:GetMSTracking()
-    tracking.enabled = enabled and true or false
+    local newValue = enabled and true or false
+    local changed = tracking.enabled ~= newValue
+    tracking.enabled = newValue
 
     if tracking.enabled then
         tracking.startedAt = GetNow()
         Print("MS registering: ON - raid/party lines like \"MS resto\" are now recorded")
     else
         Print("MS registering: OFF (" .. tostring(addon:GetMainSpecCount()) .. " recorded)")
+    end
+
+    -- Only on a real state change, so repeating /ri ms on never spams the raid.
+    if changed then
+        addon:AnnounceMSWindow(tracking.enabled)
     end
 
     addon:RefreshMSButton()
@@ -3705,6 +3773,11 @@ end
 -- Raid chat hook. Only listens while registering is on.
 function addon:OnRaidChatMessage(event, message, author)
     if not addon:IsMSTrackingEnabled() then
+        return
+    end
+
+    -- Skip the copy of our own broadcast that echoes back to us.
+    if addon:IsSelfAnnouncement(message) then
         return
     end
 
@@ -3793,6 +3866,7 @@ function addon:ShareMainSpecChanges()
 
     local i
     for i = 1, #lines do
+        addon:NoteSelfAnnouncement(lines[i])
         addon:SendSummaryMessage(lines[i])
     end
 
@@ -7110,6 +7184,9 @@ function addon:ShowInfoDialog()
             "  \"MS resto\" are recorded against whoever typed them, and the row shows",
             "  MS:<spec> in place of Scanned=<age>. Records survive rescans and relogs;",
             "  Clear or MS Clear wipes them.",
+            "  Toggling also announces the window to the raid (raid warning if you are",
+            "  leader/assistant, otherwise raid chat): opening sends \"MS CHANGES IN RAID",
+            "  CHAT NOW\", closing sends \"MS CHANGE CLOSED\".",
             "MS Share - post the whole recorded MS list to the ticked Share channels.",
             "MS Clear - wipe the recorded MS changes only, keeping the scan list.",
             "RW - a Share channel for Raid Warning (needs leader/assistant).",
