@@ -13,7 +13,7 @@ Raid Inspector is a WoW 3.3.5a addon for raid gear analysis on the bridgeless br
 - Gear score estimation from inspected items.
 - Enchant and gem auditing.
 - Talent/spec detection from in-game talent inspection.
-- Achievement comparison is currently disabled in this bridgeless build.
+- Raid achievement check for ICC 10/25 and Ruby Sanctum 10/25 on inspected players.
 - Saved detailed reports loaded directly from the in-game dropdown.
 - Saved single-player share snapshots for chat export.
 
@@ -49,6 +49,7 @@ Name-only remote lookups are intentionally not supported here.
 - `/ri export` remains as a compatibility alias for `/ri report`
 - `/ri exportsaved` remains as a compatibility alias for `/ri sharesaved`
 - `/ri status`
+- `/ri ach`
 - `/ri refreshstale [minutes]`
 - `/ri clearqueue [confirm]`
 - `/ri ms [on|off]`
@@ -76,8 +77,8 @@ Name-only remote lookups are intentionally not supported here.
 
 Raid members call out spec changes in raid chat, and the addon records them.
 
-1. Click `MS: off` so it reads `MS: on` (or `/ri ms on`). This also announces `MS CHANGES IN RAID CHAT NOW: MS blabla` to the raid.
-2. Players type `MS <spec>` in raid or party chat - `MS resto`, `ms heal`, `MS: boomy`, `MS - frost`, `mainspec fury` all work.
+1. Click `MS: off` so it reads `MS: on` (or `/ri ms on`). This also announces `MS changes now!: MS xxx` to the raid, which doubles as the example of what to type.
+2. Players type `MS <spec>` in raid, party, say or whisper - `MS resto`, `ms heal`, `MS: boomy`, `MS - frost`, `mainspec fury` all work. Whispering it works even from outside the raid, which is handy for people still being invited.
 3. Click `MS: on` again (or `/ri ms off`) to stop listening. This announces `MS CHANGE CLOSED`.
 
 Both announcements go out as a raid warning, falling back to normal raid chat when you are not leader or assistant. Nothing is sent outside a raid. To reword them, edit `MS_ANNOUNCE_OPEN` / `MS_ANNOUNCE_CLOSE` near the top of `RaidInspector.lua`.
@@ -97,6 +98,39 @@ Reporting: `MS Share` (or `/ri ms share`) posts the list to the ticked Share cha
 MS records are stored separately from scan results, so rescans, `/reload` and relogging all keep them. They are wiped by `Clear` (along with the queue and results) or by `MS Clear` / `/ri ms clear`, which removes only the MS list and leaves the scan list alone.
 
 Saved reports keep their own copy of the MS. `Save All` writes the recorded MS into the report, and loading it shows the specs from when it was saved - not the current MS list - so clearing or refilling the MS list never rewrites an old report. Reports saved before `0.16.0-alpha` have no MS stored and keep showing the scan age.
+
+## Raid Achievements
+
+The detail panel shows whether the selected player has killed the last boss of
+each raid:
+
+```
+Talent: Frost   ICC10 [check]  ICC25 [X]  RS10 [check]  RS25 [?]
+```
+
+- a green check means they have the achievement
+- a red X means they do not
+- `?` means nobody has scanned their achievements yet, which is deliberately
+  not the same answer as a red X
+
+This uses the client's own achievement comparison (`SetAchievementComparisonUnit`),
+so it works entirely in-game with no bridge and no external lookup. It has the
+same requirement as gear: the player must be inspectable, meaning in range and
+on your faction.
+
+The check runs by itself after a player's gear has been scanned, and it never
+repeats on its own - exactly like gear, once the data is in it stays. A player
+who was out of range when it ran is retried only when you ask: the row `Refresh`
+button re-arms that one player, and the `Raid` button or `Refresh` re-arms
+everyone. Autoscan deliberately does not.
+
+Achievements are stored with the scan result, so they survive `/reload` and are
+carried into saved reports.
+
+The IDs looked up are the final-boss kills: The Frozen Throne 10/25 (`4530` /
+`4597`) and The Twilight Destroyer 10/25 (`4817` / `4815`). Run `/ri ach` to
+print what those IDs resolve to on your client - a wrong ID would silently show
+everyone as not having the kill, so this is worth one glance.
 
 ## LFM Tab (Initial)
 - Use the `LFM` tab to compose your recruitment message.

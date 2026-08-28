@@ -163,6 +163,31 @@ local RIGHT_PANEL_X = 474
 
 local RAID_ACHIEVEMENT_KEYS = { "icc10", "icc25", "toc10", "toc25", "rs10", "rs25" }
 
+-- Achievement IDs for each raid's final-boss kill on 3.3.5a. Cross-checked
+-- against RaidBrowser's table on this client rather than from memory: 4531 is
+-- "Storming the Citadel" (the first ICC wing, not the Lich King) and 4818 is
+-- the Ruby Sanctum 10 HEROIC kill, so neither is the flag wanted here.
+local RAID_ACHIEVEMENT_IDS = {
+    icc10 = 4530, -- The Frozen Throne (Lich King 10)
+    icc25 = 4597, -- The Frozen Throne (Lich King 25)
+    toc10 = 3917, -- Call of the Crusade (10)
+    toc25 = 3916, -- Call of the Crusade (25)
+    rs10 = 4817,  -- The Twilight Destroyer (Halion 10)
+    rs25 = 4815,  -- The Twilight Destroyer (Halion 25)
+}
+
+-- Shown on the detail panel, in this order. All six keys above are collected
+-- and stored; only these four are rendered.
+local DETAIL_ACHIEVEMENTS = {
+    { key = "icc10", label = "ICC10" },
+    { key = "icc25", label = "ICC25" },
+    { key = "rs10", label = "RS10" },
+    { key = "rs25", label = "RS25" },
+}
+
+local ACHIEVEMENT_TIMEOUT_SECONDS = 6
+local ACHIEVEMENT_THROTTLE_SECONDS = 1.5
+
 local SORT_MODES = { "recent", "gs", "issues", "name", "ms" }
 local FILTER_MODES = { "all", "snapshot", "ready", "queued", "issues" }
 local ITEM_LIST_FILTER_MODES = { "all", "issues", "missing-enchant", "missing-gems" }
@@ -187,8 +212,38 @@ local MS_REPORT_LINE_LENGTH = 230
 
 -- Broadcast when the MS window is opened/closed from the toggle. Edit these two
 -- lines to change the wording the raid sees.
-local MS_ANNOUNCE_OPEN = "MS CHANGES IN RAID CHAT NOW: MS blabla"
+local MS_ANNOUNCE_OPEN = "MS changes now!: MS xxx"
 local MS_ANNOUNCE_CLOSE = "MS CHANGE CLOSED"
+
+-- Chat channels an "MS <spec>" line is accepted from while registering is on.
+-- Whisper and say are included so players can send it privately or from right
+-- next to you, not just in raid/party chat. CHAT_MSG_WHISPER is incoming only
+-- (outgoing is CHAT_MSG_WHISPER_INFORM), so our own whispers never register.
+local MS_CHAT_EVENTS = {
+    "CHAT_MSG_RAID",
+    "CHAT_MSG_RAID_LEADER",
+    "CHAT_MSG_RAID_WARNING",
+    "CHAT_MSG_PARTY",
+    "CHAT_MSG_PARTY_LEADER",
+    "CHAT_MSG_WHISPER",
+    "CHAT_MSG_SAY",
+}
+
+local MS_CHAT_EVENT_SET = {}
+for _, msChatEvent in ipairs(MS_CHAT_EVENTS) do
+    MS_CHAT_EVENT_SET[msChatEvent] = true
+end
+
+-- Short label stored on the record so the source of a spec is traceable.
+local MS_SOURCE_LABELS = {
+    ["CHAT_MSG_RAID"] = "raid",
+    ["CHAT_MSG_RAID_LEADER"] = "raid",
+    ["CHAT_MSG_RAID_WARNING"] = "raid",
+    ["CHAT_MSG_PARTY"] = "party",
+    ["CHAT_MSG_PARTY_LEADER"] = "party",
+    ["CHAT_MSG_WHISPER"] = "whisper",
+    ["CHAT_MSG_SAY"] = "say",
+}
 
 -- How long an outgoing line stays on the ignore list, so the copy that echoes
 -- back through CHAT_MSG_RAID is not read in as data.
@@ -259,6 +314,12 @@ local KEYBIND_ACTIONS = {
 local MIN_WINDOW_SCALE = 0.5
 local MAX_WINDOW_SCALE = 1.5
 local DEFAULT_WINDOW_SCALE = 1.0
+
+-- Help dialog: 560 wide less the 18px left inset and 32px right inset (which
+-- leaves room for the scrollbar).
+local INFO_DIALOG_WIDTH = 560
+local INFO_DIALOG_MAX_HEIGHT = 600
+local INFO_DIALOG_TEXT_WIDTH = INFO_DIALOG_WIDTH - 18 - 32
 
 -- Fixed columns for the gear detail list (aligned fields).
 local DETAIL_COLUMNS = {
@@ -1332,6 +1393,32 @@ local function FormatRaidAchievements(ach)
         .. " RS25:" .. FlagText(ach.rs25)
 end
 
+local function AchievementFlagIcon(value)
+    if value == true then
+        return "|TInterface\\RaidFrame\\ReadyCheck-Ready:0|t"
+    end
+    if value == false then
+        return "|TInterface\\RaidFrame\\ReadyCheck-NotReady:0|t"
+    end
+    -- Never scanned, or the scan could not reach them. Deliberately not a red
+    -- X: "we do not know" and "they have not killed it" are different answers.
+    return ColorText("?", "999999")
+end
+
+local function FormatDetailAchievements(ach)
+    local parts = {}
+    local i
+    for i = 1, #DETAIL_ACHIEVEMENTS do
+        local def = DETAIL_ACHIEVEMENTS[i]
+        local value = nil
+        if type(ach) == "table" then
+            value = ach[def.key]
+        end
+        table.insert(parts, def.label .. " " .. AchievementFlagIcon(value))
+    end
+    return table.concat(parts, "  ")
+end
+
 local function NormalizeSlot(slot)
     local raw = string.lower((slot or "")):gsub("_", "")
     return SLOT_ALIASES[raw]
@@ -1866,6 +1953,7 @@ function addon:FinalizeInspectCurrent(success, failureReason)
                         req.statusReason = nil
                         req.updatedAt = GetNow()
                     end
+                    addon:QueueAchievementScan(current.key, current.name, current.realm)
                     addon:RefreshActiveRaidHistoryEntry()
                     if ClearInspectPlayer then
                         ClearInspectPlayer()
@@ -1919,6 +2007,7 @@ function addon:FinalizeInspectCurrent(success, failureReason)
                 req.updatedAt = GetNow()
             end
 
+            addon:QueueAchievementScan(current.key, current.name, current.realm)
             addon:RefreshActiveRaidHistoryEntry()
         else
             Print("inspect build failed: " .. tostring(resultOrErr))
@@ -2458,6 +2547,257 @@ function addon:OnInspectTalentReady()
     addon.inspectCurrent.talentReadyAt = GetNow()
 end
 
+-- ---------------------------------------------------------------------------
+-- Raid achievement comparison
+--
+-- Fully client-side: SetAchievementComparisonUnit asks the server for the
+-- unit's achievements over the game's own protocol, exactly the way
+-- NotifyInspect asks for gear. Same requirement as gear, too - the player has
+-- to be inspectable (in range, same faction).
+--
+-- It runs as a separate, lower-priority pass rather than being folded into the
+-- gear inspect. The gear timing logic is delicate and making it wait on a
+-- second server round-trip is precisely how the rescan loop got broken before,
+-- so gear always finishes first and achievements fill in behind it.
+-- ---------------------------------------------------------------------------
+
+function addon:HasRaidAchievementData(key)
+    local result = RaidInspectorDB.results and RaidInspectorDB.results[key]
+    if type(result) ~= "table" then
+        return false
+    end
+    return HasAnyKnownRaidAchievementFlags(result.raidAchievements)
+end
+
+function addon:MarkAchievementAttempt(key)
+    addon.achAttempted = addon.achAttempted or {}
+    if key and key ~= "" then
+        addon.achAttempted[key] = true
+    end
+end
+
+-- Same discipline the user asked for on gear: once the data is in it is never
+-- re-fetched on its own, and a failed attempt is remembered for the session so
+-- an out-of-range player is not retried forever. A manual Refresh re-arms it.
+function addon:ShouldScanAchievements(key)
+    if not key or key == "" then
+        return false
+    end
+    if addon.achDisabled then
+        return false
+    end
+    if addon:HasRaidAchievementData(key) then
+        return false
+    end
+    if addon.achAttempted and addon.achAttempted[key] then
+        return false
+    end
+    if addon.achQueuedKeys and addon.achQueuedKeys[key] then
+        return false
+    end
+    if addon.achCurrent and addon.achCurrent.key == key then
+        return false
+    end
+    return true
+end
+
+function addon:QueueAchievementScan(key, name, realm)
+    if not addon:ShouldScanAchievements(key) then
+        return false
+    end
+
+    addon.achQueue = addon.achQueue or {}
+    addon.achQueuedKeys = addon.achQueuedKeys or {}
+
+    table.insert(addon.achQueue, { key = key, name = name, realm = realm })
+    addon.achQueuedKeys[key] = true
+    return true
+end
+
+function addon:ClearAchievementAttempt(key)
+    if addon.achAttempted and key and key ~= "" then
+        addon.achAttempted[key] = nil
+    end
+end
+
+function addon:ClearAllAchievementAttempts()
+    addon.achAttempted = {}
+end
+
+-- Restores Blizzard's comparison frame and drops the comparison unit. Safe to
+-- call when no request is outstanding.
+function addon:EndAchievementRequest()
+    events:UnregisterEvent("INSPECT_ACHIEVEMENT_READY")
+    if AchievementFrameComparison then
+        AchievementFrameComparison:RegisterEvent("INSPECT_ACHIEVEMENT_READY")
+    end
+    if ClearAchievementComparisonUnit then
+        ClearAchievementComparisonUnit()
+    end
+    addon.achCurrent = nil
+end
+
+function addon:ProcessAchievementQueue()
+    if addon.achCurrent or addon.achDisabled then
+        return
+    end
+
+    -- Gear always has priority: a comparison request competes with an inspect
+    -- for the same unit data.
+    if addon.inspectCurrent then
+        return
+    end
+    if addon.inspectQueue and #addon.inspectQueue > 0 then
+        return
+    end
+
+    if not addon.achQueue or #addon.achQueue == 0 then
+        return
+    end
+
+    if (GetNow() - (addon.achLastRequestAt or 0)) < ACHIEVEMENT_THROTTLE_SECONDS then
+        return
+    end
+
+    local entry = table.remove(addon.achQueue, 1)
+    if not entry then
+        return
+    end
+
+    addon.achQueuedKeys = addon.achQueuedKeys or {}
+    addon.achQueuedKeys[entry.key] = nil
+
+    if not SetAchievementComparisonUnit or not GetAchievementComparisonInfo then
+        -- Client build without the comparison API. Stop trying entirely rather
+        -- than burning a request per player forever.
+        addon.achDisabled = true
+        return
+    end
+
+    local unit = addon:FindUnitByName(entry.name)
+    if not unit or not CanInspectUnit(unit) then
+        addon:MarkAchievementAttempt(entry.key)
+        return
+    end
+
+    addon.achCurrent = {
+        key = entry.key,
+        name = entry.name,
+        realm = entry.realm,
+        unit = unit,
+        guid = UnitGUID(unit),
+        startedAt = GetNow(),
+    }
+    addon.achLastRequestAt = GetNow()
+
+    -- Examiner's sequence, and for the same reasons. Blizzard's comparison
+    -- frame listens for INSPECT_ACHIEVEMENT_READY and would redraw itself on
+    -- our request, so it is muted for the duration; parking the achievement
+    -- UI's selected category stops it rebuilding its list underneath us.
+    if type(achievementFunctions) == "table" and type(achievementFunctions.selectedCategory) == "string" then
+        achievementFunctions.selectedCategory = 92
+    end
+    if AchievementFrameComparison then
+        AchievementFrameComparison:UnregisterEvent("INSPECT_ACHIEVEMENT_READY")
+    end
+
+    events:RegisterEvent("INSPECT_ACHIEVEMENT_READY")
+    SetAchievementComparisonUnit(unit)
+end
+
+function addon:OnInspectAchievementReady(guid)
+    local current = addon.achCurrent
+    if not current then
+        -- Not ours (or already timed out); do not leave the event registered.
+        events:UnregisterEvent("INSPECT_ACHIEVEMENT_READY")
+        return
+    end
+
+    if guid and current.guid and guid ~= current.guid then
+        return
+    end
+
+    addon:MarkAchievementAttempt(current.key)
+
+    local result = RaidInspectorDB.results and RaidInspectorDB.results[current.key]
+
+    -- If the comparison data never actually landed, every lookup returns nil
+    -- and we would write six red Xs - which reads as "killed nothing" instead
+    -- of "unknown". Achievement points act as the arrival check: a level 80
+    -- with a real comparison loaded always reports a number.
+    local dataArrived = true
+    if GetComparisonAchievementPoints then
+        local points = tonumber(GetComparisonAchievementPoints())
+        if points == nil then
+            dataArrived = false
+        elseif type(result) == "table" then
+            result.achievementPoints = points
+            result.achievementPointsSource = "local-inspect"
+        end
+    end
+
+    if dataArrived and type(result) == "table" then
+        local flags = { source = "local-inspect", at = GetNow() }
+        local i
+        for i = 1, #RAID_ACHIEVEMENT_KEYS do
+            local achKey = RAID_ACHIEVEMENT_KEYS[i]
+            local id = RAID_ACHIEVEMENT_IDS[achKey]
+            if id then
+                local completed = GetAchievementComparisonInfo(id)
+                flags[achKey] = (completed and true) or false
+            end
+        end
+        result.raidAchievements = flags
+        addon:RefreshActiveRaidHistoryEntry()
+    end
+
+    addon:EndAchievementRequest()
+    addon:RefreshMainWindow()
+end
+
+function addon:TickAchievementScan()
+    if addon.achDisabled then
+        return
+    end
+
+    if addon.achCurrent then
+        if (GetNow() - (addon.achCurrent.startedAt or 0)) > ACHIEVEMENT_TIMEOUT_SECONDS then
+            addon:MarkAchievementAttempt(addon.achCurrent.key)
+            addon:EndAchievementRequest()
+        end
+        return
+    end
+
+    addon:ProcessAchievementQueue()
+end
+
+-- Diagnostic: a wrong achievement ID fails silently (everyone shows as not
+-- having killed it), so this prints what each ID actually resolves to on the
+-- running client for a one-glance sanity check.
+function addon:PrintAchievementIds()
+    if not GetAchievementInfo then
+        Print("achievement API not available on this client")
+        return
+    end
+
+    Print("raid achievement ids (names should match the raid + size):")
+    local i
+    for i = 1, #RAID_ACHIEVEMENT_KEYS do
+        local achKey = RAID_ACHIEVEMENT_KEYS[i]
+        local id = RAID_ACHIEVEMENT_IDS[achKey]
+        local _, achName = GetAchievementInfo(id)
+        if achName and tostring(achName) ~= "" then
+            Print("  " .. achKey .. " = " .. tostring(id) .. " -> " .. tostring(achName))
+        else
+            Print("  " .. achKey .. " = " .. tostring(id) .. " -> " .. ColorText("unresolved on this client", "ff6666"))
+        end
+    end
+
+    if addon.achDisabled then
+        Print(ColorText("comparison API missing: achievement scanning is off", "ff6666"))
+    end
+end
+
 function addon:OnUpdate(elapsed)
     local delta = elapsed or 0
     addon.inspectRetryAccum = (addon.inspectRetryAccum or 0) + delta
@@ -2524,6 +2864,8 @@ function addon:OnUpdate(elapsed)
     end
 
     addon:ProcessInspectQueue(false)
+
+    addon:TickAchievementScan()
 
     addon:ProcessLFMPostQueue(false)
 end
@@ -3733,7 +4075,7 @@ function addon:SetMSTrackingEnabled(enabled)
 
     if tracking.enabled then
         tracking.startedAt = GetNow()
-        Print("MS registering: ON - raid/party lines like \"MS resto\" are now recorded")
+        Print("MS registering: ON - raid, party, say and whisper lines like \"MS resto\" are now recorded")
     else
         Print("MS registering: OFF (" .. tostring(addon:GetMainSpecCount()) .. " recorded)")
     end
@@ -3788,15 +4130,22 @@ function addon:OnRaidChatMessage(event, message, author)
         return
     end
 
-    local record, changed = addon:RecordMainSpecChange(author, spec, event)
+    local source = MS_SOURCE_LABELS[event] or "chat"
+    local record, changed = addon:RecordMainSpecChange(author, spec, source)
     if not record or not changed then
         return
     end
 
+    -- Whisper/say are easy to miss in a busy chat frame, so name the channel.
+    local via = ""
+    if source == "whisper" or source == "say" then
+        via = " (" .. source .. ")"
+    end
+
     if record.previousSpec then
-        Print("MS: " .. record.name .. " " .. tostring(record.previousSpec) .. " -> " .. record.spec)
+        Print("MS: " .. record.name .. " " .. tostring(record.previousSpec) .. " -> " .. record.spec .. via)
     else
-        Print("MS: " .. record.name .. " = " .. record.spec)
+        Print("MS: " .. record.name .. " = " .. record.spec .. via)
     end
 
     addon:RefreshMainWindow()
@@ -4914,6 +5263,13 @@ function addon:QueueRaidSnapshot(opts)
     local pruneMissing = opts.pruneMissing == true
     local skipScanned = opts.skipScanned == true
 
+    -- An explicit Raid scan re-arms achievement comparison for the whole raid.
+    -- Autoscan runs silent and must not, or a raid full of out-of-range players
+    -- would re-request comparisons forever.
+    if not silent then
+        addon:ClearAllAchievementAttempts()
+    end
+
     if not GetNumRaidMembers or GetNumRaidMembers() <= 0 then
         if not silent then
             Print("not in a raid")
@@ -5001,6 +5357,8 @@ function addon:QueueStaleRefresh(minAgeMinutes)
         minMinutes = 1
     end
 
+    addon:ClearAllAchievementAttempts()
+
     local now = GetNow()
     local queued = 0
     local unavailable = 0
@@ -5056,6 +5414,11 @@ function addon:RefreshOverviewEntryByKey(key)
         Print("refresh is disabled while a saved report is loaded")
         return false
     end
+
+    -- Row Refresh is the manual override for this player, so it re-arms the
+    -- achievement comparison too: that is the only way a comparison that was
+    -- skipped (out of range) or that timed out ever gets tried again.
+    addon:ClearAchievementAttempt(normalizedKey)
 
     local req = addon:GetLatestRequestForKey(normalizedKey)
     local name = req and req.name or nil
@@ -7136,8 +7499,8 @@ function addon:ShowInfoDialog()
 
     if not dialog then
         dialog = CreateFrame("Frame", "RaidInspectorInfoDialog", UIParent)
-        dialog:SetWidth(560)
-        dialog:SetHeight(600)
+        dialog:SetWidth(INFO_DIALOG_WIDTH)
+        dialog:SetHeight(INFO_DIALOG_MAX_HEIGHT)
         dialog:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
         dialog:SetFrameStrata("FULLSCREEN_DIALOG")
         dialog:SetToplevel(true)
@@ -7169,9 +7532,33 @@ function addon:ShowInfoDialog()
         title:SetPoint("TOPLEFT", dialog, "TOPLEFT", 16, -14)
         title:SetText("Raid Inspector - Help")
 
-        local body = dialog:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-        body:SetPoint("TOPLEFT", dialog, "TOPLEFT", 18, -44)
-        body:SetPoint("TOPRIGHT", dialog, "TOPRIGHT", -18, -44)
+        -- The help text grew past a fixed frame (it used to run off the top and
+        -- behind the Close button), so it lives in a scroll frame now and the
+        -- dialog height is clamped to the screen in ShowInfoDialog.
+        local scroll = CreateFrame("ScrollFrame", "RaidInspectorInfoDialogScroll", dialog, "UIPanelScrollFrameTemplate")
+        scroll:SetPoint("TOPLEFT", dialog, "TOPLEFT", 18, -44)
+        scroll:SetPoint("BOTTOMRIGHT", dialog, "BOTTOMRIGHT", -32, 46)
+
+        local content = CreateFrame("Frame", nil, scroll)
+        content:SetWidth(INFO_DIALOG_TEXT_WIDTH)
+        content:SetHeight(1)
+        scroll:SetScrollChild(content)
+
+        scroll:EnableMouseWheel(true)
+        scroll:SetScript("OnMouseWheel", function(self, delta)
+            local range = self:GetVerticalScrollRange() or 0
+            local nextValue = (self:GetVerticalScroll() or 0) - (delta * 26)
+            if nextValue < 0 then
+                nextValue = 0
+            elseif nextValue > range then
+                nextValue = range
+            end
+            self:SetVerticalScroll(nextValue)
+        end)
+
+        local body = content:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        body:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+        body:SetWidth(INFO_DIALOG_TEXT_WIDTH)
         body:SetJustifyH("LEFT")
         body:SetJustifyV("TOP")
         body:SetText(table.concat({
@@ -7191,13 +7578,13 @@ function addon:ShowInfoDialog()
             "Share - send a short summary of the selected player to the ticked Share channels.",
             "Save All - save a full report of the current overview into the addon.",
             "Clear - clear the queue, results and recorded MS changes (asks to confirm).",
-            "MS: on/off - toggle MS registering. While on, raid/party lines like",
-            "  \"MS resto\" are recorded against whoever typed them, and the row shows",
-            "  MS:<spec> in place of Scanned=<age>. Records survive rescans and relogs;",
-            "  Clear or MS Clear wipes them.",
+            "MS: on/off - toggle MS registering. While on, lines like \"MS resto\" sent",
+            "  in raid, party, say or whisper are recorded against whoever typed them,",
+            "  and the row shows MS:<spec> in place of Scanned=<age>. Records survive",
+            "  rescans and relogs; Clear or MS Clear wipes them.",
             "  Toggling also announces the window to the raid (raid warning if you are",
-            "  leader/assistant, otherwise raid chat): opening sends \"MS CHANGES IN RAID",
-            "  CHAT NOW\", closing sends \"MS CHANGE CLOSED\".",
+            "  leader/assistant, otherwise raid chat): opening sends \"MS changes now!:",
+            "  MS xxx\", closing sends \"MS CHANGE CLOSED\".",
             "MS Share - post the whole recorded MS list to the ticked Share channels.",
             "MS Clear - wipe the recorded MS changes only, keeping the scan list.",
             "RW - a Share channel for Raid Warning (needs leader/assistant).",
@@ -7232,6 +7619,14 @@ function addon:ShowInfoDialog()
             "/ri - open this window.   /ri help - list every command.",
         }, "\n"))
 
+        -- Size the scroll child to the rendered text so the scrollbar knows the
+        -- real range; without this the content stays 1px tall and never scrolls.
+        content:SetHeight(math.max(1, (tonumber(body:GetStringHeight()) or 0) + 8))
+
+        dialog.scroll = scroll
+        dialog.content = content
+        dialog.body = body
+
         local closeButton = CreateFrame("Button", nil, dialog, "UIPanelButtonTemplate")
         closeButton:SetWidth(90)
         closeButton:SetHeight(22)
@@ -7242,6 +7637,20 @@ function addon:ShowInfoDialog()
         end)
 
         addon.ui.infoDialog = dialog
+    end
+
+    -- Never taller than the screen, whatever the resolution/UI scale.
+    local available = tonumber(UIParent and UIParent:GetHeight()) or INFO_DIALOG_MAX_HEIGHT
+    local height = math.min(INFO_DIALOG_MAX_HEIGHT, math.max(240, available - 80))
+    dialog:SetHeight(height)
+
+    -- Re-measure in case the font/scale changed since it was built, and start
+    -- at the top rather than wherever it was left scrolled.
+    if dialog.content and dialog.body then
+        dialog.content:SetHeight(math.max(1, (tonumber(dialog.body:GetStringHeight()) or 0) + 8))
+    end
+    if dialog.scroll then
+        dialog.scroll:SetVerticalScroll(0)
     end
 
     dialog:Show()
@@ -7687,7 +8096,7 @@ function addon:CreateMainWindow()
         if GameTooltip then
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:SetText("MS registering")
-            GameTooltip:AddLine("While on, raid/party lines like \"MS resto\"", 1, 1, 1)
+            GameTooltip:AddLine("While on, raid/party/say/whisper lines like \"MS resto\"", 1, 1, 1)
             GameTooltip:AddLine("are recorded against that player.", 1, 1, 1)
             GameTooltip:AddLine("Right-click a row to edit an MS by hand.", 0.7, 0.7, 0.7)
             GameTooltip:Show()
@@ -8780,7 +9189,9 @@ function addon:RefreshDetailPanel(selectedEntry)
     )
 
     if addon.ui.detailMeta then
-        addon.ui.detailMeta:SetText("Talent: " .. specColored)
+        addon.ui.detailMeta:SetText(
+            "Talent: " .. specColored .. "   " .. FormatDetailAchievements(result.raidAchievements)
+        )
     end
 
     local summary = result.issueSummary or {}
@@ -9852,6 +10263,13 @@ function addon:ClearQueue()
     addon.inspectQueuedKeys = {}
     addon.inspectCurrent = nil
     addon.inspectTickAccum = 0
+
+    -- Achievement flags live inside results, which have just been wiped, so the
+    -- in-flight comparison and its queue go with them.
+    addon:EndAchievementRequest()
+    addon.achQueue = {}
+    addon.achQueuedKeys = {}
+    addon:ClearAllAchievementAttempts()
     addon.inspectRetryAccum = 0
     addon.autoScanAccum = 0
     addon.autoScanRosterAccum = 0
@@ -9972,6 +10390,7 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri savereport [name-realm] - save current or selected report snapshot")
             Print("/ri sharesaved [latest|id|name-realm] - share saved snapshot to chat")
             Print("/ri status - show queue summary")
+            Print("/ri ach - print the raid achievement ids this build looks up")
             Print("/ri refreshstale [minutes] - queue refresh for stale results")
             Print("/ri clearqueue [confirm] - clear queue/results with confirmation")
             return
@@ -9994,6 +10413,11 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
 
         if command == "inspect" then
             addon:HandleInspectCommand(args)
+            return
+        end
+
+        if command == "ach" or command == "achievements" then
+            addon:PrintAchievementIds()
             return
         end
 
@@ -10168,15 +10592,15 @@ events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 events:RegisterEvent("INSPECT_READY")
 events:RegisterEvent("INSPECT_TALENT_READY")
+-- INSPECT_ACHIEVEMENT_READY is registered only while a comparison request is
+-- in flight, so Blizzard's achievement UI keeps it the rest of the time.
 events:RegisterEvent("CHAT_MSG_ADDON")
 events:RegisterEvent("RAID_ROSTER_UPDATE")
 events:RegisterEvent("PARTY_MEMBERS_CHANGED")
 -- MS registering reads these; the handler no-ops while the toggle is off.
-events:RegisterEvent("CHAT_MSG_RAID")
-events:RegisterEvent("CHAT_MSG_RAID_LEADER")
-events:RegisterEvent("CHAT_MSG_RAID_WARNING")
-events:RegisterEvent("CHAT_MSG_PARTY")
-events:RegisterEvent("CHAT_MSG_PARTY_LEADER")
+for _, msChatEvent in ipairs(MS_CHAT_EVENTS) do
+    events:RegisterEvent(msChatEvent)
+end
 events:SetScript("OnEvent", function(_, event, ...)
     local arg1, arg2, arg3, arg4 = ...
     SafeInvoke("event " .. tostring(event), function()
@@ -10188,13 +10612,13 @@ events:SetScript("OnEvent", function(_, event, ...)
             addon:OnInspectReady(arg1)
         elseif event == "INSPECT_TALENT_READY" then
             addon:OnInspectTalentReady()
+        elseif event == "INSPECT_ACHIEVEMENT_READY" then
+            addon:OnInspectAchievementReady(arg1)
         elseif event == "CHAT_MSG_ADDON" then
             addon:OnCommReceived(arg1, arg2, arg3, arg4)
         elseif event == "RAID_ROSTER_UPDATE" or event == "PARTY_MEMBERS_CHANGED" then
             addon:OnRosterChanged()
-        elseif event == "CHAT_MSG_RAID" or event == "CHAT_MSG_RAID_LEADER"
-            or event == "CHAT_MSG_RAID_WARNING" or event == "CHAT_MSG_PARTY"
-            or event == "CHAT_MSG_PARTY_LEADER" then
+        elseif MS_CHAT_EVENT_SET[event] then
             addon:OnRaidChatMessage(event, arg1, arg2)
         end
     end)

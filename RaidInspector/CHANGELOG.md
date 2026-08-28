@@ -2,6 +2,13 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## Unreleased
+- Raid achievement check on inspected players. The detail panel now shows `ICC10 / ICC25 / RS10 / RS25` with a green check or a red X next to each, read live from the player you inspected. It uses the game's own achievement comparison, so it needs nothing outside the client and no bridge - the same requirement as gear: the player has to be inspectable. A raid nobody has scanned shows `?` rather than a red X, because "not scanned" and "has not killed it" are different answers. `/ri ach` prints the achievement IDs the build looks up so they can be verified in-game at a glance.
+- MS changes are now picked up from say and whisper as well as raid and party chat, so a player can send their spec privately or from right next to you instead of only in raid chat. Whispers work even if they are not in the raid yet. Only incoming whispers count, so your own never register, and nothing is recorded at all while registering is off.
+- The row's chat line now names the channel for a whispered or said MS, since those are easy to miss in a busy chat frame.
+- The toggle-on announcement is now `MS changes now!: MS xxx`, so the call to action carries the format players should type.
+- The `? Info` help window no longer runs off its frame. The text had grown past the fixed dialog and was spilling off the top and behind the Close button; it now sits in a scrollable panel (mouse wheel works) and the dialog is capped to the screen height.
+
 ## 0.16.1-alpha - 2026-08-03
 - Fixed a scan/retry loop. A player who had already been scanned - standing right next to you - would flip to `out of range, retrying`, get re-scanned, and repeat every few seconds. Autoscan was re-queueing the whole raid on every pass, and an inspect that comes back with no items (as much a timing race as a real out-of-range unit) was being recorded as a failed attempt, which the retry sweep then picked up again.
 - Once a player's gear has been collected they are no longer re-inspected on their own at all. Autoscan still watches the roster and scans anyone who joins, but skips people it already has gear for. Re-scanning is now always deliberate: the row `Refresh` button, the `Raid` button, or `/ri refreshstale`.
