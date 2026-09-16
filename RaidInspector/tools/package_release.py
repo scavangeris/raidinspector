@@ -11,6 +11,8 @@ from typing import Iterable
 SKIP_DIRS = {"__pycache__", ".git", ".idea", ".vscode"}
 SKIP_FILE_SUFFIXES = {".pyc", ".pyo", ".tmp"}
 SKIP_FILE_NAMES = {"item_ilvl_cache.json", ".DS_Store"}
+# Developer-only trees that have no business in a user-facing zip.
+SKIP_REL_DIRS = {("tools", "test")}
 
 
 def read_version_from_toc(toc_path: pathlib.Path) -> str:
@@ -23,6 +25,8 @@ def read_version_from_toc(toc_path: pathlib.Path) -> str:
 def should_skip(path: pathlib.Path, root: pathlib.Path) -> bool:
     rel_parts = path.relative_to(root).parts
     if any(part in SKIP_DIRS for part in rel_parts):
+        return True
+    if any(rel_parts[: len(skip)] == skip for skip in SKIP_REL_DIRS):
         return True
     if path.name in SKIP_FILE_NAMES:
         return True

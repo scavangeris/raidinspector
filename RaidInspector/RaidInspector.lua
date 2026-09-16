@@ -5,7 +5,7 @@ RaidInspectorDB = RaidInspectorDB or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.16.1-alpha"
+addon.version = "0.17.0-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
@@ -195,6 +195,19 @@ local ITEM_LIST_FILTER_MODES = { "all", "issues", "missing-enchant", "missing-ge
 local MAIN_TAB_LABELS = {
     inspector = "Inspector",
     lfm = "LFM",
+    bis = "BIS LIST",
+}
+
+-- BIS LIST tab layout. No spec in the data needs more than 17 rows (one
+-- alternative per slot at most), so the list is a fixed block with no scroll.
+local BIS_LAYOUT = {
+    rows = 18,
+    rowHeight = 21,
+    listX = 330,
+    slotWidth = 80,
+    ilvlWidth = 40,
+    itemWidth = 290,
+    altItemWidth = 300,
 }
 
 local SORT_LABELS = {
@@ -2900,6 +2913,7 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state.ui, "itemListFilterMode", "all")
     EnsureTable(RaidInspectorDB.state.ui, "buttonMode", "advanced")
     EnsureTable(RaidInspectorDB.state.ui, "activeTab", "inspector")
+    EnsureTable(RaidInspectorDB.state.ui, "bisSpec", "")
     EnsureTable(RaidInspectorDB.state.ui, "minimap", {})
     EnsureTable(RaidInspectorDB.state.ui.minimap, "angle", 220)
     EnsureTable(RaidInspectorDB.state.ui, "exportChannels", {})
@@ -4304,7 +4318,8 @@ function addon:RefreshTabVisibility()
         SetWidgetVisible(inspectorWidgets[i], inspectorVisible)
     end
 
-    SetWidgetVisible(addon.ui.lfmPanel, not inspectorVisible)
+    SetWidgetVisible(addon.ui.lfmPanel, activeTab == "lfm")
+    SetWidgetVisible(addon.ui.bisPanel, activeTab == "bis")
 
     if addon.ui.inspectorTabButton then
         if inspectorVisible then
@@ -4315,19 +4330,33 @@ function addon:RefreshTabVisibility()
     end
 
     if addon.ui.lfmTabButton then
-        if inspectorVisible then
-            addon.ui.lfmTabButton:SetText("|cffbbbbbbLFM|r")
-        else
+        if activeTab == "lfm" then
             addon.ui.lfmTabButton:SetText("|cff66ff66LFM|r")
+        else
+            addon.ui.lfmTabButton:SetText("|cffbbbbbbLFM|r")
+        end
+    end
+
+    if addon.ui.bisTabButton then
+        if activeTab == "bis" then
+            addon.ui.bisTabButton:SetText("|cff66ff66BIS LIST|r")
+        else
+            addon.ui.bisTabButton:SetText("|cffbbbbbbBIS LIST|r")
         end
     end
 
     if addon.ui.subtitle then
         if inspectorVisible then
             addon.ui.subtitle:SetText("Raid overview + selected player details")
+        elseif activeTab == "bis" then
+            addon.ui.subtitle:SetText("Best-in-slot gear per spec - hover for stats, right-click for AtlasLoot")
         else
             addon.ui.subtitle:SetText("LFM composer + multi-channel posting")
         end
+    end
+
+    if activeTab == "bis" then
+        addon:RefreshBiSPanel()
     end
 end
 
@@ -7762,6 +7791,18 @@ function addon:CreateMainWindow()
         end)
     end)
 
+    local bisTabButton = CreateFrame("Button", "RaidInspectorBiSTabButton", f, "UIPanelButtonTemplate")
+    bisTabButton:SetWidth(86)
+    bisTabButton:SetHeight(20)
+    bisTabButton:SetPoint("LEFT", optionsButton, "RIGHT", 12, 0)
+    bisTabButton:SetText("|cffbbbbbbBIS LIST|r")
+    bisTabButton:SetScript("OnClick", function()
+        SafeInvoke("tab-bis", function()
+            addon:SetActiveTab("bis")
+            addon:RefreshMainWindow()
+        end)
+    end)
+
     local closeButton = CreateFrame("Button", "RaidInspectorCloseButton", f, "UIPanelCloseButton")
     closeButton:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6, -6)
 
@@ -8730,7 +8771,13 @@ function addon:CreateMainWindow()
     addon.ui.detailLineCount = 0
     addon.ui.lastDetailKey = ""
     addon.ui.lastDetailEntry = nil
+    -- Built by its own method: CreateMainWindow is already close to Lua 5.1's
+    -- per-function local limit, and the BIS panel needs a few dozen more.
+    local bisPanel = addon:BuildBiSPanel(f, statusText)
+
     addon.ui.lfmPanel = lfmPanel
+    addon.ui.bisPanel = bisPanel
+    addon.ui.bisTabButton = bisTabButton
     addon.ui.lfmMessageBox = lfmMessageBox
     addon.ui.lfmYellCheck = lfmYellCheck
     addon.ui.lfmGuildCheck = lfmGuildCheck
@@ -9334,6 +9381,710 @@ function addon:RefreshDetailPanel(selectedEntry)
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- BIS LIST tab
+--
+-- The data is RaidInspectorBiSData, generated from the "[WotLK] BiS Lists for
+-- 3.3.5a end game" workbook by tools/build_bis_data.py and loaded from
+-- RaidInspector_BiS.lua ahead of this file. Item tooltips come from the client
+-- (GameTooltip:SetHyperlink); "where it drops" and the right-click jump come
+-- from AtlasLoot's own loot tables, read through a lazily built reverse index.
+-- Nothing here talks to anything outside the game client.
+-- ---------------------------------------------------------------------------
+
+function addon:GetBiSSpecs()
+    local data = _G.RaidInspectorBiSData
+    if type(data) ~= "table" or type(data.specs) ~= "table" then
+        return {}
+    end
+    return data.specs
+end
+
+function addon:GetBiSSpecByKey(key)
+    local specs = addon:GetBiSSpecs()
+    local i
+    for i = 1, #specs do
+        if specs[i].key == key then
+            return specs[i]
+        end
+    end
+    return nil
+end
+
+function addon:GetSelectedBiSSpec()
+    local specs = addon:GetBiSSpecs()
+    if #specs == 0 then
+        return nil
+    end
+    local wanted = RaidInspectorDB.state.ui.bisSpec
+    local spec = addon:GetBiSSpecByKey(wanted)
+    if spec then
+        return spec
+    end
+    return specs[1]
+end
+
+function addon:SetSelectedBiSSpec(key)
+    if not addon:GetBiSSpecByKey(key) then
+        return false
+    end
+    RaidInspectorDB.state.ui.bisSpec = key
+    addon:RefreshBiSPanel()
+    return true
+end
+
+-- The workbook's own label ("TTW Fire Mage", "Bear") prefixed with the class
+-- in its class colour, so the dropdown groups visually without submenus.
+function addon:FormatBiSSpecLabel(spec)
+    if type(spec) ~= "table" then
+        return "?"
+    end
+    local classNames = {
+        DEATHKNIGHT = "Death Knight", DRUID = "Druid", HUNTER = "Hunter", MAGE = "Mage",
+        PALADIN = "Paladin", PRIEST = "Priest", ROGUE = "Rogue", SHAMAN = "Shaman",
+        WARLOCK = "Warlock", WARRIOR = "Warrior",
+    }
+    local className = classNames[spec.class] or tostring(spec.class or "")
+    local label = tostring(spec.label or "")
+    return ColorClassText(className, spec.class) .. " - " .. label
+end
+
+function addon:BuildBiSStatusText()
+    local spec = addon:GetSelectedBiSSpec()
+    if not spec then
+        return "BIS LIST: no data loaded (RaidInspector_BiS.lua missing or empty)."
+    end
+    local count = #(spec.items or {})
+    local alts = 0
+    local i
+    for i = 1, count do
+        alts = alts + #((spec.items[i] or {}).alts or {})
+    end
+    local roleText = ""
+    if spec.role and spec.role ~= "" then
+        roleText = " | " .. tostring(spec.role)
+    end
+    local atlasText = "AtlasLoot: not installed (no drop sources, no right-click)"
+    if addon:IsAtlasLootAvailable() then
+        atlasText = "AtlasLoot: ready"
+    end
+    return addon:FormatBiSSpecLabel(spec) .. roleText .. " | " .. tostring(count) .. " slots, "
+        .. tostring(alts) .. " alternatives | " .. atlasText
+end
+
+-- One display row per slot; a slot's alternative sits on the same row.
+function addon:BuildBiSRows(spec)
+    local rows = {}
+    if type(spec) ~= "table" or type(spec.items) ~= "table" then
+        return rows
+    end
+    local i
+    for i = 1, #spec.items do
+        local item = spec.items[i]
+        local alts = item.alts or {}
+        table.insert(rows, { slot = item.slot, bis = item, alt = alts[1] })
+        -- The data has at most one alternative per slot today; extra ones get
+        -- their own row rather than being dropped silently.
+        local a
+        for a = 2, #alts do
+            table.insert(rows, { slot = "", bis = nil, alt = alts[a] })
+        end
+    end
+    return rows
+end
+
+-- Colour by real quality once the client has the item cached; until then the
+-- data's own name in the standard epic colour, which every BiS item is bar
+-- Shadowmourne (legendary) - and that corrects itself on the next refresh.
+function addon:FormatBiSItemName(item)
+    if type(item) ~= "table" then
+        return ""
+    end
+    local id = addon:ResolveBiSItemId(item)
+    if id and GetItemInfo then
+        local name, _, quality = GetItemInfo(id)
+        if name then
+            local _, _, _, hex = GetItemQualityColor(quality or 4)
+            return (hex or "|cffa335ee") .. name .. "|r"
+        end
+    end
+    if not id then
+        return ColorText(tostring(item.name or "?"), "9d9d9d")
+    end
+    return ColorText(tostring(item.name or "?"), "a335ee")
+end
+
+function addon:RefreshBiSPanel()
+    local ui = addon.ui
+    if not ui or not ui.bisPanel or not ui.bisRows then
+        return
+    end
+
+    local spec = addon:GetSelectedBiSSpec()
+    if ui.bisSpecDropDown then
+        if spec then
+            UIDropDownMenu_SetSelectedValue(ui.bisSpecDropDown, spec.key)
+            UIDropDownMenu_SetText(ui.bisSpecDropDown, addon:FormatBiSSpecLabel(spec))
+        else
+            UIDropDownMenu_SetText(ui.bisSpecDropDown, "No BiS data")
+        end
+    end
+
+    if ui.bisAtlasStatus then
+        if addon:IsAtlasLootAvailable() then
+            ui.bisAtlasStatus:SetText(ColorText("AtlasLoot found: hover shows the drop source, right-click opens the boss page.", "66ff66"))
+        else
+            ui.bisAtlasStatus:SetText(ColorText("AtlasLoot not installed: tooltips still work, drop sources and right-click do not.", "ff8080"))
+        end
+    end
+
+    addon:WarmBiSItemCache(spec)
+
+    local rows = addon:BuildBiSRows(spec)
+    local i
+    for i = 1, #ui.bisRows do
+        local row = ui.bisRows[i]
+        local data = rows[i]
+        if data then
+            row.slotText:SetText(SafeText(data.slot))
+            if data.bis then
+                row.ilvlText:SetText(data.bis.ilvl and tostring(data.bis.ilvl) or "")
+                row.bisButton.item = data.bis
+                row.bisButton.text:SetText(addon:FormatBiSItemName(data.bis))
+                row.bisButton:Show()
+            else
+                row.ilvlText:SetText("")
+                row.bisButton.item = nil
+                row.bisButton.text:SetText("")
+                row.bisButton:Hide()
+            end
+            if data.alt then
+                row.altIlvlText:SetText(data.alt.ilvl and tostring(data.alt.ilvl) or "")
+                row.altButton.item = data.alt
+                row.altButton.text:SetText(addon:FormatBiSItemName(data.alt))
+                row.altButton:Show()
+            else
+                row.altIlvlText:SetText("")
+                row.altButton.item = nil
+                row.altButton.text:SetText("")
+                row.altButton:Hide()
+            end
+            row:Show()
+        else
+            row.slotText:SetText("")
+            row.ilvlText:SetText("")
+            row.altIlvlText:SetText("")
+            row.bisButton.item = nil
+            row.altButton.item = nil
+            row.bisButton:Hide()
+            row.altButton:Hide()
+            row:Hide()
+        end
+    end
+end
+
+-- ---- AtlasLoot bridge -------------------------------------------------------
+
+function addon:IsAtlasLootAvailable()
+    return type(_G.AtlasLoot_Data) == "table" and type(_G.AtlasLoot_TableNames) == "table"
+end
+
+-- itemID -> sorted list of loot-table ids, and lowercase name -> itemID (for
+-- the two workbook entries that carry no link). Built once from AtlasLoot's
+-- tables the first time it is needed; the WotLK module is loaded on demand
+-- since every end-game BiS item lives there.
+function addon:EnsureAtlasLootIndex(scope)
+    if not addon:IsAtlasLootAvailable() then
+        return nil
+    end
+    scope = scope or "wotlk"
+    if addon.bisAtlasIndex and (addon.bisAtlasIndexScope == scope or addon.bisAtlasIndexScope == "all") then
+        return addon.bisAtlasIndex
+    end
+
+    if scope == "all" then
+        if type(_G.AtlasLoot_LoadAllModules) == "function" then
+            pcall(_G.AtlasLoot_LoadAllModules)
+        end
+    elseif type(LoadAddOn) == "function" then
+        if not (IsAddOnLoaded and IsAddOnLoaded("AtlasLoot_WrathoftheLichKing")) then
+            pcall(LoadAddOn, "AtlasLoot_WrathoftheLichKing")
+        end
+    end
+
+    local byId, byName = {}, {}
+    local dataID, entries
+    for dataID, entries in pairs(_G.AtlasLoot_Data) do
+        if type(entries) == "table" and _G.AtlasLoot_TableNames[dataID] then
+            local i
+            for i = 1, #entries do
+                local entry = entries[i]
+                if type(entry) == "table" and type(entry[2]) == "number" and entry[2] > 0 then
+                    local id = entry[2]
+                    byId[id] = byId[id] or {}
+                    table.insert(byId[id], dataID)
+                    if type(entry[4]) == "string" then
+                        local plain = string.lower(string.gsub(entry[4], "=q%d=", ""))
+                        if plain ~= "" and not byName[plain] then
+                            byName[plain] = id
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Highest difficulty first (25 HC > 25 > 10 HC > 10), then by name, so the
+    -- same item always resolves to the same page.
+    local id, list
+    for id, list in pairs(byId) do
+        table.sort(list, function(a, b)
+            local sa, sb = addon:ScoreAtlasLootDifficulty(a), addon:ScoreAtlasLootDifficulty(b)
+            if sa ~= sb then
+                return sa > sb
+            end
+            return a < b
+        end)
+    end
+
+    addon.bisAtlasIndex = { byId = byId, byName = byName }
+    addon.bisAtlasIndexScope = scope
+    return addon.bisAtlasIndex
+end
+
+function addon:ScoreAtlasLootDifficulty(dataID)
+    local score = 0
+    if string.find(dataID, "25Man", 1, true) then
+        score = score + 2
+    end
+    if string.find(dataID, "HEROIC", 1, true) then
+        score = score + 1
+    end
+    return score
+end
+
+-- "The Lich King (25 HC)" from "ICCLichKing25ManHEROIC". The size is only
+-- shown when the id says so or a 25-man sibling table exists; 5-man bosses
+-- just get "(HC)" or nothing.
+function addon:FormatAtlasLootSource(dataID)
+    local names = _G.AtlasLoot_TableNames
+    local entry = names and names[dataID]
+    local boss = (type(entry) == "table" and entry[1]) and tostring(entry[1]) or tostring(dataID)
+
+    local heroic = string.find(dataID, "HEROIC", 1, true) ~= nil
+    local size = nil
+    if string.find(dataID, "25Man", 1, true) then
+        size = "25"
+    elseif string.find(dataID, "10Man", 1, true) then
+        size = "10"
+    else
+        local base = string.gsub(dataID, "HEROIC$", "")
+        if names and (names[base .. "25Man"] or names[base .. "25ManHEROIC"]) then
+            size = "10"
+        end
+    end
+
+    local tag = size or ""
+    if heroic then
+        tag = (tag ~= "" and (tag .. " ") or "") .. "HC"
+    end
+    if tag ~= "" then
+        return boss .. " (" .. tag .. ")"
+    end
+    return boss
+end
+
+function addon:ResolveBiSItemId(item)
+    if type(item) ~= "table" then
+        return nil
+    end
+    if item.id then
+        return item.id
+    end
+    local index = addon:EnsureAtlasLootIndex()
+    if not index then
+        return nil
+    end
+    local id = index.byName[string.lower(tostring(item.name or ""))]
+    if id then
+        -- Runtime only: RaidInspectorBiSData is reloaded from file every login.
+        item.id = id
+    end
+    return id
+end
+
+-- Sorted list of { dataID, label } for every AtlasLoot table that drops the
+-- item. Falls back to loading every AtlasLoot module once if the WotLK data
+-- has no hit, which is what AtlasLoot's own search does.
+function addon:GetBiSItemSources(item)
+    local id = addon:ResolveBiSItemId(item)
+    if not id then
+        return {}
+    end
+    local index = addon:EnsureAtlasLootIndex()
+    if not index then
+        return {}
+    end
+    local list = index.byId[id]
+    if not list and addon.bisAtlasIndexScope ~= "all" and type(_G.AtlasLoot_LoadAllModules) == "function" then
+        index = addon:EnsureAtlasLootIndex("all")
+        list = index and index.byId[id]
+    end
+    local sources = {}
+    if list then
+        local i
+        for i = 1, #list do
+            table.insert(sources, { dataID = list[i], label = addon:FormatAtlasLootSource(list[i]) })
+        end
+    end
+    return sources
+end
+
+-- Asks the server for an item the client has never seen, the way AtlasLoot's
+-- own query does: through a hidden tooltip. Putting an uncached link on the
+-- visible tooltip, or letting it into chat, is what disconnects 3.3.5 clients.
+function addon:RequestItemCache(id)
+    id = tonumber(id)
+    if not id or id <= 0 then
+        return
+    end
+    if not addon.scanTooltip then
+        addon.scanTooltip = CreateFrame("GameTooltip", "RaidInspectorScanTooltip", UIParent, "GameTooltipTemplate")
+        if addon.scanTooltip.SetOwner then
+            addon.scanTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+        end
+    end
+    if addon.scanTooltip.SetHyperlink then
+        pcall(addon.scanTooltip.SetHyperlink, addon.scanTooltip, "item:" .. tostring(id))
+    end
+end
+
+-- Once per spec shown: request every item the client does not have yet, so
+-- names pick up their real quality colour and tooltips are complete on the
+-- first hover. About the same traffic as opening one AtlasLoot loot page.
+function addon:WarmBiSItemCache(spec)
+    if type(spec) ~= "table" or addon.bisWarmedSpecKey == spec.key then
+        return 0
+    end
+    addon.bisWarmedSpecKey = spec.key
+    local requested = 0
+    local i
+    for i = 1, #(spec.items or {}) do
+        local item = spec.items[i]
+        local candidates = { item }
+        local a
+        for a = 1, #(item.alts or {}) do
+            table.insert(candidates, item.alts[a])
+        end
+        local c
+        for c = 1, #candidates do
+            local id = candidates[c].id
+            if id and GetItemInfo and not GetItemInfo(id) then
+                addon:RequestItemCache(id)
+                requested = requested + 1
+            end
+        end
+    end
+    return requested
+end
+
+function addon:ShowBiSItemTooltip(button)
+    local item = button and button.item
+    if type(item) ~= "table" or not GameTooltip then
+        return
+    end
+
+    local id = addon:ResolveBiSItemId(item)
+    GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+    GameTooltip:ClearLines()
+
+    -- Same rule AtlasLoot follows: the real hyperlink goes on the visible
+    -- tooltip only once the client has the item cached. For an unseen item the
+    -- data's own name and level are shown and the item is requested through a
+    -- hidden tooltip, so the next hover has the full stats.
+    local cached = nil
+    if id and GetItemInfo then
+        cached = GetItemInfo(id)
+    end
+    if id and cached then
+        GameTooltip:SetHyperlink("item:" .. tostring(id))
+    else
+        GameTooltip:AddLine(tostring(item.name or "?"), 1, 1, 1)
+        if item.ilvl then
+            GameTooltip:AddLine("Item Level " .. tostring(item.ilvl), 1, 0.82, 0)
+        end
+        if id then
+            GameTooltip:AddLine("Item data not cached yet - hover again in a moment.", 0.7, 0.7, 0.7)
+            addon:RequestItemCache(id)
+        else
+            GameTooltip:AddLine("No item id in the BiS data and AtlasLoot could not resolve the name.", 0.7, 0.7, 0.7)
+        end
+    end
+
+    GameTooltip:AddLine(" ")
+    if addon:IsAtlasLootAvailable() then
+        local sources = addon:GetBiSItemSources(item)
+        if #sources == 0 then
+            GameTooltip:AddLine("Drops from: not found in AtlasLoot", 0.7, 0.7, 0.7)
+        else
+            local shown = math.min(#sources, 4)
+            local i
+            for i = 1, shown do
+                GameTooltip:AddLine((i == 1 and "Drops from: " or "            ") .. sources[i].label, 0.4, 1, 0.4)
+            end
+            if #sources > shown then
+                GameTooltip:AddLine("            +" .. tostring(#sources - shown) .. " more", 0.4, 1, 0.4)
+            end
+            GameTooltip:AddLine("Right-click: open in AtlasLoot", 0.6, 0.6, 0.6)
+        end
+    else
+        GameTooltip:AddLine("Install AtlasLoot to see where it drops.", 0.6, 0.6, 0.6)
+    end
+    GameTooltip:AddLine("Shift-click: link in chat", 0.6, 0.6, 0.6)
+    GameTooltip:Show()
+end
+
+function addon:OpenBiSItemInAtlasLoot(item)
+    if type(item) ~= "table" then
+        return false
+    end
+    if not addon:IsAtlasLootAvailable() or type(_G.AtlasLoot_ShowBossLoot) ~= "function" then
+        Print("AtlasLoot is not installed, so there is no loot page to open.")
+        return false
+    end
+
+    local sources = addon:GetBiSItemSources(item)
+    if #sources == 0 then
+        Print("AtlasLoot has no loot table containing " .. tostring(item.name or "that item") .. ".")
+        return false
+    end
+
+    -- Same sequence AtlasLoot's own browser uses: show the default frame, then
+    -- park the loot page inside its loot background.
+    local pFrame = nil
+    if _G.AtlasLootDefaultFrame and _G.AtlasLootDefaultFrame.Show then
+        _G.AtlasLootDefaultFrame:Show()
+        if _G.AtlasLootDefaultFrame_LootBackground then
+            pFrame = { "TOPLEFT", "AtlasLootDefaultFrame_LootBackground", "TOPLEFT", "2", "-2" }
+        end
+    end
+    local source = sources[1]
+    local ok, err = pcall(_G.AtlasLoot_ShowBossLoot, source.dataID, source.label, pFrame)
+    if not ok then
+        Print("AtlasLoot refused to open " .. tostring(source.dataID) .. ": " .. tostring(err))
+        return false
+    end
+    return true
+end
+
+function addon:OnBiSItemClick(button, mouseButton)
+    local item = button and button.item
+    if type(item) ~= "table" then
+        return
+    end
+    if mouseButton == "RightButton" then
+        addon:OpenBiSItemInAtlasLoot(item)
+        return
+    end
+    if IsShiftKeyDown and IsShiftKeyDown() then
+        local id = addon:ResolveBiSItemId(item)
+        if id and GetItemInfo and ChatEdit_InsertLink then
+            local _, link = GetItemInfo(id)
+            if link then
+                ChatEdit_InsertLink(link)
+            end
+        end
+    end
+end
+
+-- Builds the whole tab panel. Called once from CreateMainWindow.
+function addon:BuildBiSPanel(parent, anchorTo)
+    local panel = CreateFrame("Frame", nil, parent)
+    panel:SetPoint("TOPLEFT", anchorTo, "BOTTOMLEFT", 0, -8)
+    panel:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -PANEL_SIDE_MARGIN, OVERVIEW_BOTTOM_INSET)
+    panel:Hide()
+
+    -- Left column: spec picker + help.
+    local specLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    specLabel:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, -2)
+    specLabel:SetText("Class / Spec:")
+
+    local dropDown = CreateFrame("Frame", "RaidInspectorBiSSpecDropDown", panel, "UIDropDownMenuTemplate")
+    dropDown:SetPoint("TOPLEFT", specLabel, "BOTTOMLEFT", -16, -4)
+    UIDropDownMenu_SetWidth(dropDown, 250)
+    UIDropDownMenu_JustifyText(dropDown, "LEFT")
+    UIDropDownMenu_Initialize(dropDown, function(_, level)
+        if level ~= 1 then
+            return
+        end
+        local specs = addon:GetBiSSpecs()
+        local selected = addon:GetSelectedBiSSpec()
+        local i
+        for i = 1, #specs do
+            local spec = specs[i]
+            local info = UIDropDownMenu_CreateInfo()
+            info.text = addon:FormatBiSSpecLabel(spec)
+            info.value = spec.key
+            info.checked = (selected ~= nil and selected.key == spec.key)
+            info.func = function(btn)
+                SafeInvoke("bis-spec", function()
+                    addon:SetSelectedBiSSpec(btn.value)
+                    addon:RefreshMainWindow()
+                end)
+            end
+            UIDropDownMenu_AddButton(info, level)
+        end
+    end)
+
+    local hint = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    hint:SetPoint("TOPLEFT", dropDown, "BOTTOMLEFT", 16, -10)
+    hint:SetWidth(BIS_LAYOUT.listX - 30)
+    hint:SetJustifyH("LEFT")
+    hint:SetJustifyV("TOP")
+    hint:SetText(
+        "Pick a spec to list its best-in-slot gear, with the alternative that is "
+        .. "also fine to roll for.\n\n"
+        .. "|cffffd100Hover|r an item for its stats and where it drops.\n"
+        .. "|cffffd100Right-click|r an item to open that boss in AtlasLoot.\n"
+        .. "|cffffd100Shift-click|r to link it in chat."
+    )
+
+    local atlasStatus = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    atlasStatus:SetPoint("TOPLEFT", hint, "BOTTOMLEFT", 0, -12)
+    atlasStatus:SetWidth(BIS_LAYOUT.listX - 30)
+    atlasStatus:SetJustifyH("LEFT")
+    atlasStatus:SetText("")
+
+    local sourceText = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    sourceText:SetPoint("TOPLEFT", atlasStatus, "BOTTOMLEFT", 0, -12)
+    sourceText:SetWidth(BIS_LAYOUT.listX - 30)
+    sourceText:SetJustifyH("LEFT")
+    local data = _G.RaidInspectorBiSData
+    sourceText:SetText(ColorText("Source: " .. tostring((type(data) == "table" and data.source) or "no data file"), "999999"))
+
+    -- Right column: the list.
+    local slotX = 0
+    local ilvlX = slotX + BIS_LAYOUT.slotWidth
+    local itemX = ilvlX + BIS_LAYOUT.ilvlWidth
+    local altIlvlX = itemX + BIS_LAYOUT.itemWidth + 10
+    local altItemX = altIlvlX + BIS_LAYOUT.ilvlWidth
+
+    local header = CreateFrame("Frame", nil, panel)
+    header:SetPoint("TOPLEFT", panel, "TOPLEFT", BIS_LAYOUT.listX, -2)
+    header:SetPoint("RIGHT", panel, "RIGHT", 0, 0)
+    header:SetHeight(16)
+
+    local function HeaderText(x, text)
+        local fs = header:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        fs:SetPoint("LEFT", header, "LEFT", x, 0)
+        fs:SetJustifyH("LEFT")
+        fs:SetText(text)
+        return fs
+    end
+    HeaderText(slotX, "Slot")
+    HeaderText(ilvlX, "iLvl")
+    HeaderText(itemX, "Best in slot")
+    HeaderText(altIlvlX, "iLvl")
+    HeaderText(altItemX, "Alternative / allowed to roll for")
+
+    local function ItemButton(row, x, width)
+        local button = CreateFrame("Button", nil, row)
+        button:SetPoint("LEFT", row, "LEFT", x, 0)
+        button:SetWidth(width)
+        button:SetHeight(BIS_LAYOUT.rowHeight - 2)
+        button:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        button:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
+        local text = button:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        text:SetPoint("LEFT", button, "LEFT", 0, 0)
+        text:SetPoint("RIGHT", button, "RIGHT", 0, 0)
+        text:SetJustifyH("LEFT")
+        button.text = text
+        button:SetScript("OnEnter", function(self)
+            SafeInvoke("bis-tooltip", function()
+                addon:ShowBiSItemTooltip(self)
+            end)
+        end)
+        button:SetScript("OnLeave", function()
+            if GameTooltip then
+                GameTooltip:Hide()
+            end
+        end)
+        button:SetScript("OnClick", function(self, mouseButton)
+            SafeInvoke("bis-click", function()
+                addon:OnBiSItemClick(self, mouseButton)
+            end)
+        end)
+        button:Hide()
+        return button
+    end
+
+    local rows = {}
+    local i
+    for i = 1, BIS_LAYOUT.rows do
+        local row = CreateFrame("Frame", nil, panel)
+        row:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -((i - 1) * BIS_LAYOUT.rowHeight) - 2)
+        row:SetPoint("RIGHT", panel, "RIGHT", 0, 0)
+        row:SetHeight(BIS_LAYOUT.rowHeight)
+
+        local slotText = row:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        slotText:SetPoint("LEFT", row, "LEFT", slotX, 0)
+        slotText:SetWidth(BIS_LAYOUT.slotWidth - 4)
+        slotText:SetJustifyH("LEFT")
+
+        local ilvlText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        ilvlText:SetPoint("LEFT", row, "LEFT", ilvlX, 0)
+        ilvlText:SetWidth(BIS_LAYOUT.ilvlWidth - 4)
+        ilvlText:SetJustifyH("LEFT")
+
+        local altIlvlText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        altIlvlText:SetPoint("LEFT", row, "LEFT", altIlvlX, 0)
+        altIlvlText:SetWidth(BIS_LAYOUT.ilvlWidth - 4)
+        altIlvlText:SetJustifyH("LEFT")
+
+        row.slotText = slotText
+        row.ilvlText = ilvlText
+        row.altIlvlText = altIlvlText
+        row.bisButton = ItemButton(row, itemX, BIS_LAYOUT.itemWidth)
+        row.altButton = ItemButton(row, altItemX, BIS_LAYOUT.altItemWidth)
+        row:Hide()
+        rows[i] = row
+    end
+
+    addon.ui.bisSpecDropDown = dropDown
+    addon.ui.bisHint = hint
+    addon.ui.bisAtlasStatus = atlasStatus
+    addon.ui.bisRows = rows
+    return panel
+end
+
+function addon:HandleBiSCommand(args)
+    local wanted = string.lower(Trim(args or ""))
+    if wanted ~= "" then
+        local specs = addon:GetBiSSpecs()
+        local match = nil
+        local i
+        for i = 1, #specs do
+            local spec = specs[i]
+            local label = string.lower(tostring(spec.label or ""))
+            if spec.key == wanted or label == wanted then
+                match = spec
+                break
+            end
+            if not match and string.find(label, wanted, 1, true) then
+                match = spec
+            end
+        end
+        if match then
+            RaidInspectorDB.state.ui.bisSpec = match.key
+        else
+            Print("bis: no spec matches \"" .. wanted .. "\"")
+        end
+    end
+    addon:SetActiveTab("bis")
+    addon:ToggleWindow(true)
+    addon:RefreshMainWindow()
+end
+
 function addon:RefreshMainWindow()
     if not addon.ui or not addon.ui.frame then
         return
@@ -9366,6 +10117,8 @@ function addon:RefreshMainWindow()
                 .. " (" .. tostring(postDelaySeconds) .. "s spacing, x" .. tostring(repeatCount) .. " repeat)"
                 .. queueText
         )
+    elseif activeTab == "bis" then
+        addon.ui.statusText:SetText(addon:BuildBiSStatusText())
     elseif activeSavedReport then
         addon.ui.statusText:SetText(
             "Saved Report: " .. addon:BuildSavedReportMenuLabel(activeSavedReport)
@@ -10391,6 +11144,7 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri sharesaved [latest|id|name-realm] - share saved snapshot to chat")
             Print("/ri status - show queue summary")
             Print("/ri ach - print the raid achievement ids this build looks up")
+            Print("/ri bis [spec] - open the BIS LIST tab, optionally jumping to a spec (e.g. /ri bis fury)")
             Print("/ri refreshstale [minutes] - queue refresh for stale results")
             Print("/ri clearqueue [confirm] - clear queue/results with confirmation")
             return
@@ -10413,6 +11167,11 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
 
         if command == "inspect" then
             addon:HandleInspectCommand(args)
+            return
+        end
+
+        if command == "bis" then
+            addon:HandleBiSCommand(args)
             return
         end
 

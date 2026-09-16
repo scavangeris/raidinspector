@@ -14,6 +14,7 @@ Raid Inspector is a WoW 3.3.5a addon for raid gear analysis on the bridgeless br
 - Enchant and gem auditing.
 - Talent/spec detection from in-game talent inspection.
 - Raid achievement check for ICC 10/25 and Ruby Sanctum 10/25 on inspected players.
+- `BIS LIST` tab: best-in-slot gear per spec, with tooltips, drop sources and AtlasLoot links.
 - Saved detailed reports loaded directly from the in-game dropdown.
 - Saved single-player share snapshots for chat export.
 
@@ -50,6 +51,7 @@ Name-only remote lookups are intentionally not supported here.
 - `/ri exportsaved` remains as a compatibility alias for `/ri sharesaved`
 - `/ri status`
 - `/ri ach`
+- `/ri bis [spec]`
 - `/ri refreshstale [minutes]`
 - `/ri clearqueue [confirm]`
 - `/ri ms [on|off]`
@@ -132,6 +134,41 @@ The IDs looked up are the final-boss kills: The Frozen Throne 10/25 (`4530` /
 print what those IDs resolve to on your client - a wrong ID would silently show
 everyone as not having the kill, so this is worth one glance.
 
+## BIS LIST Tab
+
+Pick a class/spec from the dropdown; the list on the right shows the best-in-slot
+item for every slot, and next to it the alternative that is also fine to roll for.
+
+- **Hover** an item for its tooltip and, below it, `Drops from: <boss> (25 HC)`.
+- **Right-click** an item to open that boss's loot page in AtlasLoot.
+- **Shift-click** an item to link it in chat.
+- `/ri bis fury` (or any part of a spec's name) jumps straight to that spec.
+
+The item stats come from the game client and the drop sources from AtlasLoot's
+own loot tables, so nothing is looked up outside the game. AtlasLoot is optional:
+without it the list and tooltips still work, only the drop source and right-click
+are missing. The WotLK loot module is loaded the first time it is needed.
+
+An item the client has never seen shows its name and item level from the data
+and is fetched quietly in the background; hover it again a moment later for the
+full stats. The real item link is deliberately never put on the tooltip before
+the item is cached, because on 3.3.5 an uncached link can disconnect you.
+
+### Where the data comes from
+
+`RaidInspector_BiS.lua` is **generated** - do not edit it by hand. It is built from
+the `[WotLK] BiS Lists for 3.3.5a end game` workbook by
+`tools/build_bis_data.py` (requires `pip install openpyxl`):
+
+```bash
+cd "Interface/AddOns/RaidInspector"
+python tools/build_bis_data.py "path/to/[WotLK] BiS Lists for 3.3.5a end game.xlsx"
+```
+
+Item ids are read from the workbook's hyperlinks. The two entries that have no
+link (Libram of the Eternal Tower, Totem of Hex) are resolved by name through
+AtlasLoot at runtime.
+
 ## LFM Tab (Initial)
 - Use the `LFM` tab to compose your recruitment message.
 - Write your post, link an achievement in any chat window, and paste that achievement link into the LFM message box.
@@ -202,6 +239,20 @@ MS records are kept in `RaidInspectorDB.msTracking.entries`, outside `results`, 
 Bridge assets were removed from this repository to keep the release branch fully in-game and self-contained.
 
 The addon no longer depends on `RaidInspectorBridge` or bridge-generated SavedVariables files.
+
+## Tests
+
+```bash
+pip install lupa
+cd "Interface/AddOns/RaidInspector"
+python tools/test/run.py
+```
+
+This compile-checks every addon file under Lua 5.1 (the client's dialect, which
+also proves the 200-local / 60-upvalue limits hold) and then runs every
+`tools/test/*_test.lua` against the real addon over a stubbed WoW API. No game
+client needed. Static verification is not a substitute for trying a change
+in-game, but it catches the whole class of "loads fine, breaks on first click".
 
 ## Release Packaging (Phase 8)
 Build a release zip that contains only the runtime addon folder (`RaidInspector`).
