@@ -2928,6 +2928,7 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.settings, "overview", {})
     EnsureTable(RaidInspectorDB.settings.overview, "sortMode", "recent")
     EnsureTable(RaidInspectorDB.settings.overview, "filterMode", "all")
+    EnsureTable(RaidInspectorDB.settings.overview, "groupByRole", false)
 
     EnsureTable(RaidInspectorDB.settings, "autoScan", {})
     EnsureTable(RaidInspectorDB.settings.autoScan, "enabled", false)
@@ -3001,6 +3002,18 @@ function addon:GetSortMode()
     end
     RaidInspectorDB.settings.overview.sortMode = "recent"
     return "recent"
+end
+
+-- Group-by-role is a layer on top of the sort mode, not a mode of its own:
+-- on, the list is tanks, then healers, melee, ranged, unknown - and inside
+-- each group the chosen sort (GS, recent, issues...) still applies.
+function addon:IsGroupByRole()
+    return RaidInspectorDB.settings.overview.groupByRole == true
+end
+
+function addon:SetGroupByRole(flag)
+    RaidInspectorDB.settings.overview.groupByRole = (flag == true)
+    return RaidInspectorDB.settings.overview.groupByRole
 end
 
 function addon:GetFilterMode()
@@ -4365,6 +4378,7 @@ function addon:RefreshTabVisibility()
         addon.ui.sortRow,
         addon.ui.sortLabel,
         addon.ui.sortDropDown,
+        addon.ui.sortByRoleCheck,
         addon.ui.actionPanel,
         addon.ui.targetButton,
         addon.ui.raidButton,
@@ -5886,7 +5900,16 @@ function addon:GetOverviewEntries()
     end
 
     local sortMode = addon:GetSortMode()
+    local groupByRole = addon:IsGroupByRole()
     table.sort(filtered, function(a, b)
+        if groupByRole then
+            local aRank = addon:GetEntryRoleRank(a)
+            local bRank = addon:GetEntryRoleRank(b)
+            if aRank ~= bRank then
+                return aRank < bRank
+            end
+        end
+
         local aIssues = a.result and tonumber(a.result.issuesCount or 0) or 0
         local bIssues = b.result and tonumber(b.result.issuesCount or 0) or 0
         local aGs = a.result and tonumber(a.result.gearScore or -1) or -1
@@ -6450,7 +6473,9 @@ function addon:ShowDetailRowTooltip(row)
     local slotLabel = SLOT_LABELS[data.slotKey or ""] or tostring(data.slotKey or "Item")
     local itemLink = BuildInspectItemHyperlink(item)
 
-    GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+    -- The row spans the whole gear panel, so ANCHOR_RIGHT put the tooltip at
+    -- the far edge of the window; the cursor is where the eye already is.
+    GameTooltip:SetOwner(row, "ANCHOR_CURSOR")
     if itemLink then
         GameTooltip:SetHyperlink(itemLink)
     else
@@ -8108,6 +8133,29 @@ function addon:CreateMainWindow()
         end
     end)
     UIDropDownMenu_SetSelectedValue(sortDropDown, addon:GetSortMode())
+
+    local sortByRoleCheck = CreateFrame("CheckButton", "RaidInspectorSortByRoleCheck", f, "UICheckButtonTemplate")
+    sortByRoleCheck:SetPoint("LEFT", sortDropDown, "RIGHT", -8, -2)
+    sortByRoleCheck:SetHitRectInsets(0, -44, 0, 0)
+    _G[sortByRoleCheck:GetName() .. "Text"]:SetText("by role")
+    sortByRoleCheck:SetScript("OnClick", function(self)
+        SafeInvoke("sort-by-role", function()
+            addon:SetGroupByRole(self:GetChecked() and true or false)
+            addon:RefreshMainWindow()
+        end)
+    end)
+    sortByRoleCheck:SetScript("OnEnter", function(self)
+        if GameTooltip then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText("Group the list by role - tanks, healers, melee, ranged - and apply the chosen sort inside each group.")
+            GameTooltip:Show()
+        end
+    end)
+    sortByRoleCheck:SetScript("OnLeave", function()
+        if GameTooltip then
+            GameTooltip:Hide()
+        end
+    end)
     UIDropDownMenu_SetText(sortDropDown, SORT_LABELS[addon:GetSortMode()] or addon:GetSortMode())
 
     local actionPanel = CreateFrame("Frame", nil, f)
@@ -8873,6 +8921,7 @@ function addon:CreateMainWindow()
     addon.ui.sortRow = sortRow
     addon.ui.sortLabel = sortLabel
     addon.ui.sortDropDown = sortDropDown
+    addon.ui.sortByRoleCheck = sortByRoleCheck
     addon.ui.actionPanel = actionPanel
     addon.ui.sortButton = sortButton
     addon.ui.filterButton = filterButton
@@ -9001,7 +9050,12 @@ function addon:BuildOverviewRowText(entry)
         nameText = ColorClassText(nameText, result.class)
     end
 
-    return "#" .. tostring(reqId)
+    local rolePrefix = ""
+    if addon:IsGroupByRole() then
+        rolePrefix = addon:FormatEntryRoleTag(entry) .. " "
+    end
+
+    return rolePrefix .. "#" .. tostring(reqId)
         .. " " .. nameText
         .. " [" .. state .. "] GS=" .. gsText
         .. auditText
@@ -9119,6 +9173,40 @@ local function ClassifyTalentRole(classValue, specValue)
     end
 
     return nil
+end
+
+-- Display order for the group-by-role sort. Unknown (no talent data yet)
+-- sinks to the bottom so an un-scanned player never splits a group.
+local ROLE_SORT_ORDER = { tank = 1, heal = 2, mdps = 3, rdps = 4 }
+local ROLE_TAGS = {
+    tank = { label = "T", color = "6fb6ff" },
+    heal = { label = "H", color = "66ff66" },
+    mdps = { label = "M", color = "ff7f7f" },
+    rdps = { label = "R", color = "ffb347" },
+}
+
+function addon:GetEntryRole(entry)
+    local result = type(entry) == "table" and entry.result or nil
+    if type(result) ~= "table" or result.error then
+        return nil
+    end
+    return ClassifyTalentRole(result.class, result.spec)
+end
+
+function addon:GetEntryRoleRank(entry)
+    local role = addon:GetEntryRole(entry)
+    return (role and ROLE_SORT_ORDER[role]) or 5
+end
+
+-- "T"/"H"/"M"/"R" in the role's colour, or a grey "?" - only rendered while
+-- group-by-role is on, so the default row text is unchanged.
+function addon:FormatEntryRoleTag(entry)
+    local role = addon:GetEntryRole(entry)
+    local tag = role and ROLE_TAGS[role]
+    if tag then
+        return ColorText(tag.label, tag.color)
+    end
+    return ColorText("?", "808080")
 end
 
 local function BuildRaidCompositionCounts(entries)
@@ -9934,7 +10022,7 @@ function addon:ShowBiSItemTooltip(button)
     end
 
     local id = addon:ResolveBiSItemId(item)
-    GameTooltip:SetOwner(button, "ANCHOR_RIGHT")
+    GameTooltip:SetOwner(button, "ANCHOR_CURSOR")
     GameTooltip:ClearLines()
 
     -- Same rule AtlasLoot follows: the real hyperlink goes on the visible
@@ -10272,6 +10360,9 @@ function addon:RefreshMainWindow()
         local sortMode = addon:GetSortMode()
         UIDropDownMenu_SetSelectedValue(addon.ui.sortDropDown, sortMode)
         UIDropDownMenu_SetText(addon.ui.sortDropDown, SORT_LABELS[sortMode] or sortMode)
+    end
+    if addon.ui.sortByRoleCheck then
+        addon.ui.sortByRoleCheck:SetChecked(addon:IsGroupByRole())
     end
 
     if addon.ui.filterButton then
@@ -11308,6 +11399,7 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri ach - print the raid achievement ids this build looks up")
             Print("/ri bis [spec] - open the BIS LIST tab, optionally jumping to a spec (e.g. /ri bis fury)")
             Print("/ri compact [on|off] - hide/show the gear list (compact raid-list window)")
+            Print("/ri byrole [on|off] - group the list by role (tanks, healers, melee, ranged) on top of the sort")
             Print("/ri refreshstale [minutes] - queue refresh for stale results")
             Print("/ri clearqueue [confirm] - clear queue/results with confirmation")
             return
@@ -11335,6 +11427,20 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
 
         if command == "bis" then
             addon:HandleBiSCommand(args)
+            return
+        end
+
+        if command == "byrole" or command == "rolesort" then
+            local sub = string.lower(Trim(args or ""))
+            if sub == "on" then
+                addon:SetGroupByRole(true)
+            elseif sub == "off" then
+                addon:SetGroupByRole(false)
+            else
+                addon:SetGroupByRole(not addon:IsGroupByRole())
+            end
+            addon:RefreshMainWindow()
+            Print("group by role: " .. (addon:IsGroupByRole() and "on" or "off"))
             return
         end
 

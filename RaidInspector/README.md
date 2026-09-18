@@ -38,6 +38,7 @@ Name-only remote lookups are intentionally not supported here.
 - `/ri inspecttarget`
 - `/ri inspectraid`
 - `/ri sort [recent|gs|issues|name]`
+- `/ri byrole [on|off]`
 - `/ri filter [all|snapshot|ready|queued|issues]`
 - `/ri report`
 - `/ri loadreport [latest|report-id]`
@@ -70,6 +71,7 @@ Name-only remote lookups are intentionally not supported here.
 - `Refresh`: attempt live refresh for stale entries that are currently present in target/party/raid.
 - `Status`: print runtime status into chat.
 - `Clear`: clear queued requests, cached live-inspect results and recorded MS changes.
+- `by role` (next to Sort): group the list tanks / healers / melee / ranged, with the chosen sort applied inside each group. Rows show a T/H/M/R letter while it is on.
 - `<<` / `>>` (top right, next to close): compact view. Hides the gear panel and narrows the window to the raid list with the composition line and action buttons; press again (or `/ri compact`) to bring the gear panel back. Remembered across reloads. LFM and BIS LIST always show at full width.
 - `MS: on/off`: start/stop recording MS changes from raid chat.
 - `MS Share`: post the recorded MS list to the ticked Share channels.

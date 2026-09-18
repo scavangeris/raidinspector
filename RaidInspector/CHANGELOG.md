@@ -3,6 +3,8 @@
 All notable changes to Raid Inspector are documented in this file.
 
 ## Unreleased
+- Item tooltips in the gear list (and the BIS LIST) now open next to the mouse. They were anchored to the right edge of the row, and since a row spans the whole panel that put the tooltip at the far edge of the window.
+- New `by role` checkbox next to the Sort dropdown. Ticked, the raid list is grouped tanks, healers, melee, ranged (players with no talent data yet at the bottom), and the sort you picked - GS, recent, issues, name, MS - still applies inside each group. While it is on, each row starts with a coloured role letter (T/H/M/R) so the groups are visible at a glance; untick it and the rows look exactly as before. Remembered across reloads. `/ri byrole [on|off]` does the same from chat or a macro.
 - New `/trade` channel checkbox on the LFM tab, next to `/global`. Trade only exists inside a capital city, so the channel status line says `missing (city only)` until you are in one and POST tells you the same if you try from outside. Off by default.
 - Fixed LFM only ever recognising the first joined chat channel. On 3.3.5 the client lists joined channels as id/name pairs, and the addon walked them in threes, so anything after channel 1 read as `missing`: `/trade` never worked, and `/global` only worked through a name lookup that reported the alias instead of the real channel name. Every joined channel is now found, and the status line shows real names.
 
