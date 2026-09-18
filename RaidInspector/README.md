@@ -174,11 +174,11 @@ AtlasLoot at runtime.
 ## LFM Tab (Initial)
 - Use the `LFM` tab to compose your recruitment message.
 - Write your post, link an achievement in any chat window, and paste that achievement link into the LFM message box.
-- Supported channel checkboxes: `Yell`, `/general`, `/global`.
+- Supported channel checkboxes: `Yell`, `/guild`, `/general`, `/global`, `/trade` (Trade only exists inside a city).
 - Delay dropdown options: `10s`, `20s`, `30s`, `60s`.
 - Click `POST` to broadcast the message.
 - If multiple channels are selected, posts are sent one-by-one using the selected delay to reduce mute penalty risk.
-- A channel status line shows joined/missing state for `/general` and `/global`.
+- A channel status line shows joined/missing state for `/general`, `/global` and `/trade`.
 - While the message box is focused, Shift-clicking an achievement link inserts it into your message.
 
 ## Saved Data

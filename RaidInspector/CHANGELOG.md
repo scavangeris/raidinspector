@@ -2,6 +2,10 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## Unreleased
+- New `/trade` channel checkbox on the LFM tab, next to `/global`. Trade only exists inside a capital city, so the channel status line says `missing (city only)` until you are in one and POST tells you the same if you try from outside. Off by default.
+- Fixed LFM only ever recognising the first joined chat channel. On 3.3.5 the client lists joined channels as id/name pairs, and the addon walked them in threes, so anything after channel 1 read as `missing`: `/trade` never worked, and `/global` only worked through a name lookup that reported the alias instead of the real channel name. Every joined channel is now found, and the status line shows real names.
+
 ## 0.18.0-alpha - 2026-09-18
 - Compact view. The `<<` button next to the window's close button hides the whole gear panel and narrows the window to just the raid list, for keeping an eye on who is in and scanned without a wide window in the way. `>>` (or `/ri compact`) brings the gear panel back. The choice is remembered across reloads. LFM and BIS LIST always open at full width and the Inspector tab narrows again when you return to it.
 - The raid composition line (`Tanks | Heals | RDPS | MDPS | Total`) moved from the top of the gear panel to directly under the action buttons, above the raid list, so it stays visible in the compact view.

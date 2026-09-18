@@ -27,6 +27,7 @@ local AUTOSCAN_ROSTER_DEBOUNCE_SECONDS = 2
 local DEFAULT_LFM_POST_DELAY_SECONDS = 10
 local LFM_GENERAL_ALIASES = { "general" }
 local LFM_GLOBAL_ALIASES = { "global", "globalchat", "world", "worldchat" }
+local LFM_TRADE_ALIASES = { "trade" }
 local LFM_NEED_GROUPS = {
     {
         key = "warrior",
@@ -645,6 +646,37 @@ local function NormalizeChannelAliasToken(value)
     return token
 end
 
+-- Joined chat channels as { id, name } records. On 3.3.5 GetChannelList()
+-- returns id, name PAIRS (Recount and Skada on this client divide by 2);
+-- later expansions add a third "disabled" flag per channel. Walking the
+-- list in threes on a pairs client only ever finds the first channel, which
+-- is why /general worked and everything after it read as "missing".
+local function CollectJoinedChannels()
+    if type(GetChannelList) ~= "function" then
+        return {}
+    end
+
+    local raw = { GetChannelList() }
+    local channels = {}
+    local i = 1
+    while i <= #raw do
+        local id = tonumber(raw[i])
+        local name = raw[i + 1]
+        if id and id > 0 and type(name) == "string" and name ~= "" then
+            table.insert(channels, { id = id, name = name })
+            if type(raw[i + 2]) == "boolean" then
+                i = i + 3
+            else
+                i = i + 2
+            end
+        else
+            -- Out of step (unexpected value); move one slot and resync.
+            i = i + 1
+        end
+    end
+    return channels
+end
+
 local function FindJoinedChannelByAlias(aliasList)
     if type(aliasList) ~= "table" then
         return nil, nil
@@ -675,11 +707,11 @@ local function FindJoinedChannelByAlias(aliasList)
             local ok, id = pcall(GetChannelName, alias)
             local channelId = ok and tonumber(id) or nil
             if channelId and channelId > 0 then
-                local channelsByName = { GetChannelList() }
+                local joined = CollectJoinedChannels()
                 local j
-                for j = 1, #channelsByName, 3 do
-                    if tonumber(channelsByName[j]) == channelId then
-                        return channelId, tostring(channelsByName[j + 1] or alias)
+                for j = 1, #joined do
+                    if joined[j].id == channelId then
+                        return channelId, joined[j].name
                     end
                 end
                 return channelId, alias
@@ -687,14 +719,10 @@ local function FindJoinedChannelByAlias(aliasList)
         end
     end
 
-    if type(GetChannelList) ~= "function" then
-        return nil, nil
-    end
-
-    local channels = { GetChannelList() }
-    for i = 1, #channels, 3 do
-        local channelId = tonumber(channels[i])
-        local channelName = tostring(channels[i + 1] or "")
+    local channels = CollectJoinedChannels()
+    for i = 1, #channels do
+        local channelId = channels[i].id
+        local channelName = channels[i].name
         if channelId and channelId > 0 and channelName ~= "" then
             local normalizedName = string.lower(channelName)
             local idx
@@ -2932,6 +2960,7 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "guild", false)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "general", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "global", true)
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "trade", false)
     EnsureTable(RaidInspectorDB.state.ui.lfm, "postDelaySeconds", DEFAULT_LFM_POST_DELAY_SECONDS)
     EnsureTable(RaidInspectorDB.state.ui.lfm, "repeatCount", DEFAULT_LFM_REPEAT_COUNT)
     EnsureLFMNeedDefaults(RaidInspectorDB.state.ui.lfm)
@@ -3083,6 +3112,7 @@ function addon:GetLFMState()
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "guild", false)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "general", true)
     EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "global", true)
+    EnsureTable(RaidInspectorDB.state.ui.lfm.channels, "trade", false)
     EnsureTable(RaidInspectorDB.state.ui.lfm, "postDelaySeconds", DEFAULT_LFM_POST_DELAY_SECONDS)
     EnsureTable(RaidInspectorDB.state.ui.lfm, "repeatCount", DEFAULT_LFM_REPEAT_COUNT)
     EnsureLFMNeedDefaults(RaidInspectorDB.state.ui.lfm)
@@ -3096,7 +3126,8 @@ function addon:GetLFMChannels()
 end
 
 function addon:SetLFMChannel(channel, enabled)
-    if channel ~= "yell" and channel ~= "guild" and channel ~= "general" and channel ~= "global" then
+    if channel ~= "yell" and channel ~= "guild" and channel ~= "general"
+        and channel ~= "global" and channel ~= "trade" then
         return false
     end
 
@@ -3771,16 +3802,20 @@ end
 function addon:GetLFMChannelAvailability()
     local generalId, generalName = FindJoinedChannelByAlias(LFM_GENERAL_ALIASES)
     local globalId, globalName = FindJoinedChannelByAlias(LFM_GLOBAL_ALIASES)
+    local tradeId, tradeName = FindJoinedChannelByAlias(LFM_TRADE_ALIASES)
 
     return {
         yell = true,
         guild = IsInGuild() and true or false,
         general = generalId and true or false,
         global = globalId and true or false,
+        trade = tradeId and true or false,
         generalId = generalId,
         globalId = globalId,
+        tradeId = tradeId,
         generalName = generalName,
         globalName = globalName,
+        tradeName = tradeName,
     }
 end
 
@@ -8548,6 +8583,14 @@ function addon:CreateMainWindow()
         addon:SetLFMChannel("global", self:GetChecked() and true or false)
     end)
 
+    local lfmTradeCheck = CreateFrame("CheckButton", "RaidInspectorLFMTradeCheck", lfmPanel, "UICheckButtonTemplate")
+    lfmTradeCheck:SetPoint("LEFT", lfmGlobalCheck, "RIGHT", 58, 0)
+    lfmTradeCheck:SetHitRectInsets(0, -24, 0, 0)
+    _G[lfmTradeCheck:GetName() .. "Text"]:SetText("/trade")
+    lfmTradeCheck:SetScript("OnClick", function(self)
+        addon:SetLFMChannel("trade", self:GetChecked() and true or false)
+    end)
+
     local lfmDelayLabel = lfmPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     lfmDelayLabel:SetPoint("TOPLEFT", lfmYellCheck, "BOTTOMLEFT", 0, -12)
     lfmDelayLabel:SetText("Delay (s):")
@@ -8878,6 +8921,7 @@ function addon:CreateMainWindow()
     addon.ui.lfmGuildCheck = lfmGuildCheck
     addon.ui.lfmGeneralCheck = lfmGeneralCheck
     addon.ui.lfmGlobalCheck = lfmGlobalCheck
+    addon.ui.lfmTradeCheck = lfmTradeCheck
     addon.ui.lfmDelayBox = lfmDelayBox
     addon.ui.lfmRepeatBox = lfmRepeatBox
     addon.ui.lfmPostButton = lfmPostButton
@@ -10281,6 +10325,9 @@ function addon:RefreshMainWindow()
     if addon.ui.lfmGlobalCheck then
         addon.ui.lfmGlobalCheck:SetChecked(lfmChannels.global == true)
     end
+    if addon.ui.lfmTradeCheck then
+        addon.ui.lfmTradeCheck:SetChecked(lfmChannels.trade == true)
+    end
 
     local lfmRoles = addon:GetLFMRoleState()
     if addon.ui.lfmRoleRows then
@@ -10374,6 +10421,11 @@ function addon:RefreshMainWindow()
             .. BuildChannelStatusLabel("general", "/general", availability.general, availability.generalName)
             .. "  |  "
             .. BuildChannelStatusLabel("global", "/global", availability.global, availability.globalName)
+            .. "  |  "
+            .. BuildChannelStatusLabel("trade", "/trade", availability.trade, availability.tradeName)
+        if not availability.trade then
+            statusText = statusText .. ColorText(" (city only)", "b8b8b8")
+        end
 
         addon.ui.lfmChannelStatus:SetText(statusText)
     end
@@ -10866,8 +10918,23 @@ function addon:PostLFMMessage()
         end
     end
 
+    if channels.trade then
+        selectedCount = selectedCount + 1
+        local channelId, channelName = FindJoinedChannelByAlias(LFM_TRADE_ALIASES)
+        if channelId and channelId > 0 then
+            table.insert(baseTargets, {
+                message = message,
+                chatType = "CHANNEL",
+                channelId = channelId,
+                label = channelName or "trade",
+            })
+        else
+            Print("lfm: /trade channel is not joined (it only exists inside a city)")
+        end
+    end
+
     if selectedCount == 0 then
-        Print("lfm: no channels selected (Yell/Guild/General/Global)")
+        Print("lfm: no channels selected (Yell/Guild/General/Global/Trade)")
         return 0, 0
     end
 
