@@ -51,6 +51,7 @@ Name-only remote lookups are intentionally not supported here.
 - `/ri exportsaved` remains as a compatibility alias for `/ri sharesaved`
 - `/ri status`
 - `/ri ach`
+- `/ri compact [on|off]`
 - `/ri bis [spec]`
 - `/ri refreshstale [minutes]`
 - `/ri clearqueue [confirm]`
@@ -69,6 +70,7 @@ Name-only remote lookups are intentionally not supported here.
 - `Refresh`: attempt live refresh for stale entries that are currently present in target/party/raid.
 - `Status`: print runtime status into chat.
 - `Clear`: clear queued requests, cached live-inspect results and recorded MS changes.
+- `<<` / `>>` (top right, next to close): compact view. Hides the gear panel and narrows the window to the raid list with the composition line and action buttons; press again (or `/ri compact`) to bring the gear panel back. Remembered across reloads. LFM and BIS LIST always show at full width.
 - `MS: on/off`: start/stop recording MS changes from raid chat.
 - `MS Share`: post the recorded MS list to the ticked Share channels.
 - `MS Clear`: wipe the recorded MS list (asks to confirm).

@@ -2,6 +2,10 @@
 
 All notable changes to Raid Inspector are documented in this file.
 
+## 0.18.0-alpha - 2026-09-18
+- Compact view. The `<<` button next to the window's close button hides the whole gear panel and narrows the window to just the raid list, for keeping an eye on who is in and scanned without a wide window in the way. `>>` (or `/ri compact`) brings the gear panel back. The choice is remembered across reloads. LFM and BIS LIST always open at full width and the Inspector tab narrows again when you return to it.
+- The raid composition line (`Tanks | Heals | RDPS | MDPS | Total`) moved from the top of the gear panel to directly under the action buttons, above the raid list, so it stays visible in the compact view.
+
 ## 0.17.0-alpha - 2026-09-16
 - New `BIS LIST` tab. Pick a class/spec from the dropdown and the right-hand list shows that spec's best-in-slot item for every slot, with the alternative that is also fine to roll for. Hover an item for its full tooltip plus where it drops, right-click it to open that boss in AtlasLoot, shift-click to link it in chat. The data is generated from the `[WotLK] BiS Lists for 3.3.5a end game` workbook (27 specs, 452 items, 163 alternatives) by `tools/build_bis_data.py` into `RaidInspector_BiS.lua`; drop sources come from AtlasLoot's own loot tables, so nothing is looked up outside the game. Without AtlasLoot the list and tooltips still work, only the drop source and right-click are unavailable. `/ri bis [spec]` jumps straight to a spec.
 - Item tooltips in the BIS list follow the same rule AtlasLoot uses: the real item link is only put on the tooltip once the client has the item cached (an uncached link can disconnect a 3.3.5 client). Unseen items show their name and level from the data and are fetched quietly in the background, so the second hover has the full stats.

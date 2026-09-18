@@ -5,7 +5,7 @@ RaidInspectorDB = RaidInspectorDB or {}
 
 local addon = RaidInspector
 addon.name = addonName or "RaidInspector"
-addon.version = "0.17.0-alpha"
+addon.version = "0.18.0-alpha"
 
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
@@ -157,6 +157,8 @@ local OVERVIEW_VISIBLE_ROWS = 14
 local OVERVIEW_BOTTOM_INSET = 28
 local DETAIL_ROW_HEIGHT = 21
 local WINDOW_WIDTH = 1180
+-- Compact layout: just the left column (432px overview + scrollbar + margins).
+local COLLAPSED_WINDOW_WIDTH = 512
 local WINDOW_HEIGHT = 610
 local PANEL_SIDE_MARGIN = 24
 local RIGHT_PANEL_X = 474
@@ -2891,6 +2893,7 @@ function addon:InitDatabase()
     EnsureTable(RaidInspectorDB.settings.window, "x", 0)
     EnsureTable(RaidInspectorDB.settings.window, "y", 0)
     EnsureTable(RaidInspectorDB.settings.window, "scale", 1.0)
+    EnsureTable(RaidInspectorDB.settings.window, "collapsed", false)
 
     EnsureTable(RaidInspectorDB.settings, "keybinds", {})
 
@@ -4255,6 +4258,45 @@ function addon:PrintMainSpecRecords()
     end
 end
 
+function addon:IsWindowCollapsed()
+    return RaidInspectorDB.settings.window.collapsed == true
+end
+
+function addon:SetWindowCollapsed(flag)
+    RaidInspectorDB.settings.window.collapsed = (flag == true)
+    addon:RefreshMainWindow()
+    return RaidInspectorDB.settings.window.collapsed
+end
+
+-- The compact layout only applies to the Inspector tab. LFM and BIS LIST need
+-- the full width and get it whenever they are shown; the preference survives
+-- and the Inspector tab narrows again when you come back to it.
+function addon:IsCompactLayoutActive()
+    return addon:IsWindowCollapsed() and addon:GetActiveTab() == "inspector"
+end
+
+function addon:ApplyWindowWidth()
+    local ui = addon.ui
+    if not ui or not ui.frame then
+        return
+    end
+    local width = WINDOW_WIDTH
+    if addon:IsCompactLayoutActive() then
+        width = COLLAPSED_WINDOW_WIDTH
+    end
+    ui.frame:SetWidth(width)
+    if ui.statusText then
+        ui.statusText:SetWidth(width - (PANEL_SIDE_MARGIN * 2))
+    end
+    if ui.collapseButton then
+        if addon:IsWindowCollapsed() then
+            ui.collapseButton:SetText(">>")
+        else
+            ui.collapseButton:SetText("<<")
+        end
+    end
+end
+
 function addon:RefreshTabVisibility()
     if not addon.ui or not addon.ui.frame then
         return
@@ -4317,6 +4359,25 @@ function addon:RefreshTabVisibility()
     for i = 1, #inspectorWidgets do
         SetWidgetVisible(inspectorWidgets[i], inspectorVisible)
     end
+
+    -- Compact layout: the whole right-hand gear panel goes away and the frame
+    -- narrows to the raid list. The composition line stays - it is on the left.
+    local detailVisible = inspectorVisible and not addon:IsCompactLayoutActive()
+    local detailWidgets = {
+        addon.ui.detailHeader,
+        addon.ui.detailScore,
+        addon.ui.detailMeta,
+        addon.ui.detailAudit,
+        addon.ui.itemFilterLabel,
+        addon.ui.itemFilterDropDown,
+        addon.ui.detailHeaderRow,
+        addon.ui.detailContainer,
+        addon.ui.detailScroll,
+    }
+    for i = 1, #detailWidgets do
+        SetWidgetVisible(detailWidgets[i], detailVisible)
+    end
+    addon:ApplyWindowWidth()
 
     SetWidgetVisible(addon.ui.lfmPanel, activeTab == "lfm")
     SetWidgetVisible(addon.ui.bisPanel, activeTab == "bis")
@@ -7806,6 +7867,36 @@ function addon:CreateMainWindow()
     local closeButton = CreateFrame("Button", "RaidInspectorCloseButton", f, "UIPanelCloseButton")
     closeButton:SetPoint("TOPRIGHT", f, "TOPRIGHT", -6, -6)
 
+    -- Compact toggle: hides the gear panel and shrinks the window to the raid
+    -- list. Lives next to the close button, so in the compact window it sits
+    -- at the top-right corner of what is left.
+    local collapseButton = CreateFrame("Button", "RaidInspectorCollapseButton", f, "UIPanelButtonTemplate")
+    collapseButton:SetWidth(28)
+    collapseButton:SetHeight(20)
+    collapseButton:SetPoint("RIGHT", closeButton, "LEFT", 2, 0)
+    collapseButton:SetText("<<")
+    collapseButton:SetScript("OnClick", function()
+        SafeInvoke("collapse", function()
+            addon:SetWindowCollapsed(not addon:IsWindowCollapsed())
+        end)
+    end)
+    collapseButton:SetScript("OnEnter", function(self)
+        if GameTooltip then
+            GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+            if addon:IsWindowCollapsed() then
+                GameTooltip:SetText("Show the gear list again")
+            else
+                GameTooltip:SetText("Compact view: hide the gear list, keep just the raid list")
+            end
+            GameTooltip:Show()
+        end
+    end)
+    collapseButton:SetScript("OnLeave", function()
+        if GameTooltip then
+            GameTooltip:Hide()
+        end
+    end)
+
     local statusText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     statusText:SetPoint("TOPLEFT", inspectorTabButton, "BOTTOMLEFT", 0, -4)
     statusText:SetJustifyH("LEFT")
@@ -8202,7 +8293,8 @@ function addon:CreateMainWindow()
     end)
 
     local rowsViewport = CreateFrame("ScrollFrame", nil, f)
-    rowsViewport:SetPoint("TOPLEFT", actionPanel, "BOTTOMLEFT", 0, -8)
+    -- 30px gap: the raid composition line sits between the buttons and the list.
+    rowsViewport:SetPoint("TOPLEFT", actionPanel, "BOTTOMLEFT", 0, -30)
     rowsViewport:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", PANEL_SIDE_MARGIN, OVERVIEW_BOTTOM_INSET)
     rowsViewport:SetWidth(432)
     if rowsViewport.SetClipsChildren then
@@ -8242,17 +8334,19 @@ function addon:CreateMainWindow()
 
     local rightPanelWidth = WINDOW_WIDTH - RIGHT_PANEL_X - PANEL_SIDE_MARGIN
 
+    -- Raid composition sits right under the action buttons, on the left, so
+    -- it stays in view in the compact layout where the gear panel is hidden.
+    -- Header and numbers share one line; the overview list starts below it.
     local compositionHeader = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    compositionHeader:SetPoint("TOPLEFT", f, "TOPLEFT", RIGHT_PANEL_X, -86)
-    compositionHeader:SetWidth(rightPanelWidth)
+    compositionHeader:SetPoint("TOPLEFT", actionPanel, "BOTTOMLEFT", 0, -7)
     compositionHeader:SetJustifyH("LEFT")
-    compositionHeader:SetText("Raid Composition (Talent):")
+    compositionHeader:SetText("Composition:")
 
     local compositionSummary = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    compositionSummary:SetPoint("TOPLEFT", compositionHeader, "BOTTOMLEFT", 0, -6)
-    compositionSummary:SetWidth(rightPanelWidth)
+    compositionSummary:SetPoint("LEFT", compositionHeader, "RIGHT", 6, 0)
+    compositionSummary:SetWidth(340)
     compositionSummary:SetJustifyH("LEFT")
-    compositionSummary:SetText("Tanks: 0  |  Heals: 0  |  RDPS: 0  |  MDPS: 0  |  Total: 0")
+    compositionSummary:SetText("Tanks: 0 | Heals: 0 | RDPS: 0 | MDPS: 0 | Total: 0")
 
     local detailHeader = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     detailHeader:SetPoint("TOPLEFT", f, "TOPLEFT", RIGHT_PANEL_X, -136)
@@ -8724,6 +8818,7 @@ function addon:CreateMainWindow()
     addon.ui.inspectorTabButton = inspectorTabButton
     addon.ui.lfmTabButton = lfmTabButton
     addon.ui.statusText = statusText
+    addon.ui.collapseButton = collapseButton
     addon.ui.shareChannelsRow = shareChannelsRow
     addon.ui.shareChannelsLabel = shareChannelsLabel
     addon.ui.raidShareCheck = raidShareCheck
@@ -10324,10 +10419,10 @@ function addon:RefreshMainWindow()
         local counts = BuildRaidCompositionCounts(compositionEntries)
         addon.ui.compositionSummary:SetText(
             "Tanks: " .. tostring(counts.tank)
-                .. "  |  Heals: " .. tostring(counts.heal)
-                .. "  |  RDPS: " .. tostring(counts.rdps)
-                .. "  |  MDPS: " .. tostring(counts.mdps)
-                .. "  |  Total: " .. tostring(counts.total)
+                .. " | Heals: " .. tostring(counts.heal)
+                .. " | RDPS: " .. tostring(counts.rdps)
+                .. " | MDPS: " .. tostring(counts.mdps)
+                .. " | Total: " .. tostring(counts.total)
         )
     end
 
@@ -11145,6 +11240,7 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
             Print("/ri status - show queue summary")
             Print("/ri ach - print the raid achievement ids this build looks up")
             Print("/ri bis [spec] - open the BIS LIST tab, optionally jumping to a spec (e.g. /ri bis fury)")
+            Print("/ri compact [on|off] - hide/show the gear list (compact raid-list window)")
             Print("/ri refreshstale [minutes] - queue refresh for stale results")
             Print("/ri clearqueue [confirm] - clear queue/results with confirmation")
             return
@@ -11172,6 +11268,22 @@ SlashCmdList["RAIDINSPECTOR"] = function(message)
 
         if command == "bis" then
             addon:HandleBiSCommand(args)
+            return
+        end
+
+        if command == "compact" then
+            local sub = string.lower(Trim(args or ""))
+            if sub == "on" then
+                addon:SetWindowCollapsed(true)
+            elseif sub == "off" then
+                addon:SetWindowCollapsed(false)
+            else
+                addon:SetWindowCollapsed(not addon:IsWindowCollapsed())
+            end
+            addon:SetActiveTab("inspector")
+            addon:ToggleWindow(true)
+            addon:RefreshMainWindow()
+            Print("compact view: " .. (addon:IsWindowCollapsed() and "on" or "off"))
             return
         end
 
