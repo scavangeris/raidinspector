@@ -86,6 +86,47 @@ check("/ri byrole on", addon:IsGroupByRole() == true)
 slash("byrole")
 check("/ri byrole toggles", addon:IsGroupByRole() == false)
 
+-- 5b. Group headers between roles ------------------------------------------------------------------
+addon:SetGroupByRole(false)
+local plain = addon:GetOverviewEntries()
+check("off: display list is the entries themselves", addon:BuildOverviewDisplayList(plain) == plain)
+
+addon:SetGroupByRole(true)
+local display = addon:BuildOverviewDisplayList(addon:GetOverviewEntries())
+local shape = {}
+for _, e in ipairs(display) do
+    table.insert(shape, e.separator and ("[" .. e.rank .. ":" .. e.count .. "]") or e.req.name)
+end
+check("on: a header above every group with its count",
+    table.concat(shape, ",") == "[1:1],Tanky,[2:2],Holyp,Palah,[3:1],Stabby,[4:1],Boomy,[5:1],Ghost", table.concat(shape, ","))
+check("header text names the group and count", addon:FormatOverviewGroupHeader(display[3]):find("Healers (2)", 1, true) ~= nil, addon:FormatOverviewGroupHeader(display[3]))
+check("unknown group header wording", addon:FormatOverviewGroupHeader(display[10]):find("No talent data yet (1)", 1, true) ~= nil)
+
+-- The plain entry list must never grow headers (composition, share, reports).
+local n = 0
+for _, e in ipairs(addon:GetOverviewEntries()) do if e.separator then n = n + 1 end end
+check("GetOverviewEntries never contains headers", n == 0)
+
+-- Rendered rows.
+addon:SetActiveTab("inspector")
+for _, r in ipairs(addon.ui.overviewRows) do r.EnableMouse = function(self, v) self.__mouse = v end end
+addon:RefreshMainWindow()
+local rows = addon.ui.overviewRows
+check("row 1 is the Tanks header", (rows[1].text:GetText() or ""):find("Tanks (1)", 1, true) ~= nil, rows[1].text:GetText())
+check("header row has no key (nothing to select or edit)", rows[1].key == nil)
+check("header row ignores the mouse", rows[1].__mouse == false)
+check("row 2 is Tanky", rows[2].key == "tanky-testrealm" and rows[2].__mouse == true)
+check("row 3 is the Healers header", (rows[3].text:GetText() or ""):find("Healers (2)", 1, true) ~= nil)
+check("rows 4-5 are the two healers", rows[4].key == "holyp-testrealm" and rows[5].key == "palah-testrealm")
+check("scroll count includes the headers", addon.ui.overviewEntryCount == 11, addon.ui.overviewEntryCount)
+check("selection is still a player, never a header", addon:GetSelectedKey() ~= "" and addon:GetSelectedKey() ~= nil)
+
+addon:SetGroupByRole(false)
+addon:RefreshMainWindow()
+check("off: row 1 is a player again", rows[1].key ~= nil and rows[1].__mouse == true, rows[1].key)
+check("off: scroll count is the player count", addon.ui.overviewEntryCount == 6)
+addon:SetGroupByRole(false)
+
 -- 6. Hidden with the other inspector widgets on other tabs ------------------------------------------------
 addon:SetActiveTab("bis")
 addon:RefreshMainWindow()

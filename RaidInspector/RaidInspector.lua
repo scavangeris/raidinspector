@@ -10,6 +10,11 @@ addon.version = "0.18.0-alpha"
 local events = CreateFrame("Frame")
 local FRESHNESS_TTL_SECONDS = 30 * 60
 local RAID_HISTORY_RETENTION_SECONDS = 30 * 24 * 60 * 60
+-- Each history entry stores the full gear of every raider, and only the
+-- active entry is ever read back. Age alone was no limit: a busy month left
+-- 342 snapshots / 25 MB in SavedVariables, parsed by every client at login
+-- and rewritten at every logout and /reload.
+local RAID_HISTORY_MAX_SCANS = 10
 local INSPECT_THROTTLE_SECONDS = 2
 local INSPECT_TIMEOUT_SECONDS = 8
 local INSPECT_TALENT_MIN_WAIT_SECONDS = 1
@@ -4643,6 +4648,21 @@ function addon:PruneRaidScanHistory()
         end
     end
 
+    -- Then by count: keep the newest RAID_HISTORY_MAX_SCANS, plus the active
+    -- entry wherever it sits, since the live overview refreshes it by id.
+    if #kept > RAID_HISTORY_MAX_SCANS then
+        local trimmed = {}
+        local firstKept = #kept - RAID_HISTORY_MAX_SCANS + 1
+        for i = 1, #kept do
+            local entry = kept[i]
+            local isActive = activeHistoryId > 0 and tonumber(entry.id) == activeHistoryId
+            if i >= firstKept or isActive then
+                trimmed[#trimmed + 1] = entry
+            end
+        end
+        kept = trimmed
+    end
+
     history.scans = kept
     if activeHistoryId > 0 and not activeKept and RaidInspectorDB.state.lastSnapshot then
         RaidInspectorDB.state.lastSnapshot.historyId = 0
@@ -9185,6 +9205,52 @@ local ROLE_TAGS = {
     rdps = { label = "R", color = "ffb347" },
 }
 
+-- Header rows shown above each role group while group-by-role is on.
+local ROLE_GROUP_HEADERS = {
+    [1] = { label = "Tanks", color = "6fb6ff" },
+    [2] = { label = "Healers", color = "66ff66" },
+    [3] = { label = "Melee", color = "ff7f7f" },
+    [4] = { label = "Ranged", color = "ffb347" },
+    [5] = { label = "No talent data yet", color = "808080" },
+}
+
+-- What the overview actually renders. With group-by-role on, a labelled
+-- header row sits above each role group so the groups read as separate
+-- blocks; otherwise it is the entries untouched. Only the renderer uses
+-- this list - composition, share, reports and selection keep working on
+-- the plain entries, which never contain a header.
+function addon:BuildOverviewDisplayList(entries)
+    entries = entries or {}
+    if not addon:IsGroupByRole() or #entries == 0 then
+        return entries
+    end
+
+    local counts = {}
+    local i
+    for i = 1, #entries do
+        local rank = addon:GetEntryRoleRank(entries[i])
+        counts[rank] = (counts[rank] or 0) + 1
+    end
+
+    local display = {}
+    local lastRank = nil
+    for i = 1, #entries do
+        local entry = entries[i]
+        local rank = addon:GetEntryRoleRank(entry)
+        if rank ~= lastRank then
+            table.insert(display, { separator = true, rank = rank, count = counts[rank] or 0 })
+            lastRank = rank
+        end
+        table.insert(display, entry)
+    end
+    return display
+end
+
+function addon:FormatOverviewGroupHeader(separator)
+    local header = ROLE_GROUP_HEADERS[separator and separator.rank] or ROLE_GROUP_HEADERS[5]
+    return ColorText("- " .. header.label .. " (" .. tostring(separator and separator.count or 0) .. ") -", header.color)
+end
+
 function addon:GetEntryRole(entry)
     local result = type(entry) == "table" and entry.result or nil
     if type(result) ~= "table" or result.error then
@@ -9268,6 +9334,90 @@ end
 
 -- Returns the aligned-column data for a gear slot: { slot, name, ilvl, enchant,
 -- gems, r, g, b }. Colour follows the same priority as the old single line.
+-- Heroic items have their own item ids and the game tooltip prints a
+-- "Heroic" line right under the name, so the tooltip is the authority.
+-- Returns true/false, or nil while the client has not cached the item yet
+-- (it is requested then, and the tag shows on a later refresh).
+function addon:IsHeroicItemId(itemId)
+    itemId = tonumber(itemId)
+    if not itemId or itemId <= 0 then
+        return nil
+    end
+    addon.heroicItemCache = addon.heroicItemCache or {}
+    local cached = addon.heroicItemCache[itemId]
+    if cached ~= nil then
+        return cached
+    end
+
+    if not GetItemInfo or not GetItemInfo(itemId) then
+        if addon.RequestItemCache then
+            addon:RequestItemCache(itemId)
+        end
+        return nil
+    end
+
+    if not addon.heroicScanTooltip then
+        addon.heroicScanTooltip = CreateFrame("GameTooltip", "RaidInspectorHeroicScanTooltip", UIParent, "GameTooltipTemplate")
+    end
+    local tip = addon.heroicScanTooltip
+    tip:SetOwner(UIParent, "ANCHOR_NONE")
+    tip:ClearLines()
+    tip:SetHyperlink("item:" .. tostring(itemId))
+
+    local lineCount = tip.NumLines and tip:NumLines() or 0
+    if lineCount == 0 then
+        tip:Hide()
+        return nil
+    end
+
+    local heroicText = (type(ITEM_HEROIC) == "string" and ITEM_HEROIC ~= "") and ITEM_HEROIC or "Heroic"
+    local isHeroic = false
+    local i
+    -- The marker sits on line 2; a few lines of slack cover tooltip addons
+    -- that insert their own lines. Exact match only, so an item or spell
+    -- description that merely mentions "heroic" never counts.
+    for i = 2, math.min(lineCount, 4) do
+        local fontString = _G["RaidInspectorHeroicScanTooltipTextLeft" .. tostring(i)]
+        local text = fontString and fontString:GetText()
+        if text == heroicText then
+            isHeroic = true
+            break
+        end
+    end
+    tip:Hide()
+
+    addon.heroicItemCache[itemId] = isHeroic
+    return isHeroic
+end
+
+-- "[H]" for the heroic version of an item, "[N]" for the normal one. Only
+-- for epic-or-better gear, where the distinction matters; blank while the
+-- item is not cached yet.
+function addon:GetItemDifficultyTag(item)
+    if type(item) ~= "table" then
+        return nil
+    end
+    local itemId = tonumber(item.itemId)
+    if not itemId then
+        return nil
+    end
+    local quality = tonumber(item.quality)
+    if not quality and GetItemInfo then
+        local _, _, q = GetItemInfo(itemId)
+        quality = tonumber(q)
+    end
+    if not quality or quality < 4 then
+        return nil
+    end
+    local heroic = addon:IsHeroicItemId(itemId)
+    if heroic == true then
+        return ColorText("[H]", "ff7f3f")
+    elseif heroic == false then
+        return ColorText("[N]", "a0a0a0")
+    end
+    return nil
+end
+
 function addon:BuildSlotColumns(slotKey, item)
     local slotLabel = SLOT_LABELS[slotKey] or slotKey
     if not item then
@@ -9332,6 +9482,7 @@ function addon:BuildSlotColumns(slotKey, item)
     local columns = {
         slot = slotLabel,
         name = itemName,
+        nameTag = addon:GetItemDifficultyTag(item),
         ilvl = ilvlText,
         enchant = enchantText,
         gems = gemText,
@@ -9579,7 +9730,10 @@ function addon:RefreshDetailPanel(selectedEntry)
                 local col = DETAIL_COLUMNS[c]
                 local fs = row.colFS[col.key]
                 local value = cols[col.key] or ""
-                if col.truncate then
+                if col.key == "name" and cols.nameTag then
+                    SetTruncatedText(fs, value, col.width - 28)
+                    fs:SetText((fs:GetText() or "") .. " " .. cols.nameTag)
+                elseif col.truncate then
                     SetTruncatedText(fs, value, col.width)
                 else
                     fs:SetText(value)
@@ -10569,16 +10723,17 @@ function addon:RefreshMainWindow()
         )
     end
 
-    addon.ui.overviewEntryCount = #entries
+    local displayEntries = addon:BuildOverviewDisplayList(entries)
+    addon.ui.overviewEntryCount = #displayEntries
     local overviewOffset = 0
     if addon.ui.overviewScroll then
-        local maxOverviewOffset = math.max(0, #entries - #addon.ui.overviewRows)
+        local maxOverviewOffset = math.max(0, #displayEntries - #addon.ui.overviewRows)
         local currentOverviewOffset = GetFauxScrollOffset(addon.ui.overviewScroll)
         if currentOverviewOffset > maxOverviewOffset then
             SetFauxScrollOffset(addon.ui.overviewScroll, maxOverviewOffset, OVERVIEW_ROW_HEIGHT)
             currentOverviewOffset = maxOverviewOffset
         end
-        FauxScrollFrame_Update(addon.ui.overviewScroll, #entries, #addon.ui.overviewRows, OVERVIEW_ROW_HEIGHT)
+        FauxScrollFrame_Update(addon.ui.overviewScroll, #displayEntries, #addon.ui.overviewRows, OVERVIEW_ROW_HEIGHT)
         overviewOffset = currentOverviewOffset
     end
 
@@ -10612,8 +10767,28 @@ function addon:RefreshMainWindow()
     local rowIndex
     for rowIndex = 1, #addon.ui.overviewRows do
         local row = addon.ui.overviewRows[rowIndex]
-        local entry = entries[rowIndex + overviewOffset]
-        if entry then
+        local entry = displayEntries[rowIndex + overviewOffset]
+        if entry and entry.separator then
+            -- Group header: a label, nothing to click, no buttons.
+            row.key = nil
+            row.playerName = nil
+            row.text:SetText(addon:FormatOverviewGroupHeader(entry))
+            row.text:SetTextColor(1.0, 1.0, 1.0)
+            SetFontStringBold(row.text, false)
+            row:UnlockHighlight()
+            row:EnableMouse(false)
+            if row.refreshButton then
+                row.refreshButton:Hide()
+            end
+            if row.removeButton then
+                row.removeButton:Hide()
+            end
+            if row.gearButton then
+                row.gearButton:Hide()
+            end
+            row:Show()
+        elseif entry then
+            row:EnableMouse(true)
             row.key = entry.key
             row.playerName = entry.req and entry.req.name or nil
             row.text:SetText(addon:BuildOverviewRowText(entry))
@@ -11342,6 +11517,7 @@ function addon:OnAddonLoaded(loadedName)
     end
 
     addon:InitDatabase()
+    addon:PruneRaidScanHistory()
     addon:InitInspectRuntime()
     addon:CreateMainWindow()
     addon:InitLFMMessageLinkHook()

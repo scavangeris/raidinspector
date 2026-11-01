@@ -23,7 +23,7 @@ tooltipLines = {}
 tooltipHyperlink = nil
 
 local LAYOUT_NUMBERS = {
-    GetStringHeight = 12, GetStringWidth = 80, GetHeight = 20, GetWidth = 200,
+    GetStringHeight = 12, GetStringWidth = 80, GetHeight = 320, GetWidth = 400,
     GetVerticalScrollRange = 0, GetVerticalScroll = 0, GetNumLines = 3,
     GetScale = 1, GetEffectiveScale = 1, GetLeft = 0, GetRight = 200,
     GetTop = 200, GetBottom = 0, GetValue = 0, GetFrameLevel = 1,
